@@ -93,8 +93,13 @@ impl Tree {
         while sp > 0 {
             sp -= 1;
             let n = &self.nodes[stack[sp] as usize];
-            let dx = n.com_x - xi;
-            let dy = n.com_y - yi;
+            let (nx, ny) = if n.body >= 0 {
+                (b.x[n.body as usize], b.y[n.body as usize])
+            } else {
+                (n.com_x, n.com_y)
+            };
+            let dx = nx - xi;
+            let dy = ny - yi;
             let d2 = dx * dx + dy * dy + SOFT2;
             let accept = if n.body >= 0 {
                 if n.body as usize == i {

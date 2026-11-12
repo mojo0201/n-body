@@ -400,3 +400,76 @@ fn legacy_presets_parse_without_companions() {
         }
     }
 }
+
+// Append to src/physics/tests/presets.rs (uses `use super::super::*;` already there).
+
+/// Index of the body with this preset name. Names survive `compact()`,
+/// indices do not, so tests that run many steps look the body up each time.
+fn find_named(b: &Bodies, name: &str) -> Option<usize> {
+    (0..b.len()).find(|&i| b.name[i].as_deref() == Some(name))
+}
+
+#[test]
+fn moon_stays_bound_to_earth() {
+    let mut b = Bodies::with_capacity(0);
+    spawn_solar_system(&mut b);
+    let a0 = 0.0025695 * au_in_gm();
+    for step in 0..10_000 {
+        advance(&mut b, DT);
+        let e = find_named(&b, "Earth").expect("Earth vanished");
+        let m = find_named(&b, "Moon").unwrap_or_else(|| panic!("Moon vanished at step {step}"));
+        let d = (b.x[m] - b.x[e]).hypot(b.y[m] - b.y[e]);
+        assert!(
+            d >= 0.5 * a0 && d <= 2.0 * a0,
+            "step {step}: Moon-Earth distance {d:.4} Gm, expected [{:.4}, {:.4}]",
+            0.5 * a0,
+            2.0 * a0
+        );
+    }
+}
+
+#[test]
+fn moon_parent_stable() {
+    let mut b = Bodies::with_capacity(0);
+    spawn_solar_system(&mut b);
+    for step in 0..10_000 {
+        advance(&mut b, DT);
+        let e = find_named(&b, "Earth").expect("Earth vanished");
+        let m = find_named(&b, "Moon").unwrap_or_else(|| panic!("Moon vanished at step {step}"));
+        assert_eq!(
+            find_parent(&b, m),
+            Some(e),
+            "step {step}: Moon parent changed"
+        );
+    }
+}
+
+/// Diagnostic only. Run with:
+///   cargo test --release --lib moon_diagnose -- --ignored --nocapture
+/// Delete after Task 1 is closed.
+#[test]
+#[ignore]
+fn moon_diagnose() {
+    let mut b = Bodies::with_capacity(0);
+    spawn_solar_system(&mut b);
+    let a0 = 0.0025695 * au_in_gm();
+    for step in 0..10_000 {
+        if step % 250 == 0 {
+            let e = find_named(&b, "Earth").unwrap();
+            let m = find_named(&b, "Moon").unwrap();
+            let d = (b.x[m] - b.x[e]).hypot(b.y[m] - b.y[e]);
+            let o = orbit_info(&b, m, e);
+            println!(
+                "step {step:5} n {} d/a0 {:.3} rung {} dtl/DT {:.3} bound {} ecc {:.3} kmax {}",
+                b.len(),
+                d / a0,
+                b.rung[m],
+                b.dtl[m] / DT,
+                o.bound,
+                o.ecc,
+                b.stats.max_rung
+            );
+        }
+        advance(&mut b, DT);
+    }
+}
