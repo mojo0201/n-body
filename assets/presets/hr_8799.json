@@ -7,17 +7,60 @@
         "metallicity": -0.47
     },
     "planets": [
-        { "name": "e", "a_au": 16.25, "e": 0.1445, "m_earth": 2353.0, "density_gcc": 1.0 },
-        { "name": "d", "a_au": 26.67, "e": 0.1134, "m_earth": 2894.0, "density_gcc": 1.0 },
-        { "name": "c", "a_au": 41.39, "e": 0.0519, "m_earth": 2480.0, "density_gcc": 1.0 },
-        { "name": "b", "a_au": 71.60, "e": 0.0160, "m_earth": 1813.0, "density_gcc": 1.0 }
+        {
+            "name": "e",
+            "a_au": 16.25,
+            "e": 0.1445,
+            "m_earth": 2353.0,
+            "density_gcc": 5.7
+        },
+        {
+            "name": "d",
+            "a_au": 26.67,
+            "e": 0.1134,
+            "m_earth": 2894.0,
+            "density_gcc": 7.0
+        },
+        {
+            "name": "c",
+            "a_au": 41.39,
+            "e": 0.0519,
+            "m_earth": 2480.0,
+            "density_gcc": 6.0
+        },
+        {
+            "name": "b",
+            "a_au": 71.60,
+            "e": 0.0160,
+            "m_earth": 1813.0,
+            "density_gcc": 4.4
+        }
     ],
     "belts": {
         "belt_budget": 2500,
-        "total_mass_earth": 0.04,
+        "total_mass_earth": 1.0,
+        "inner": {
+            "a_lo_au": 6.0,
+            "a_hi_au": 15.0,
+            "mass_frac": 0.04
+        },
         "outer": {
             "populations": [
-                { "kind": "cold_classical", "a_lo_au": 104.0, "a_hi_au": 360.0, "mass_frac": 1.0, "e_sigma": 0.05 }
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 104.0,
+                    "a_hi_au": 310.0,
+                    "mass_frac": 0.78,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "scattered",
+                    "a_lo_au": 310.0,
+                    "a_hi_au": 1000.0,
+                    "mass_frac": 0.18,
+                    "e_sigma": 0.20,
+                    "q_frac": 100.0
+                }
             ]
         }
     }

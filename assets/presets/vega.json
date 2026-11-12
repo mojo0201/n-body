@@ -10,10 +10,28 @@
     "belts": {
         "belt_budget": 2500,
         "total_mass_earth": 10.0,
+        "inner": {
+            "a_lo_au": 4.0,
+            "a_hi_au": 20.0,
+            "mass_frac": 0.03
+        },
         "outer": {
             "populations": [
-                { "kind": "cold_classical", "a_lo_au": 80.0, "a_hi_au": 120.0, "mass_frac": 0.5, "e_sigma": 0.05 },
-                { "kind": "scattered", "a_lo_au": 120.0, "a_hi_au": 400.0, "mass_frac": 0.5, "e_sigma": 0.20, "q_frac": 100.0 }
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 80.0,
+                    "a_hi_au": 170.0,
+                    "mass_frac": 0.82,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "scattered",
+                    "a_lo_au": 170.0,
+                    "a_hi_au": 400.0,
+                    "mass_frac": 0.15,
+                    "e_sigma": 0.20,
+                    "q_frac": 100.0
+                }
             ]
         }
     }

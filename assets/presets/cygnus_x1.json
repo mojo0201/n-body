@@ -1,10 +1,21 @@
 {
     "name": "Cygnus X-1",
     "dust_boost": 0.1,
-    "star": { "name": "HDE 226868", "mass_earth": 6192796.0, "age_gyr": 5.0, "metallicity": 0.0 },
+    "star": {
+        "name": "HDE 226868",
+        "mass_earth": 13517608.0,
+        "age_gyr": 0.005,
+        "metallicity": 0.0
+    },
     "companions": [
-        { "name": "Cygnus X-1", "mass_earth": 7058455.0, "kind": "black_hole",
-          "a_au": 0.2, "e": 0.72, "phase": 0.0 }
+        {
+            "name": "Cygnus X-1",
+            "mass_earth": 7058455.0,
+            "kind": "black_hole",
+            "a_au": 0.244,
+            "e": 0.019,
+            "phase": 0.0
+        }
     ],
     "planets": []
 }

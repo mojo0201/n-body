@@ -1,16 +1,34 @@
 {
     "name": "WASP-12b",
     "dust_boost": 0.5,
-    "star": { "name": "WASP-12", "mass_earth": 449000.0, "age_gyr": 2.0, "metallicity": 0.30 },
+    "star": {
+        "name": "WASP-12",
+        "mass_earth": 476111.0,
+        "age_gyr": 3.0,
+        "metallicity": 0.30
+    },
     "planets": [
-        { "name": "WASP-12b", "a_au": 0.0234, "e": 0.0, "m_earth": 467.0, "density_gcc": 0.35 }
+        {
+            "name": "WASP-12b",
+            "a_au": 0.0234,
+            "e": 0.0,
+            "m_earth": 467.0,
+            "density_gcc": 0.25
+        }
     ],
     "belts": {
         "belt_budget": 200,
         "total_mass_earth": 0.001,
-        "outer": { "populations": [
-            { "kind": "cold_classical", "a_lo_au": 5.0, "a_hi_au": 20.0,
-              "mass_frac": 1.0, "e_sigma": 0.10 }
-        ] }
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 5.0,
+                    "a_hi_au": 20.0,
+                    "mass_frac": 1.0,
+                    "e_sigma": 0.10
+                }
+            ]
+        }
     }
 }

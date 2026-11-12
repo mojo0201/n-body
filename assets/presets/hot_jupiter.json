@@ -25,16 +25,49 @@
         },
         "outer": {
             "populations": [
-                { "kind": "hot_classical", "a_lo_au": 0.5, "a_hi_au": 5.0, "mass_frac": 0.17, "e_sigma": 0.12 },
-                { "kind": "cold_classical", "a_lo_au": 5.0, "a_hi_au": 30.0, "mass_frac": 0.76, "e_sigma": 0.05 },
-                { "kind": "scattered", "a_lo_au": 30.0, "a_hi_au": 60.0, "mass_frac": 0.04, "e_sigma": 0.30, "q_frac": 25.0 }
+                {
+                    "kind": "hot_classical",
+                    "a_lo_au": 0.5,
+                    "a_hi_au": 5.0,
+                    "mass_frac": 0.17,
+                    "e_sigma": 0.12
+                },
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 5.0,
+                    "a_hi_au": 30.0,
+                    "mass_frac": 0.76,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "scattered",
+                    "a_lo_au": 30.0,
+                    "a_hi_au": 60.0,
+                    "mass_frac": 0.04,
+                    "e_sigma": 0.30,
+                    "q_frac": 25.0
+                }
             ]
         },
-        "trojans": [ { "giant_a_au": 0.0527, "mass_frac": 0.01 } ],
+        "trojans": [
+            {
+                "giant_a_au": 0.0527,
+                "mass_frac": 0.01
+            }
+        ],
         "gaps": [
-            { "a_au": 0.0837, "width_au": 0.004 },
-            { "a_au": 0.1096, "width_au": 0.005 },
-            { "a_au": 0.1310, "width_au": 0.006 }
+            {
+                "a_au": 0.0837,
+                "width_au": 0.004
+            },
+            {
+                "a_au": 0.1096,
+                "width_au": 0.005
+            },
+            {
+                "a_au": 0.1328,
+                "width_au": 0.006
+            }
         ]
     }
 }

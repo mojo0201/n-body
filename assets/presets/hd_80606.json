@@ -1,8 +1,28 @@
 {
     "name": "HD 80606",
     "dust_boost": 0.5,
-    "star": { "name": "HD 80606", "mass_earth": 322957.0, "age_gyr": 5.0, "metallicity": 0.43 },
+    "star": {
+        "name": "HD 80606",
+        "mass_earth": 349593.0,
+        "age_gyr": 5.0,
+        "metallicity": 0.43
+    },
+    "companions": [
+        {
+            "name": "HD 80607",
+            "mass_earth": 332946.0,
+            "a_au": 1200.0,
+            "e": 0.5,
+            "phase": 0.0
+        }
+    ],
     "planets": [
-        { "name": "HD 80606 b", "a_au": 0.456, "e": 0.933, "m_earth": 1240.0, "density_gcc": 0.5 }
+        {
+            "name": "HD 80606 b",
+            "a_au": 0.4606,
+            "e": 0.9336,
+            "m_earth": 1309.0,
+            "density_gcc": 5.1
+        }
     ]
 }
