@@ -1,0 +1,27 @@
+{
+    "name": "TRAPPIST-1",
+    "dust_boost": 0.3,
+    "star": {
+        "mass_earth": 29898.0,
+        "age_gyr": 7.6,
+        "metallicity": 0.04
+    },
+    "planets": [
+        { "name": "b", "a_au": 0.01154, "e": 0.006, "m_earth": 1.374, "density_gcc": 5.0 },
+        { "name": "c", "a_au": 0.01580, "e": 0.007, "m_earth": 1.308, "density_gcc": 4.9 },
+        { "name": "d", "a_au": 0.02227, "e": 0.008, "m_earth": 0.388, "density_gcc": 4.5 },
+        { "name": "e", "a_au": 0.02925, "e": 0.005, "m_earth": 0.692, "density_gcc": 4.7 },
+        { "name": "f", "a_au": 0.03849, "e": 0.011, "m_earth": 1.039, "density_gcc": 4.8 },
+        { "name": "g", "a_au": 0.04683, "e": 0.002, "m_earth": 1.321, "density_gcc": 4.9 },
+        { "name": "h", "a_au": 0.06189, "e": 0.086, "m_earth": 0.326, "density_gcc": 4.4 }
+    ],
+    "belts": {
+        "belt_budget": 80,
+        "total_mass_earth": 1e-5,
+        "outer": {
+            "populations": [
+                { "kind": "cold_classical", "a_lo_au": 0.5, "a_hi_au": 4.0, "mass_frac": 1.0, "e_sigma": 0.03 }
+            ]
+        }
+    }
+}

@@ -1,0 +1,12 @@
+{
+    "name": "WD 1145+017",
+    "dust_boost": 5.0,
+    "star": { "name": "WD 1145+017", "mass_earth": 200000.0, "age_gyr": 0.25,
+              "metallicity": 0.0, "kind": "white_dwarf" },
+    "planets": [],
+    "belts": {
+        "belt_budget": 300,
+        "total_mass_earth": 0.005,
+        "inner": { "a_lo_au": 0.005, "a_hi_au": 0.05, "mass_frac": 1.0 }
+    }
+}

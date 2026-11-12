@@ -1,0 +1,31 @@
+{
+    "name": "HD 40307",
+    "dust_boost": 1.0,
+    "star": {
+        "mass_earth": 256368.0,
+        "age_gyr": 1.2,
+        "metallicity": -0.31
+    },
+    "planets": [
+        { "name": "b", "a_au": 0.0468, "e": 0.0,  "m_earth": 4.0,  "density_gcc": 3.6 },
+        { "name": "c", "a_au": 0.0812, "e": 0.0,  "m_earth": 6.6,  "density_gcc": 2.4 },
+        { "name": "d", "a_au": 0.1321, "e": 0.0,  "m_earth": 9.5,  "density_gcc": 1.9 },
+        { "name": "e", "a_au": 0.1886, "e": 0.06, "m_earth": 3.5,  "density_gcc": 2.0 },
+        { "name": "f", "a_au": 0.2470, "e": 0.02, "m_earth": 5.2,  "density_gcc": 2.0 },
+        { "name": "g", "a_au": 0.6000, "e": 0.15, "m_earth": 7.1,  "density_gcc": 2.3 }
+    ],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 0.005,
+        "inner": {
+            "a_lo_au": 0.8,
+            "a_hi_au": 1.5,
+            "mass_frac": 0.3
+        },
+        "outer": {
+            "populations": [
+                { "kind": "cold_classical", "a_lo_au": 5.0, "a_hi_au": 25.0, "mass_frac": 0.7, "e_sigma": 0.05 }
+            ]
+        }
+    }
+}

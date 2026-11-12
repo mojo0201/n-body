@@ -1,0 +1,19 @@
+{
+    "name": "γ Cephei",
+    "dust_boost": 1.0,
+    "star": { "name": "γ Cep A", "mass_earth": 466000.0, "age_gyr": 6.0, "metallicity": 0.10 },
+    "companions": [
+        { "name": "γ Cep B", "mass_earth": 133000.0, "a_au": 20.0, "e": 0.41, "phase": 0.3 }
+    ],
+    "planets": [
+        { "name": "γ Cep b", "a_au": 2.05, "e": 0.11, "m_earth": 588.0, "density_gcc": 1.4 }
+    ],
+    "belts": {
+        "belt_budget": 200,
+        "total_mass_earth": 0.005,
+        "outer": { "populations": [
+            { "kind": "cold_classical", "a_lo_au": 60.0, "a_hi_au": 120.0,
+              "mass_frac": 1.0, "e_sigma": 0.05 }
+        ] }
+    }
+}

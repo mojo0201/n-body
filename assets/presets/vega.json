@@ -1,0 +1,20 @@
+{
+    "name": "Vega",
+    "dust_boost": 2.0,
+    "star": {
+        "mass_earth": 710840.0,
+        "age_gyr": 0.455,
+        "metallicity": -0.5
+    },
+    "planets": [],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 10.0,
+        "outer": {
+            "populations": [
+                { "kind": "cold_classical", "a_lo_au": 80.0, "a_hi_au": 120.0, "mass_frac": 0.5, "e_sigma": 0.05 },
+                { "kind": "scattered", "a_lo_au": 120.0, "a_hi_au": 400.0, "mass_frac": 0.5, "e_sigma": 0.20, "q_frac": 100.0 }
+            ]
+        }
+    }
+}

@@ -1,0 +1,65 @@
+{
+    "colors": {
+        "panel_fill": [
+            14,
+            15,
+            20,
+            236
+        ],
+        "window_fill": [
+            14,
+            15,
+            20,
+            236
+        ],
+        "accent": [
+            120,
+            190,
+            255
+        ],
+        "warn": [
+            255,
+            150,
+            100
+        ],
+        "good": [
+            130,
+            220,
+            150
+        ],
+        "dim": [
+            140,
+            140,
+            140
+        ],
+        "selection_bg": [
+            40,
+            90,
+            140
+        ],
+        "text": [
+            220,
+            220,
+            220
+        ]
+    },
+    "spacing": {
+        "item_spacing": [
+            6.0,
+            4.0
+        ],
+        "button_padding": [
+            7.0,
+            3.0
+        ],
+        "window_margin": 8.0,
+        "window_rounding": 6.0,
+        "panel_margin": 8.0
+    },
+    "fonts": {
+        "body_size": 13.0,
+        "small_size": 10.5,
+        "heading_size": 16.0,
+        "mono_size": 12.0
+    }
+}

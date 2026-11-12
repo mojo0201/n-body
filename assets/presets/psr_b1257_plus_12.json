@@ -1,0 +1,11 @@
+{
+    "name": "PSR B1257+12 (Lich)",
+    "dust_boost": 0.1,
+    "star": { "name": "PSR B1257+12", "mass_earth": 466000.0, "age_gyr": 3.0,
+              "metallicity": 0.0, "kind": "neutron_star" },
+    "planets": [
+        { "name": "Draugr",      "a_au": 0.19, "e": 0.0,    "m_earth": 0.02, "density_gcc": 5.5 },
+        { "name": "Poltergeist", "a_au": 0.36, "e": 0.0186, "m_earth": 4.3,  "density_gcc": 5.5 },
+        { "name": "Phobetor",    "a_au": 0.46, "e": 0.0252, "m_earth": 3.9,  "density_gcc": 5.5 }
+    ]
+}

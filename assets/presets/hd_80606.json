@@ -1,0 +1,8 @@
+{
+    "name": "HD 80606",
+    "dust_boost": 0.5,
+    "star": { "name": "HD 80606", "mass_earth": 322957.0, "age_gyr": 5.0, "metallicity": 0.43 },
+    "planets": [
+        { "name": "HD 80606 b", "a_au": 0.456, "e": 0.933, "m_earth": 1240.0, "density_gcc": 0.5 }
+    ]
+}

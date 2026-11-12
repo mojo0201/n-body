@@ -1,0 +1,10 @@
+{
+    "name": "Algol (β Persei)",
+    "dust_boost": 0.3,
+    "star": { "name": "Algol Aa1", "mass_earth": 1055239.0, "age_gyr": 0.57, "metallicity": 0.0 },
+    "companions": [
+        { "name": "Algol Aa2", "mass_earth": 256368.0, "a_au": 0.062, "e": 0.0,   "phase": 0.0 },
+        { "name": "Algol Ab",  "mass_earth": 66589.0,  "a_au": 2.69,  "e": 0.225, "phase": 0.5 }
+    ],
+    "planets": []
+}

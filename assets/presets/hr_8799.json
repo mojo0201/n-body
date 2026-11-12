@@ -1,0 +1,24 @@
+{
+    "name": "HR 8799",
+    "dust_boost": 2.0,
+    "star": {
+        "mass_earth": 489431.0,
+        "age_gyr": 0.03,
+        "metallicity": -0.47
+    },
+    "planets": [
+        { "name": "e", "a_au": 16.25, "e": 0.1445, "m_earth": 2353.0, "density_gcc": 1.0 },
+        { "name": "d", "a_au": 26.67, "e": 0.1134, "m_earth": 2894.0, "density_gcc": 1.0 },
+        { "name": "c", "a_au": 41.39, "e": 0.0519, "m_earth": 2480.0, "density_gcc": 1.0 },
+        { "name": "b", "a_au": 71.60, "e": 0.0160, "m_earth": 1813.0, "density_gcc": 1.0 }
+    ],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 0.04,
+        "outer": {
+            "populations": [
+                { "kind": "cold_classical", "a_lo_au": 104.0, "a_hi_au": 360.0, "mass_frac": 1.0, "e_sigma": 0.05 }
+            ]
+        }
+    }
+}

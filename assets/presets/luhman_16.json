@@ -1,0 +1,19 @@
+{
+    "name": "Luhman 16",
+    "dust_boost": 0.5,
+    "star": { "name": "Luhman 16 A", "mass_earth": 10653.0, "age_gyr": 0.6,
+              "metallicity": 0.0, "kind": "brown_dwarf" },
+    "companions": [
+        { "name": "Luhman 16 B", "mass_earth": 9095.0, "kind": "brown_dwarf",
+          "a_au": 3.5, "e": 0.34, "phase": 0.0 }
+    ],
+    "planets": [],
+    "belts": {
+        "belt_budget": 80,
+        "total_mass_earth": 1e-6,
+        "outer": { "populations": [
+            { "kind": "cold_classical", "a_lo_au": 20.0, "a_hi_au": 100.0,
+              "mass_frac": 1.0, "e_sigma": 0.10 }
+        ] }
+    }
+}

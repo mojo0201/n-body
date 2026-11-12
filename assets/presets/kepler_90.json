@@ -1,0 +1,15 @@
+{
+    "name": "Kepler-90",
+    "dust_boost": 1.0,
+    "star": { "name": "Kepler-90", "mass_earth": 350000.0, "age_gyr": 2.0, "metallicity": 0.10 },
+    "planets": [
+        { "name": "b", "a_au": 0.074, "e": 0.0, "m_earth": 5.0,  "density_gcc": 4.0 },
+        { "name": "c", "a_au": 0.089, "e": 0.0, "m_earth": 4.0,  "density_gcc": 4.5 },
+        { "name": "i", "a_au": 0.107, "e": 0.0, "m_earth": 1.5,  "density_gcc": 5.0 },
+        { "name": "d", "a_au": 0.320, "e": 0.0, "m_earth": 8.0,  "density_gcc": 3.5 },
+        { "name": "e", "a_au": 0.420, "e": 0.0, "m_earth": 8.0,  "density_gcc": 3.5 },
+        { "name": "f", "a_au": 0.480, "e": 0.0, "m_earth": 8.0,  "density_gcc": 3.5 },
+        { "name": "g", "a_au": 0.710, "e": 0.0, "m_earth": 50.0, "density_gcc": 1.4 },
+        { "name": "h", "a_au": 1.010, "e": 0.0, "m_earth": 60.0, "density_gcc": 1.2 }
+    ]
+}

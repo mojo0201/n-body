@@ -1,0 +1,19 @@
+{
+    "name": "Kepler-16",
+    "dust_boost": 0.5,
+    "star": { "name": "Kepler-16 A", "mass_earth": 229732.0, "age_gyr": 2.0, "metallicity": -0.30 },
+    "companions": [
+        { "name": "Kepler-16 B", "mass_earth": 66589.0, "a_au": 0.22, "e": 0.16, "phase": 0.0 }
+    ],
+    "planets": [
+        { "name": "Kepler-16 b", "a_au": 0.70, "e": 0.007, "m_earth": 106.0, "density_gcc": 0.7 }
+    ],
+    "belts": {
+        "belt_budget": 200,
+        "total_mass_earth": 0.003,
+        "outer": { "populations": [
+            { "kind": "cold_classical", "a_lo_au": 3.0, "a_hi_au": 6.0,
+              "mass_frac": 1.0, "e_sigma": 0.05 }
+        ] }
+    }
+}

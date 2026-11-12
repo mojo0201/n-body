@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+
+# Profiler output (perf record generates these; can be 500+ MB each)
+perf.data
+perf.data.old
+perf.data.*
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
