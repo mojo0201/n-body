@@ -50,7 +50,12 @@ pub(in crate::physics) fn debris_belt_occurrence_fraction(m_sun: f64, age_gyr: f
 /// M⊕ — the real Kuiper + asteroid belt. The age factor uses a
 /// 300-Myr collisional-depletion timescale (Wyatt 2008), so a 100-Myr
 /// disk is about 4× more massive than a 5-Gyr one.
-pub(in crate::physics) fn belt_mass_earth(m_sun: f64, feh: f64, age_gyr: f64, rng: &mut XorShift) -> f64 {
+pub(in crate::physics) fn belt_mass_earth(
+    m_sun: f64,
+    feh: f64,
+    age_gyr: f64,
+    rng: &mut XorShift,
+) -> f64 {
     let baseline = 0.02 * m_sun * 10f64.powf(1.5 * feh);
     let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0));
     baseline * scatter * (1.0 + age_gyr / 0.3).powf(-1.0)
@@ -63,7 +68,12 @@ pub(in crate::physics) fn belt_mass_earth(m_sun: f64, feh: f64, age_gyr: f64, rn
 /// the inner belt. The age factor `(1 + t/3 Gyr)^-0.3` is mild (~1.3x at
 /// 4.6 Gyr): a primordial cold belt is barely collisionally depleted, unlike
 /// the inner belt in `belt_mass_earth`.
-pub(in crate::physics) fn belt_mass_earth_outer(m_sun: f64, feh: f64, age_gyr: f64, rng: &mut XorShift) -> f64 {
+pub(in crate::physics) fn belt_mass_earth_outer(
+    m_sun: f64,
+    feh: f64,
+    age_gyr: f64,
+    rng: &mut XorShift,
+) -> f64 {
     let baseline = 0.035 * m_sun * 10f64.powf(1.5 * feh);
     let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0));
     baseline * scatter * (1.0 + age_gyr / 3.0).powf(-0.3)
@@ -120,7 +130,12 @@ pub(in crate::physics) fn crosses_gap(a_au: f64, gaps: &[Gap]) -> bool {
 
 /// Draw a semi-major axis in `[lo, hi]` AU that is outside every gap.
 /// Returns `None` when 16 draws all fall in gaps.
-pub(in crate::physics) fn draw_a_outside_gaps(rng: &mut XorShift, lo: f64, hi: f64, gaps: &[Gap]) -> Option<f64> {
+pub(in crate::physics) fn draw_a_outside_gaps(
+    rng: &mut XorShift,
+    lo: f64,
+    hi: f64,
+    gaps: &[Gap],
+) -> Option<f64> {
     for _ in 0..16 {
         let a = lo + (hi - lo) * rng.next_f64();
         if !crosses_gap(a, gaps) {
@@ -134,7 +149,12 @@ pub(in crate::physics) fn draw_a_outside_gaps(rng: &mut XorShift, lo: f64, hi: f
 /// outside every gap. The surface density falls as a^-1.5, so the number of
 /// bodies per unit a goes as a^-0.5 (flat-in-a would put too much mass far
 /// out). Falls back to a flat draw if `hi` is not finite.
-pub(in crate::physics) fn draw_a_outer(rng: &mut XorShift, lo: f64, hi: f64, gaps: &[Gap]) -> Option<f64> {
+pub(in crate::physics) fn draw_a_outer(
+    rng: &mut XorShift,
+    lo: f64,
+    hi: f64,
+    gaps: &[Gap],
+) -> Option<f64> {
     if !(hi.is_finite() && lo > 0.0 && hi > lo) {
         return draw_a_outside_gaps(rng, lo, hi, gaps);
     }
@@ -166,11 +186,7 @@ pub(in crate::physics) fn spawn_belt_body(
     let omega = rng.next_f64() * std::f64::consts::TAU;
     let (cx, cy, cvx, cvy, mc) = centre;
     let (x, y, vx, vy) = kepler_state(G * mc, a_gm, e, nu, omega);
-    let kind = if m >= BELT_DWARF_M_MIN {
-        BodyKind::DwarfPlanet
-    } else {
-        BodyKind::Planet
-    };
+    let kind = classify_small_body(m);
     let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
     b.origin[i] = origin;
     b.bulk_density[i] = draw_density(rng, (a_gm / au_in_gm()) < snow_line_au);
@@ -180,7 +196,11 @@ pub(in crate::physics) fn spawn_belt_body(
 
 /// Angle (rad) of the giant planet nearest to `a_au` about the centre, if
 /// the system has one within 10 %.
-pub(in crate::physics) fn giant_angle(b: &Bodies, centre: (f64, f64, f64, f64, f64), a_au: f64) -> Option<f64> {
+pub(in crate::physics) fn giant_angle(
+    b: &Bodies,
+    centre: (f64, f64, f64, f64, f64),
+    a_au: f64,
+) -> Option<f64> {
     let au = au_in_gm();
     let mut best: Option<(f64, f64)> = None;
     for i in 0..b.len() {
@@ -202,7 +222,11 @@ pub(in crate::physics) fn giant_angle(b: &Bodies, centre: (f64, f64, f64, f64, f
 
 /// Mass (Earth masses) of the giant planet nearest to `a_au` about the
 /// centre, if the system has one within 10 %.
-pub(in crate::physics) fn giant_mass_near(b: &Bodies, centre: (f64, f64, f64, f64, f64), a_au: f64) -> Option<f64> {
+pub(in crate::physics) fn giant_mass_near(
+    b: &Bodies,
+    centre: (f64, f64, f64, f64, f64),
+    a_au: f64,
+) -> Option<f64> {
     let au = au_in_gm();
     let mut best: Option<(f64, f64)> = None;
     for i in 0..b.len() {
@@ -238,11 +262,7 @@ pub(in crate::physics) fn spawn_trojan(
     let omega = giant_angle + lead * std::f64::consts::PI / 3.0 + jitter;
     let (cx, cy, cvx, cvy, mc) = centre;
     let (x, y, vx, vy) = kepler_state(G * mc, a_gm, e, 0.0, omega);
-    let kind = if m >= BELT_DWARF_M_MIN {
-        BodyKind::DwarfPlanet
-    } else {
-        BodyKind::Planet
-    };
+    let kind = classify_small_body(m);
     let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
     b.origin[i] = BodyOrigin::Trojan;
     b.bulk_density[i] = draw_density(rng, true);

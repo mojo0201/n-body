@@ -473,3 +473,73 @@ fn moon_diagnose() {
         advance(&mut b, DT);
     }
 }
+
+// Append to src/physics/tests/presets.rs.
+// Also delete `moon_diagnose` from that file: Task 1 is closed.
+// `find_named` is the helper added for Task 1 in the same file.
+
+#[test]
+fn preset_is_dwarf_validated() {
+    let json = r#"{
+        "name": "Fixture",
+        "star": { "mass_earth": 332946.0, "age_gyr": 4.6, "metallicity": 0.0 },
+        "planets": [
+            { "name": "heavy", "a_au": 1.0, "e": 0.0, "m_earth": 0.5, "is_dwarf": true },
+            { "name": "light", "a_au": 2.0, "e": 0.0, "m_earth": 0.001, "is_dwarf": true }
+        ]
+    }"#;
+    let preset: SystemPreset = serde_json::from_str(json).expect("parse");
+    let mut b = Bodies::with_capacity(0);
+    let warnings = spawn_from_preset_seeded(&mut b, &preset, 1);
+    let heavy = find_named(&b, "heavy").expect("heavy");
+    let light = find_named(&b, "light").expect("light");
+    assert_eq!(b.kind[heavy], BodyKind::Planet, "0.5 M⊕ is not a dwarf");
+    assert_eq!(b.kind[light], BodyKind::DwarfPlanet);
+    assert_eq!(warnings.len(), 1, "warnings {:?}", warnings);
+    assert!(warnings[0].contains("heavy"));
+    assert!(b
+        .events
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::User) && e.text.contains("heavy")));
+}
+
+#[test]
+fn preset_dwarf_mass_within_range() {
+    let preset = load_preset_by_slug("solar_system").expect("solar_system");
+    for name in ["Ceres", "Pluto", "Eris", "Haumea", "Makemake"] {
+        let p = preset
+            .planets
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        assert!(p.is_dwarf, "{name} is not flagged dwarf");
+    }
+    // Every flagged body, not only the five.
+    for p in preset.planets.iter().filter(|p| p.is_dwarf) {
+        assert!(
+            (BELT_DWARF_M_MIN..=DWARF_M_MAX).contains(&p.m_earth),
+            "{} mass {} outside [{}, {}]",
+            p.name,
+            p.m_earth,
+            BELT_DWARF_M_MIN,
+            DWARF_M_MAX
+        );
+    }
+}
+
+#[test]
+fn moon_of_dwarf_not_labelled_dwarf() {
+    let mut b = Bodies::with_capacity(3);
+    let au = au_in_gm();
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let dwarf = b.push(au, 0.0, 0.0, 0.0, 0.002, BodyKind::DwarfPlanet);
+    // Well inside the dwarf's Hill sphere (about 0.19 Gm).
+    let moon = b.push(au + 0.02, 0.0, 0.0, 0.0, 0.0003, BodyKind::DwarfPlanet);
+    b.origin[dwarf] = BodyOrigin::Spawned;
+    b.origin[moon] = BodyOrigin::Spawned;
+    assert_eq!(b.kind[moon], BodyKind::DwarfPlanet);
+    assert_eq!(find_parent(&b, moon), Some(dwarf));
+    assert_eq!(body_class_with_parent(&b, moon, Some(dwarf)), "moon");
+    assert_eq!(body_class(&b, moon), "moon");
+    assert_eq!(body_class(&b, dwarf), "dwarf planet");
+}

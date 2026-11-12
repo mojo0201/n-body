@@ -211,9 +211,11 @@ fn belt_dwarf_planets_use_dwarf_kind() {
         spawn_system(&mut b, 100, seed);
         for i in 0..b.len() {
             if b.origin[i].is_belt() {
+                // Dwarfs have an upper mass limit too, so a heavy belt body
+                // stays a planet.
                 assert_eq!(
                     b.kind[i] == BodyKind::DwarfPlanet,
-                    b.m[i] >= BELT_DWARF_M_MIN
+                    (BELT_DWARF_M_MIN..=DWARF_M_MAX).contains(&b.m[i])
                 );
             }
         }
@@ -231,4 +233,44 @@ fn belt_body_distance_matches_primary() {
     let o = orbit_info(&b, belt, prim);
     assert!(o.dist > 0.0);
     assert!(o.period.is_finite());
+}
+
+#[test]
+fn belt_classification_uses_thresholds() {
+    const { assert!(BELT_DWARF_M_MIN < DWARF_M_MAX) };
+    assert_eq!(
+        classify_small_body(BELT_DWARF_M_MIN * 0.999),
+        BodyKind::Planet
+    );
+    assert_eq!(classify_small_body(BELT_DWARF_M_MIN), BodyKind::DwarfPlanet);
+    assert_eq!(classify_small_body(DWARF_M_MAX), BodyKind::DwarfPlanet);
+    assert_eq!(classify_small_body(DWARF_M_MAX * 1.001), BodyKind::Planet);
+}
+
+#[test]
+fn classify_small_body_matches_belt_spawn() {
+    let mut checked = 0usize;
+    let mut check = |b: &Bodies, ctx: &str| {
+        for i in 0..b.len() {
+            if b.origin[i].is_belt() {
+                checked += 1;
+                assert_eq!(
+                    b.kind[i],
+                    classify_small_body(b.m[i]),
+                    "{ctx} body {i} mass {}",
+                    b.m[i]
+                );
+            }
+        }
+    };
+    for seed in 0..100u32 {
+        let mut b = Bodies::with_capacity(100);
+        spawn_system(&mut b, 100, seed);
+        check(&b, &format!("seed {seed}"));
+    }
+    // The Solar System preset has the heavy belt and the Trojans.
+    let mut b = Bodies::with_capacity(0);
+    spawn_solar_system(&mut b);
+    check(&b, "solar_system");
+    assert!(checked > 0, "no belt bodies were checked");
 }

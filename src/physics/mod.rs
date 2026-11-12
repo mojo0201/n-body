@@ -150,11 +150,9 @@ pub const NS_M_MAX: f64 = 2.5 * M_SUN_ME;
 
 pub const NS_R_GM: f64 = 1e-5;
 
-// Dwarf planets.
-pub const DWARF_M_MAX: f64 = 0.013;
+pub const DWARF_M_MAX: f64 = 0.005;
 
-/// A belt body at or above this mass (Earth masses) is a dwarf planet.
-pub const BELT_DWARF_M_MIN: f64 = 1e-3;
+pub const BELT_DWARF_M_MIN: f64 = 1e-4;
 
 pub const BH_CAPTURE_HORIZONS: f64 = 3.0;
 

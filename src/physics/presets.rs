@@ -272,7 +272,11 @@ pub(super) fn belt_spec_for(
     spec
 }
 
-pub(super) fn belt_spec_for_evolved(m_remnant_sun: f64, _age_gyr: f64, rng: &mut XorShift) -> BeltSpec {
+pub(super) fn belt_spec_for_evolved(
+    m_remnant_sun: f64,
+    _age_gyr: f64,
+    rng: &mut XorShift,
+) -> BeltSpec {
     if m_remnant_sun < 1.0 && rng.next_f64() < 0.3 {
         let total = 1e-4 * rng.next_f64();
         BeltSpec {
@@ -442,7 +446,13 @@ pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: 
     b.set_mass(idx, c.mass_earth);
 }
 
-pub(super) fn push_circumbinary(b: &mut Bodies, a_au: f64, e: f64, m_me: f64, mean_anomaly: f64) -> usize {
+pub(super) fn push_circumbinary(
+    b: &mut Bodies,
+    a_au: f64,
+    e: f64,
+    m_me: f64,
+    mean_anomaly: f64,
+) -> usize {
     let n = b.len();
     let (mut mt, mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for i in 0..n {
@@ -621,11 +631,20 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
                 "hot_jupiter",
                 include_str!("../../assets/presets/hot_jupiter.json"),
             ),
-            ("wasp_12b", include_str!("../../assets/presets/wasp_12b.json")),
-            ("hd_80606", include_str!("../../assets/presets/hd_80606.json")),
+            (
+                "wasp_12b",
+                include_str!("../../assets/presets/wasp_12b.json"),
+            ),
+            (
+                "hd_80606",
+                include_str!("../../assets/presets/hd_80606.json"),
+            ),
             ("vega", include_str!("../../assets/presets/vega.json")),
             ("hr_8799", include_str!("../../assets/presets/hr_8799.json")),
-            ("hd_40307", include_str!("../../assets/presets/hd_40307.json")),
+            (
+                "hd_40307",
+                include_str!("../../assets/presets/hd_40307.json"),
+            ),
             (
                 "gamma_cephei",
                 include_str!("../../assets/presets/gamma_cephei.json"),
@@ -689,7 +708,13 @@ pub fn spawn_preset_with_seed(b: &mut Bodies, preset: &SystemPreset, phase_seed:
 }
 
 /// Like `spawn_from_preset`, with the seed that picks each planet's phase.
-pub(super) fn spawn_from_preset_seeded(b: &mut Bodies, preset: &SystemPreset, phase_seed: u32) {
+/// Returns one warning for each preset flag that the masses contradict.
+pub(super) fn spawn_from_preset_seeded(
+    b: &mut Bodies,
+    preset: &SystemPreset,
+    phase_seed: u32,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
     let n_stars = 1 + preset.companions.len();
     let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
     *b = Bodies::with_capacity(n_stars + preset.planets.len() + n_moons);
@@ -722,7 +747,7 @@ pub(super) fn spawn_from_preset_seeded(b: &mut Bodies, preset: &SystemPreset, ph
         };
         b.name[idx] = Some(p.name.clone());
         if p.is_dwarf {
-            b.kind[idx] = BodyKind::DwarfPlanet;
+            apply_dwarf_flag(b, idx, &mut warnings);
         }
         let rho = p
             .density_gcc
@@ -735,7 +760,7 @@ pub(super) fn spawn_from_preset_seeded(b: &mut Bodies, preset: &SystemPreset, ph
             let mi = push_orbit(b, idx, moon.a_au, moon.e, moon.m_earth, mangle);
             b.name[mi] = Some(moon.name.clone());
             if moon.is_dwarf {
-                b.kind[mi] = BodyKind::DwarfPlanet;
+                apply_dwarf_flag(b, mi, &mut warnings);
             }
             b.bulk_density[mi] = moon
                 .density_gcc
@@ -763,6 +788,7 @@ pub(super) fn spawn_from_preset_seeded(b: &mut Bodies, preset: &SystemPreset, ph
             g.mass *= preset.dust_boost;
         }
     }
+    warnings
 }
 
 /// Copy every body of `src` into `dst`, shifted by `(cx, cy)`. Returns the
@@ -905,4 +931,21 @@ pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Ve
         .fold(0.0f64, f64::max)
         .max(1.0);
     (radius, ranges)
+}
+
+/// Set the kind of a preset body flagged `is_dwarf` from its mass. A flag
+/// that disagrees with the mass is overridden; the warning goes to the
+/// event log and to `warnings`.
+fn apply_dwarf_flag(b: &mut Bodies, i: usize, warnings: &mut Vec<String>) {
+    let kind = classify_small_body(b.m[i]);
+    b.kind[i] = kind;
+    if kind != BodyKind::DwarfPlanet {
+        let text = format!(
+            "preset: {} is flagged dwarf but its mass is outside the dwarf range",
+            tag(b, i)
+        );
+        let (x, y) = (b.x[i], b.y[i]);
+        warnings.push(text.clone());
+        b.log(EventKind::User, text, x, y);
+    }
 }

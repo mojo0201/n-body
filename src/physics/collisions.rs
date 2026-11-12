@@ -147,7 +147,12 @@ pub(super) fn find_collisions(b: &Bodies, sweep: bool, dt: f64) -> Vec<(usize, u
     pairs
 }
 
-pub(super) fn find_collisions_hot(b: &Bodies, hot: &[usize], sweep: bool, dt: f64) -> Vec<(usize, usize)> {
+pub(super) fn find_collisions_hot(
+    b: &Bodies,
+    hot: &[usize],
+    sweep: bool,
+    dt: f64,
+) -> Vec<(usize, usize)> {
     let _ = dt;
     if hot.len() * hot.len() > 4_000_000 {
         return find_collisions(b, sweep, dt);
@@ -524,7 +529,11 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
         b.log(EventKind::Merge, text, cx, cy);
     }
 
-    if b.origin[keep].is_belt() && b.kind[keep] == BodyKind::Planet && b.m[keep] >= BELT_DWARF_M_MIN
+    // Same mass range as the spawn, so a merge cannot promote a body that
+    // is already above `DWARF_M_MAX`.
+    if b.origin[keep].is_belt()
+        && b.kind[keep] == BodyKind::Planet
+        && classify_small_body(b.m[keep]) == BodyKind::DwarfPlanet
     {
         b.kind[keep] = BodyKind::DwarfPlanet;
     }

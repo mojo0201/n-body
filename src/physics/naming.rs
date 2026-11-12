@@ -46,6 +46,14 @@ pub fn bd_class(m: f64) -> char {
     }
 }
 
+pub fn classify_small_body(m: f64) -> BodyKind {
+    if (BELT_DWARF_M_MIN..=DWARF_M_MAX).contains(&m) {
+        BodyKind::DwarfPlanet
+    } else {
+        BodyKind::Planet
+    }
+}
+
 pub fn class_name(b: &Bodies, i: usize) -> String {
     match b.kind[i] {
         BodyKind::BlackHole => "black hole".to_string(),
