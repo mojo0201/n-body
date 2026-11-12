@@ -22,7 +22,7 @@ use super::*;
 /// Tracers released per belt/rubble body at start-up (capped by the budget).
 pub const DUST_GRAINS_PER_BODY: usize = 60;
 /// Hard cap per field.
-pub const DUST_MAX_GRAINS: usize = 150_000;
+pub const DUST_MAX_GRAINS: usize = 500_000;
 /// Tracers emitted by one collision.
 pub const DUST_EMIT_GRAINS: usize = 40;
 /// Ejection speed of collision dust, as a fraction of local circular speed.
