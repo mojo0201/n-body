@@ -712,6 +712,7 @@ pub struct Flash {
     pub r0: f64,
     pub age: f64,
     pub life: f64,
+    pub expires_at: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

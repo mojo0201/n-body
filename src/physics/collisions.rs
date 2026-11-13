@@ -23,6 +23,7 @@ pub(super) fn flash_at(b: &mut Bodies, x: f64, y: f64, r0: f64) {
         r0,
         age: 0.0,
         life: FLASH_LIFE,
+        expires_at: b.time + FLASH_LIFE,
     });
 }
 

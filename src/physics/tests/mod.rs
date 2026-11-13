@@ -60,15 +60,16 @@
 //! Files: shared helpers, then one file per area (`cargo test --lib
 //! physics::tests::collisions` runs one area).
 
-mod shared;
-mod conservation;
 mod collisions;
+mod conservation;
+mod debris;
+mod dust;
+mod evolution;
+mod forces;
+mod fuzz;
 mod kepler;
 mod orbits;
-mod debris;
-mod evolution;
+mod presets;
+mod shared;
 mod spawn;
 mod util;
-mod presets;
-mod fuzz;
-mod dust;
