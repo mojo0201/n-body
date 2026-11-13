@@ -865,3 +865,467 @@ fn p_escape_cull_culls_light_ejectee() {
     assert_eq!(b.len(), 1, "light ejectee must still be culled");
     assert!(b.events.iter().any(|e| matches!(e.kind, EventKind::Escape)));
 }
+
+// ===========================================================================
+// q — energy / angular-momentum bookkeeping: unit-level correctness
+// ===========================================================================
+//
+// The existing `q_*` tests only prove that drift stays *small* over
+// integration. These tests pin the helpers' contract instead: closed-form
+// values, edge cases, None-return paths, idempotency, and the serial-vs-
+// parallel equivalence inside `potential_energy`. A future change that
+// preserved "small drift" while returning a consistently wrong energy
+// would slip past the existing suite but fail every test below.
+
+// ---------------------------------------------------------------------------
+// total_energy — closed-form / edge cases
+// ---------------------------------------------------------------------------
+
+/// Empty system: no kinetic terms, no pairs → energy is exactly zero.
+#[test]
+fn q_total_energy_empty_is_zero() {
+    let b = Bodies::with_capacity(0);
+    assert_eq!(total_energy(&b), Some(0.0));
+}
+
+/// Single stationary body: no pairs (n < 2) and v = 0 → energy is zero.
+#[test]
+fn q_total_energy_single_stationary_is_zero() {
+    let mut b = Bodies::with_capacity(1);
+    b.push(1.0, 2.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    assert_eq!(total_energy(&b), Some(0.0));
+}
+
+/// Single moving body: energy reduces to exactly ½·m·v².
+#[test]
+fn q_total_energy_single_moving_is_kinetic() {
+    let mut b = Bodies::with_capacity(1);
+    b.push(0.0, 0.0, 3.0, 4.0, 2.0, BodyKind::Planet); // v² = 25
+    let e = total_energy(&b).unwrap();
+    assert!((e - 25.0).abs() < 1e-12, "e = {e}");
+}
+
+/// Two stationary bodies: energy is the softened potential — negative,
+/// with magnitude G·m₁·m₂/√(r² + SOFT2). Pins both the sign convention
+/// and the `+ SOFT2` term.
+#[test]
+fn q_total_energy_two_body_at_rest_is_negative_pe() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(10.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    let e = total_energy(&b).unwrap();
+    let expected = -G / (100.0 + SOFT2).sqrt();
+    assert!(
+        (e - expected).abs() < 1e-12 * expected.abs(),
+        "e = {e}, expected {expected}"
+    );
+    assert!(e < 0.0);
+}
+
+/// Coincident bodies: the `SOFT2` term keeps the 1/r² PE from blowing up.
+/// The result must be finite and match -G·m₁·m₂/√SOFT2.
+#[test]
+fn q_total_energy_coincident_finite() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    let e = total_energy(&b).unwrap();
+    let expected = -G / SOFT2.sqrt();
+    assert!(e.is_finite());
+    assert!((e - expected).abs() < 1e-12 * expected.abs().max(1e-30));
+}
+
+/// Virial theorem on a circular two-body orbit at r ≫ √SOFT2:
+/// PE ≈ -2·KE and E ≈ -KE. `a = 100` makes the softening correction
+/// well below the tolerance regardless of SOFT2's exact magnitude.
+#[test]
+fn q_total_energy_circular_orbit_virial() {
+    let (m1, m2) = (M_SUN_ME, 1.0);
+    let mt = m1 + m2;
+    let mu = m1 * m2 / mt;
+    let a = 100.0;
+    let v_rel = (G * mt / a).sqrt();
+    let mut b = Bodies::with_capacity(2);
+    b.push(-m2 / mt * a, 0.0, 0.0, -m2 / mt * v_rel, m1, BodyKind::Star);
+    b.push(m1 / mt * a, 0.0, 0.0, m1 / mt * v_rel, m2, BodyKind::Planet);
+    let e = total_energy(&b).unwrap();
+    let ke = 0.5 * mu * v_rel * v_rel;
+    assert!(e < 0.0, "circular orbit is bound: {e}");
+    // E ≈ -KE (virial), with tolerance absorbing SOFT2 / a².
+    let neg_ke = -ke;
+    assert!((e + ke).abs() < 1e-3 * ke, "E {e} vs -KE {neg_ke} (virial)");
+}
+
+/// Above `ENERGY_MAX_N`, `total_energy` returns None directly — not only
+/// via `energy_drift_pct`'s early return.
+#[test]
+fn q_total_energy_above_limit_none_direct() {
+    let mut b = Bodies::with_capacity(ENERGY_MAX_N + 1);
+    for k in 0..=ENERGY_MAX_N {
+        b.push(k as f64, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    }
+    assert_eq!(total_energy(&b), None);
+}
+
+/// The optimised paired-row `potential_energy` must agree with a naïve
+/// inline O(n²) reference at every size, including the PE_PAR_THRESHOLD
+/// boundary where the code flips serial ↔ parallel. Any missed pair, a
+/// wrong `mid` split, or an off-by-one in the pairing surfaces here.
+#[test]
+fn q_total_energy_matches_reference() {
+    let reference = |b: &Bodies| -> f64 {
+        let n = b.len();
+        let mut e = 0.0;
+        for i in 0..n {
+            let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
+            e += 0.5 * b.m[i] * v2;
+            for j in (i + 1)..n {
+                let dx = b.x[j] - b.x[i];
+                let dy = b.y[j] - b.y[i];
+                e -= G * b.m[i] * b.m[j] / (dx * dx + dy * dy + SOFT2).sqrt();
+            }
+        }
+        e
+    };
+    // 127 = below threshold (serial), 128 = at threshold, 129 = above
+    // (parallel), plus a couple of larger sizes to stress the pairing.
+    for &n in &[2usize, 10, 127, 128, 129, 200] {
+        let mut b = Bodies::with_capacity(n);
+        let mut rng = XorShift::new(n as u32);
+        for _ in 0..n {
+            b.push(
+                100.0 * (rng.next_f64() - 0.5),
+                100.0 * (rng.next_f64() - 0.5),
+                10.0 * (rng.next_f64() - 0.5),
+                10.0 * (rng.next_f64() - 0.5),
+                0.1 + 10.0 * rng.next_f64(),
+                BodyKind::Planet,
+            );
+        }
+        let fast = total_energy(&b).unwrap();
+        let slow = reference(&b);
+        let rel = (fast - slow).abs() / slow.abs().max(1e-30);
+        assert!(rel < 1e-10, "n = {n}: {fast} vs {slow}, rel {rel}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// total_angular_momentum — closed-form / edge cases
+// ---------------------------------------------------------------------------
+
+/// Empty system: no bodies → L = 0.
+#[test]
+fn q_l_empty_is_zero() {
+    let b = Bodies::with_capacity(0);
+    assert_eq!(total_angular_momentum(&b), 0.0);
+}
+
+/// Single body: L about its own CoM is zero regardless of velocity.
+/// Without spin the function must return exactly zero for every
+/// direction of motion, since the "orbit" is degenerate.
+#[test]
+fn q_l_single_body_is_zero_without_spin() {
+    for (vx, vy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (3.0, -4.0)] {
+        let mut b = Bodies::with_capacity(1);
+        b.push(5.0, -3.0, vx, vy, 1.0, BodyKind::Planet);
+        assert_eq!(total_angular_momentum(&b), 0.0, "v = ({vx}, {vy})");
+    }
+}
+
+/// Single body with spin: the orbital term is still zero, so L = spin.
+#[test]
+fn q_l_single_body_returns_spin() {
+    let mut b = Bodies::with_capacity(1);
+    b.push(1.0, 2.0, 3.0, 4.0, 1.0, BodyKind::Planet);
+    b.spin[0] = 0.75;
+    assert!((total_angular_momentum(&b) - 0.75).abs() < 1e-15);
+}
+
+/// Two bodies separating purely radially: velocity is parallel to the
+/// separation vector, so r × v = 0 per body. L must vanish.
+#[test]
+fn q_l_two_body_radial_is_zero() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(-1.0, 0.0, -1.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(1.0, 0.0, 1.0, 0.0, 1.0, BodyKind::Planet);
+    assert!(total_angular_momentum(&b).abs() < 1e-15);
+}
+
+/// Circular two-body orbit: closed-form L = μ·√(G·M·a) with μ the
+/// reduced mass. Sign must flip when the orbit reverses (prograde ↔
+/// retrograde), which the second half verifies.
+#[test]
+fn q_l_two_body_circular_closed_form() {
+    let (m1, m2) = (M_SUN_ME, 1.0);
+    let mt = m1 + m2;
+    let mu = m1 * m2 / mt;
+    let a = 5.0;
+    let v_rel = (G * mt / a).sqrt();
+    let mut b = Bodies::with_capacity(2);
+    b.push(-m2 / mt * a, 0.0, 0.0, -m2 / mt * v_rel, m1, BodyKind::Star);
+    b.push(m1 / mt * a, 0.0, 0.0, m1 / mt * v_rel, m2, BodyKind::Planet);
+    let expected = mu * (G * mt * a).sqrt();
+    let got = total_angular_momentum(&b);
+    assert!(
+        (got / expected - 1.0).abs() < 1e-9,
+        "prograde L = {got} vs {expected}"
+    );
+    assert!(got > 0.0, "prograde must be positive");
+    // Retrograde: flip every velocity. L flips sign.
+    for i in 0..b.len() {
+        b.vy[i] = -b.vy[i];
+    }
+    let got_retro = total_angular_momentum(&b);
+    assert!(
+        (got_retro + expected).abs() / expected < 1e-9,
+        "retrograde L = {got_retro} vs -{expected}"
+    );
+    assert!(got_retro < 0.0);
+}
+
+/// Translation invariance: L about the CoM is invariant under a global
+/// coordinate shift. The two-pass subtraction form of
+/// `total_angular_momentum` is what makes this hold to fp precision;
+/// the algebraically-equivalent one-pass form Σm·r×v − M·R×V would
+/// diverge as the offset grows.
+#[test]
+fn q_l_translation_invariance() {
+    let make = |cx: f64, cy: f64| -> Bodies {
+        let (m1, m2) = (10.0, 1.0);
+        let mt = m1 + m2;
+        let a = 5.0;
+        let v_rel = (G * mt / a).sqrt();
+        let mut b = Bodies::with_capacity(2);
+        b.push(
+            cx - m2 / mt * a,
+            cy,
+            0.0,
+            -m2 / mt * v_rel,
+            m1,
+            BodyKind::Planet,
+        );
+        b.push(
+            cx + m1 / mt * a,
+            cy,
+            0.0,
+            m1 / mt * v_rel,
+            m2,
+            BodyKind::Planet,
+        );
+        b
+    };
+    let l0 = total_angular_momentum(&make(0.0, 0.0));
+    let l1 = total_angular_momentum(&make(1000.0, 500.0));
+    assert!(
+        (l0 - l1).abs() < 1e-9 * (1.0 + l0.abs()),
+        "L shifted: {l0} -> {l1}"
+    );
+}
+
+/// Spin adds linearly to the orbital L. Setting each spin to 0.5 must
+/// raise the total by exactly 1.0.
+#[test]
+fn q_l_spin_adds() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(-1.0, 0.0, 0.0, 1.0, 1.0, BodyKind::Planet);
+    b.push(1.0, 0.0, 0.0, -1.0, 1.0, BodyKind::Planet);
+    let l_orb = total_angular_momentum(&b);
+    b.spin[0] = 0.5;
+    b.spin[1] = 0.5;
+    let l_total = total_angular_momentum(&b);
+    assert!((l_total - (l_orb + 1.0)).abs() < 1e-15);
+}
+
+// ---------------------------------------------------------------------------
+// mark_energy / settle_energy / rebase_energy — contracts
+// ---------------------------------------------------------------------------
+
+/// `mark_energy` populates `e_pre` with the current energy.
+#[test]
+fn q_mark_energy_stores_e_pre() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    assert!(b.e_pre.is_none());
+    mark_energy(&mut b);
+    assert!(b.e_pre.is_some());
+    assert_eq!(b.e_pre, total_energy(&b));
+}
+
+/// `mark_energy` is idempotent — a retry mid-step must not overwrite
+/// the original snapshot, or drift would be under-counted.
+#[test]
+fn q_mark_energy_idempotent() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    mark_energy(&mut b);
+    let first = b.e_pre;
+    b.vx[0] = 1.0; // mutate so a second snapshot would differ
+    mark_energy(&mut b);
+    assert_eq!(b.e_pre, first, "second mark must be a no-op");
+}
+
+/// `settle_energy` without a prior mark is a no-op — e_pre stays None,
+/// offset stays put.
+#[test]
+fn q_settle_energy_noop_without_mark() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    let offset_before = b.stats.energy_offset;
+    settle_energy(&mut b);
+    assert_eq!(b.stats.energy_offset, offset_before);
+    assert!(b.e_pre.is_none());
+}
+
+/// Two mark/settle cycles accumulate their deltas into `energy_offset`.
+#[test]
+fn q_settle_energy_accumulates() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    let mut total_expected = 0.0;
+    for k in 0..3 {
+        let e_before = total_energy(&b).unwrap();
+        mark_energy(&mut b);
+        b.vx[0] += 0.1;
+        let e_after = total_energy(&b).unwrap();
+        settle_energy(&mut b);
+        total_expected += e_after - e_before;
+        assert!(
+            (b.stats.energy_offset - total_expected).abs() < 1e-10 * (1.0 + total_expected.abs()),
+            "k = {k}: offset {} vs {total_expected}",
+            b.stats.energy_offset
+        );
+    }
+}
+
+/// `rebase_energy` resets all three state variables together.
+#[test]
+fn q_rebase_energy_resets_state() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.stats.energy_offset = 42.0;
+    b.e_pre = Some(-100.0);
+    rebase_energy(&mut b);
+    assert_eq!(b.stats.energy0, total_energy(&b).unwrap());
+    assert_eq!(b.stats.energy_offset, 0.0);
+    assert!(b.e_pre.is_none());
+}
+
+/// Above `ENERGY_MAX_N`, `rebase_energy` still succeeds — `energy0`
+/// becomes 0 via `unwrap_or(0.0)`. Downstream drift helpers must then
+/// return None without panicking.
+#[test]
+fn q_rebase_energy_above_limit_sets_zero() {
+    let mut b = Bodies::with_capacity(ENERGY_MAX_N + 5);
+    for k in 0..=ENERGY_MAX_N + 4 {
+        b.push(k as f64, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    }
+    rebase_energy(&mut b);
+    assert_eq!(b.stats.energy0, 0.0);
+    assert_eq!(b.stats.energy_offset, 0.0);
+    assert!(b.e_pre.is_none());
+}
+
+/// Immediately after rebase, drift is exactly zero (well, ε).
+#[test]
+fn q_rebase_then_drift_is_zero() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let v = (G * M_SUN_ME / 5.0).sqrt();
+    b.push(5.0, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    rebase_energy(&mut b);
+    let d = energy_drift_pct(&b).unwrap();
+    assert!(d.abs() < 1e-15, "drift right after rebase: {d}");
+}
+
+// ---------------------------------------------------------------------------
+// energy_drift_pct / energy_dissipated_pct — None paths and formula
+// ---------------------------------------------------------------------------
+
+/// `e0 = 0` → `energy_drift_pct` returns None (undefined ratio). A
+/// single stationary body is the smallest such system.
+#[test]
+fn q_drift_zero_e0_none() {
+    let mut b = Bodies::with_capacity(1);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    rebase_energy(&mut b);
+    assert_eq!(b.stats.energy0, 0.0);
+    assert_eq!(energy_drift_pct(&b), None);
+}
+
+/// Bound system (e0 < 0): the `|e0|` denominator preserves the sign of
+/// the drift as a *change*, not the sign of energy itself.
+#[test]
+fn q_drift_uses_abs_e0_for_bound_system() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let r = 5.0;
+    let v = (G * M_SUN_ME / r).sqrt();
+    b.push(r, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    rebase_energy(&mut b);
+    let e0 = b.stats.energy0;
+    assert!(e0 < 0.0, "circular orbit is bound: e0 = {e0}");
+    // Add energy: bump the tangential speed. E rises (less negative).
+    b.vx[1] += 0.005 * v;
+    let e1 = total_energy(&b).unwrap();
+    let d = energy_drift_pct(&b).unwrap();
+    let expected = (e1 - e0) / e0.abs() * 100.0;
+    assert!((d - expected).abs() < 1e-12, "formula: {d} vs {expected}");
+    assert!(d > 0.0, "adding energy must give positive drift: {d}");
+}
+
+/// `energy_dissipated_pct` with zero offset is exactly 0.0, not None.
+#[test]
+fn q_dissipated_zero_offset_is_zero() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let v = (G * M_SUN_ME / 5.0).sqrt();
+    b.push(5.0, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    rebase_energy(&mut b);
+    assert_eq!(energy_dissipated_pct(&b), Some(0.0));
+}
+
+/// `energy_dissipated_pct` with `energy0 = 0` (single body) returns None,
+/// **independent** of the above-limit path — a distinct None branch
+/// from the one tested in `q_energy_drift_returns_none_above_limit`.
+#[test]
+fn q_dissipated_zero_e0_none() {
+    let mut b = Bodies::with_capacity(1);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    rebase_energy(&mut b);
+    assert_eq!(b.stats.energy0, 0.0);
+    assert_eq!(energy_dissipated_pct(&b), None);
+}
+
+/// End-to-end purpose of `energy_offset`: after an inelastic collision,
+/// raw energy changes substantially, but the **offset-adjusted** drift
+/// stays near zero. If `settle_energy` stopped being called after
+/// collisions, this test would fail even though the existing
+/// drift-smallness tests pass.
+#[test]
+fn q_offset_excludes_collision_from_drift() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.push(0.001, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet); // overlapping, at rest
+    rebase_energy(&mut b);
+    let e_raw_before = total_energy(&b).unwrap();
+    assert!(e_raw_before < 0.0, "overlapping pair is bound");
+    collision_pass(&mut b, DT, None);
+    assert_eq!(b.len(), 1, "inelastic merge happened");
+    // Raw drift would be large (energy lost to the merge).
+    let e_raw_after = total_energy(&b).unwrap();
+    let raw_drift = (e_raw_after - e_raw_before) / e_raw_before.abs() * 100.0;
+    assert!(raw_drift.abs() > 1.0, "raw drift after merge: {raw_drift}%");
+    // But offset-accounted drift must be ~0.
+    let drift = energy_drift_pct(&b).unwrap();
+    assert!(
+        drift.abs() < 1e-6,
+        "offset-adjusted drift {drift}% should exclude the merge"
+    );
+    // And the offset itself carries the (negative) collision delta.
+    assert!(b.stats.energy_offset != 0.0);
+}

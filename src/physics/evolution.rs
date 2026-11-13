@@ -1,13 +1,31 @@
-//! Stellar evolution, remnants, brown-dwarf and white-dwarf cooling, mass transfer.
+//! Stellar evolution, end-of-life remnants, brown- and white-dwarf cooling
+//! tracks, and Roche-lobe mass transfer in binaries.
+//!
+//! Stars have a main-sequence lifetime, mild MS growth, and a giant /
+//! supergiant swelling phase. Mass is lost during the giant phase
+//! (adiabatically) or in a supernova (impulsively). White dwarfs and
+//! brown dwarfs cool along Mestel / Burrows tracks. Binary mass transfer
+//! conserves linear and angular momentum and can change a star's mass,
+//! luminosity, and eventual fate.
 
 use super::*;
 
+/// Bolometric luminosity in L☉ for a body of mass `m` (internal units).
+///
+/// Stars follow the standard main-sequence mass-luminosity relation
+/// L ∝ M^3.5. Brown dwarfs scale as M^2.5 (no stable hydrogen burning).
+/// Remnants are given flat representative values here; their real
+/// brightness comes from the cooling tracks (`wd_luminosity`,
+/// `bd_state`) in `luminosity_of`.
 pub fn star_luminosity(kind: BodyKind, m: f64) -> f64 {
     match kind {
-        BodyKind::Star => (m / M_SUN_ME).powf(3.5),
+        BodyKind::Star => {
+            let s = m / M_SUN_ME;
+            s * s * s * s.sqrt()
+        }
         BodyKind::BrownDwarf => {
-            let mj = m / JUPITER_MASS;
-            (mj / 80.0).powf(2.5) * 1e-4
+            let x = m / JUPITER_MASS / 80.0;
+            x * x * x.sqrt() * 1e-4
         }
         BodyKind::WhiteDwarf => 1e-3,
         BodyKind::NeutronStar => 1e-5,
@@ -15,12 +33,19 @@ pub fn star_luminosity(kind: BodyKind, m: f64) -> f64 {
     }
 }
 
+/// Effective surface temperature in K.
+///
+/// Main-sequence stars use Stefan-Boltzmann, T = T☉ · (L/L☉)^(1/4) ·
+/// (R☉/R)^(1/2). Brown dwarfs use a linear ramp from ~500 K at the
+/// planetary-mass end toward the hydrogen-burning limit. Remnants are
+/// given flat values; the WD branch is superseded by the cooling
+/// track in `wd_temperature`.
 pub fn star_temperature(kind: BodyKind, m: f64) -> f64 {
     match kind {
         BodyKind::Star => {
             let l = star_luminosity(kind, m);
             let r = (physical_radius(kind, m) / R_SUN_GM).max(1e-6);
-            5772.0 * (l / (r * r)).powf(0.25)
+            5772.0 * (l / (r * r)).sqrt().sqrt()
         }
         BodyKind::BrownDwarf => {
             let mj = m / JUPITER_MASS;
@@ -32,14 +57,23 @@ pub fn star_temperature(kind: BodyKind, m: f64) -> f64 {
     }
 }
 
+/// Main-sequence lifetime in Gyr.
+///
+/// From the fuel-burn-rate argument: available fuel ∝ M, burn rate ∝ L
+/// ∝ M^3.5, so t_MS ∝ M^-2.5. Normalized so 1 M☉ lasts ~10 Gyr.
+/// Brown dwarfs and remnants have no main sequence and return infinity.
 pub fn star_lifetime_gyr(kind: BodyKind, m: f64) -> f64 {
     match kind {
-        BodyKind::Star => 10.0 * (m / M_SUN_ME).powf(-2.5),
+        BodyKind::Star => {
+            let s = m / M_SUN_ME;
+            10.0 / (s * s * s.sqrt())
+        }
         BodyKind::BrownDwarf | BodyKind::WhiteDwarf | BodyKind::NeutronStar => f64::INFINITY,
         _ => 0.0,
     }
 }
 
+/// Evolutionary stage of a star.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StellarPhase {
     MainSequence,
@@ -47,7 +81,7 @@ pub enum StellarPhase {
     RedSupergiant,
 }
 
-/// Structure of a star at one moment of its life.
+/// Snapshot of a star's structure at one moment of its life.
 #[derive(Clone, Copy, Debug)]
 pub struct StarState {
     pub phase: StellarPhase,
@@ -60,11 +94,16 @@ pub struct StarState {
     pub temperature: f64,
 }
 
+/// Hermite smoothstep on [0, 1]. Eases the temperature ramp so the
+/// giant branch cools in gradually rather than linearly.
 pub(super) fn smoothstep(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Fraction of MS lifetime spent in the giant phase. Massive stars
+/// burn a shorter (relative) tail; low- and intermediate-mass stars
+/// spend a larger fraction of their total life post-MS.
 pub(super) fn post_ms_frac(m_init: f64) -> f64 {
     if m_init >= EVO_MASSIVE_M {
         EVO_POST_MS_FRAC_MASSIVE
@@ -73,16 +112,18 @@ pub(super) fn post_ms_frac(m_init: f64) -> f64 {
     }
 }
 
-/// Total life of a star in Gyr: main sequence plus giant phase.
+/// Total lifetime (MS + giant phase) in Gyr.
 pub fn star_total_life_gyr(m_init: f64) -> f64 {
     let t_ms = star_lifetime_gyr(BodyKind::Star, m_init);
     t_ms * (1.0 + post_ms_frac(m_init))
 }
 
 /// Object left when a star of initial mass `m_init` dies, and its mass.
-/// White dwarf mass follows the initial-final mass relation of
-/// Kalirai et al. (2008). Neutron stars span 1.4-2.0 M☉. Black holes keep
-/// a quarter of the initial mass.
+///
+///  * Low/intermediate mass: white dwarf via the Kalirai et al. (2008)
+///    initial-final mass relation, capped at the Chandrasekhar limit.
+///  * Massive: neutron star, linear in mass up to the BH threshold.
+///  * Very massive: black hole, ~25% of the progenitor's mass.
 pub fn remnant_of(m_init: f64) -> (BodyKind, f64) {
     let s = m_init / M_SUN_ME;
     if m_init < EVO_MASSIVE_M {
@@ -96,17 +137,33 @@ pub fn remnant_of(m_init: f64) -> (BodyKind, f64) {
     }
 }
 
-/// Structure of a star from its initial mass, current mass and age.
+/// Structure of a star from its initial mass, current mass, and age.
 ///
-/// Age 0 gives exactly the present-day relations (`physical_radius`,
-/// `star_luminosity`), so presets look the same until evolution is switched on.
+/// Main sequence: radius and luminosity grow by fixed small factors
+/// over the MS lifetime, and T follows from L and R. Giant phase: the
+/// star swells to the giant (or supergiant) radius and cools along a
+/// smoothstep ramp to the giant effective temperature; L again follows
+/// from the new R and T.
+///
+/// Age 0 gives exactly the static `physical_radius` / `star_luminosity`
+/// relations, so presets are unchanged until evolution is switched on.
 pub fn star_state(m_init: f64, m: f64, age_gyr: f64) -> StarState {
     let t_ms = star_lifetime_gyr(BodyKind::Star, m_init).max(1e-12);
+
+    // Main-sequence (R, L, T) at fraction f of the MS, for a given
+    // current mass. Factored out because the giant branch also needs
+    // the endpoint (f = 1) as its starting point.
+    let ms = |mass: f64, f: f64| -> (f64, f64, f64) {
+        let r = physical_radius(BodyKind::Star, mass) * (1.0 + EVO_MS_RADIUS_GROWTH * f);
+        let l = star_luminosity(BodyKind::Star, mass) * (1.0 + EVO_MS_LUM_GROWTH * f);
+        let rr = r / R_SUN_GM;
+        let t = 5772.0 * (l / (rr * rr)).sqrt().sqrt();
+        (r, l, t)
+    };
+
     if age_gyr < t_ms {
         let f = (age_gyr / t_ms).clamp(0.0, 1.0);
-        let r = physical_radius(BodyKind::Star, m) * (1.0 + EVO_MS_RADIUS_GROWTH * f);
-        let l = star_luminosity(BodyKind::Star, m) * (1.0 + EVO_MS_LUM_GROWTH * f);
-        let t = 5772.0 * (l / (r / R_SUN_GM).powi(2)).powf(0.25);
+        let (r, l, t) = ms(m, f);
         return StarState {
             phase: StellarPhase::MainSequence,
             progress: f,
@@ -115,13 +172,15 @@ pub fn star_state(m_init: f64, m: f64, age_gyr: f64) -> StarState {
             temperature: t,
         };
     }
-    // Giant phase. Structure follows the initial mass, which is constant.
+
+    // Giant phase. Radius and phase come from the initial mass (which
+    // is constant during the giant branch); the star reaches the MS
+    // endpoint at p = 0 and the peak giant radius at p = 1.
     let massive = m_init >= EVO_MASSIVE_M;
     let post = t_ms * post_ms_frac(m_init);
     let p = ((age_gyr - t_ms) / post).clamp(0.0, 1.0);
-    let r0 = physical_radius(BodyKind::Star, m_init) * (1.0 + EVO_MS_RADIUS_GROWTH);
-    let l0 = star_luminosity(BodyKind::Star, m_init) * (1.0 + EVO_MS_LUM_GROWTH);
-    let t0 = 5772.0 * (l0 / (r0 / R_SUN_GM).powi(2)).powf(0.25);
+    let (r0, _l0, t0) = ms(m_init, 1.0);
+
     let (r_peak, t_giant, phase) = if massive {
         let r = EVO_SUPERGIANT_R_SUN * (m_init / (20.0 * M_SUN_ME)).sqrt();
         (
@@ -146,11 +205,18 @@ pub fn star_state(m_init: f64, m: f64, age_gyr: f64) -> StarState {
     }
 }
 
-/// Mass a star has at `age_gyr`, before any other change. Low-mass stars lose
-/// their envelope in the giant phase (most of it at the end). Massive stars
-/// lose a fraction in winds. The rest leaves in the supernova.
-pub(super) fn star_mass_at(m_init: f64, age_gyr: f64) -> f64 {
-    let t_ms = star_lifetime_gyr(BodyKind::Star, m_init).max(1e-12);
+/// Mass at the given age, after envelope loss but before mass transfer.
+///
+/// Low-mass stars peel off their envelope during the giant phase
+/// (gradually, steepening near the end: ∝ p²). Massive stars lose a
+/// fixed fraction of their mass to winds but keep at least their
+/// remnant mass. Whatever is left leaves abruptly in the supernova,
+/// which is handled in `become_remnant`, not here.
+///
+/// `t_ms` is passed in so callers that already have it avoid a
+/// redundant `star_lifetime_gyr` evaluation in the hot loop.
+pub(super) fn star_mass_at_pre(m_init: f64, t_ms: f64, age_gyr: f64) -> f64 {
+    let t_ms = t_ms.max(1e-12);
     let post = t_ms * post_ms_frac(m_init);
     let p = ((age_gyr - t_ms) / post).clamp(0.0, 1.0);
     if p <= 0.0 {
@@ -165,12 +231,34 @@ pub(super) fn star_mass_at(m_init: f64, age_gyr: f64) -> f64 {
     }
 }
 
-/// Phase of body `i`, or `None` if it is not a star.
-pub fn phase_of(b: &Bodies, i: usize) -> Option<StellarPhase> {
-    (b.kind[i] == BodyKind::Star).then(|| star_state(b.m_init[i], b.m[i], b.age_gyr[i]).phase)
+/// Convenience wrapper that computes `t_ms` on the fly.
+pub(super) fn star_mass_at(m_init: f64, age_gyr: f64) -> f64 {
+    let t_ms = star_lifetime_gyr(BodyKind::Star, m_init).max(1e-12);
+    star_mass_at_pre(m_init, t_ms, age_gyr)
 }
 
-/// Luminosity of body `i` in L☉, with evolution included.
+/// Classify a body's stellar phase without computing full structure.
+/// Non-stars return `None`. This mirrors `star_state`'s branch choice,
+/// so callers that only need the phase skip the (more expensive)
+/// radius/luminosity computation.
+pub fn phase_of(b: &Bodies, i: usize) -> Option<StellarPhase> {
+    if b.kind[i] != BodyKind::Star {
+        return None;
+    }
+    let t_ms = star_lifetime_gyr(BodyKind::Star, b.m_init[i]).max(1e-12);
+    Some(if b.age_gyr[i] < t_ms {
+        StellarPhase::MainSequence
+    } else if b.m_init[i] >= EVO_MASSIVE_M {
+        StellarPhase::RedSupergiant
+    } else {
+        StellarPhase::RedGiant
+    })
+}
+
+/// Luminosity of body `i` in L☉, including evolution. Each kind uses
+/// its appropriate track: `star_state` for stars, the Mestel law for
+/// white dwarfs, the Burrows track for brown dwarfs, and the flat
+/// values from `star_luminosity` for everything else.
 pub fn luminosity_of(b: &Bodies, i: usize) -> f64 {
     match b.kind[i] {
         BodyKind::Star => star_state(b.m_init[i], b.m[i], b.age_gyr[i]).luminosity,
@@ -180,7 +268,7 @@ pub fn luminosity_of(b: &Bodies, i: usize) -> f64 {
     }
 }
 
-/// Surface temperature of body `i` in K, with evolution included.
+/// Surface temperature of body `i` in K, including evolution.
 pub fn temperature_of(b: &Bodies, i: usize) -> f64 {
     match b.kind[i] {
         BodyKind::Star => star_state(b.m_init[i], b.m[i], b.age_gyr[i]).temperature,
@@ -190,7 +278,11 @@ pub fn temperature_of(b: &Bodies, i: usize) -> f64 {
     }
 }
 
-/// Habitable zone (inner, outer) of body `i` in AU, with evolution included.
+/// Habitable zone (inner, outer) in AU.
+///
+/// Standard inverse-square scaling L = flux · r², with the solar-flux
+/// multipliers 1.1 (inner, runaway greenhouse) and 0.36 (outer, early
+/// Mars limit). Returns (NaN, NaN) for a non-luminous body.
 pub fn habitable_zone_of(b: &Bodies, i: usize) -> (f64, f64) {
     let l = luminosity_of(b, i);
     if l <= 0.0 {
@@ -199,7 +291,8 @@ pub fn habitable_zone_of(b: &Bodies, i: usize) -> (f64, f64) {
     ((l / 1.1).sqrt(), (l / 0.36).sqrt())
 }
 
-/// Remaining life of star `i` in Gyr. Infinite for bodies that do not evolve.
+/// Time remaining until star `i` dies, in Gyr. Infinite for anything
+/// that does not evolve (remnants, brown dwarfs, planets).
 pub fn star_time_left_gyr(b: &Bodies, i: usize) -> f64 {
     if b.kind[i] != BodyKind::Star {
         return f64::INFINITY;
@@ -207,8 +300,9 @@ pub fn star_time_left_gyr(b: &Bodies, i: usize) -> f64 {
     (star_total_life_gyr(b.m_init[i]) - b.age_gyr[i]).max(0.0)
 }
 
-/// Switch stellar evolution on or off. `gyr_per_time_unit` is the stellar
-/// time that passes in one simulation time unit (0 or less = off).
+/// Enable or disable stellar evolution. `gyr_per_time_unit` is the
+/// number of simulated Gyr that pass per simulation time unit.
+/// Non-finite or non-positive values disable evolution.
 pub fn set_evolution_rate(b: &mut Bodies, gyr_per_time_unit: f64) {
     b.evolution_rate = if gyr_per_time_unit.is_finite() && gyr_per_time_unit > 0.0 {
         gyr_per_time_unit
@@ -217,8 +311,9 @@ pub fn set_evolution_rate(b: &mut Bodies, gyr_per_time_unit: f64) {
     };
 }
 
-/// Put star `i` at a given age. Mass, radius and forces follow. A star older
-/// than its life is placed just before its death.
+/// Force a star to a given age. Clamped to just before its death so
+/// it remains a star. Mass, radius, and velocity-dependent forces are
+/// refreshed via `set_mass`.
 pub fn set_star_age(b: &mut Bodies, i: usize, age_gyr: f64) {
     if b.kind[i] != BodyKind::Star || !age_gyr.is_finite() {
         return;
@@ -236,8 +331,10 @@ pub fn set_star_age(b: &mut Bodies, i: usize, age_gyr: f64) {
 }
 
 // ---- Dwarf cooling -----------------------------------------------------------
-/// Age a body has when it is created. White dwarfs and brown dwarfs start
-/// partly cooled, so presets keep about the brightness they had before.
+
+/// Initial age assigned to a newly created body. White and brown dwarfs
+/// start partly cooled so their presets match the pre-evolution
+/// appearance at default age.
 pub fn default_age_gyr(kind: BodyKind) -> f64 {
     match kind {
         BodyKind::WhiteDwarf => WD_DEFAULT_AGE_GYR,
@@ -246,19 +343,25 @@ pub fn default_age_gyr(kind: BodyKind) -> f64 {
     }
 }
 
-/// White dwarf luminosity in L☉ for a given cooling age (Mestel law).
+/// White dwarf luminosity in L☉ under the Mestel cooling law.
+///
+/// A degenerate core with no nuclear source radiates its stored
+/// thermal energy, giving L ∝ M · (t + t₀)^(-α), with α ≈ 1.4 for
+/// the classic Mestel solution (see `WD_COOL_EXP`). `t₀` smooths the
+/// initial hot, non-degenerate phase.
 pub fn wd_luminosity(m: f64, cooling_age_gyr: f64) -> f64 {
     let t = cooling_age_gyr.max(0.0) + WD_COOL_T0_GYR;
     WD_COOL_L_REF * (m / (0.6 * M_SUN_ME)) * t.powf(-WD_COOL_EXP)
 }
 
-/// White dwarf surface temperature in K for a given cooling age.
+/// White dwarf effective temperature in K, from L and the (fixed) WD
+/// radius via Stefan-Boltzmann.
 pub fn wd_temperature(m: f64, cooling_age_gyr: f64) -> f64 {
     let r = physical_radius(BodyKind::WhiteDwarf, m) / R_SUN_GM;
     5772.0 * (wd_luminosity(m, cooling_age_gyr) / (r * r)).powf(0.25)
 }
 
-/// Structure of a brown dwarf at one moment of its life.
+/// Brown dwarf structure at one moment of its life.
 #[derive(Clone, Copy, Debug)]
 pub struct DwarfState {
     pub radius_gm: f64,
@@ -268,9 +371,14 @@ pub struct DwarfState {
     pub temperature: f64,
 }
 
-/// Brown dwarf radius, luminosity and temperature from mass and age. Young
-/// brown dwarfs are larger and brighter. They shrink and fade as L ∝ M^2.64 t^-1.3
-/// (Burrows et al. 2001). At `BD_DEFAULT_AGE_GYR` the radius equals `physical_radius`.
+/// Brown dwarf radius, luminosity, and temperature from mass and age.
+///
+/// Young brown dwarfs are puffy and bright, then contract and dim
+/// along the Burrows et al. (2001) tracks:
+///   L ∝ M^2.64 · t^-1.3
+/// The radius relaxes toward `physical_radius` on a timescale of
+/// `BD_R_CONTRACT_GYR`, normalized so that at `BD_DEFAULT_AGE_GYR`
+/// the radius matches the static preset value (zero excess).
 pub fn bd_state(m: f64, age_gyr: f64) -> DwarfState {
     let mj = m / JUPITER_MASS;
     let age = age_gyr.max(0.0);
@@ -286,8 +394,13 @@ pub fn bd_state(m: f64, age_gyr: f64) -> DwarfState {
     }
 }
 
-// ---- Mass transfer in binaries -----------------------------------------------
-/// Roche-lobe radius of a donor (Eggleton 1983), in the unit of `sep`.
+// ---- Mass transfer in binaries ----------------------------------------------
+
+/// Roche-lobe radius of the donor in a binary with separation `sep`.
+///
+/// Eggleton (1983) approximation, accurate to ~1% over all mass ratios:
+///   r_L / sep = 0.49 q^(2/3) / (0.6 q^(2/3) + ln(1 + q^(1/3)))
+/// with q = m_donor / m_other.
 pub fn roche_lobe_radius(sep: f64, m_donor: f64, m_other: f64) -> f64 {
     let q = (m_donor / m_other).max(1e-12);
     let q13 = q.cbrt();
@@ -295,19 +408,12 @@ pub fn roche_lobe_radius(sep: f64, m_donor: f64, m_other: f64) -> f64 {
     sep * 0.49 * q23 / (0.6 * q23 + (1.0 + q13).ln())
 }
 
-/// Least mass a donor can have. A main-sequence star stays above the
-/// hydrogen-burning limit. A giant keeps its core (the future remnant).
-pub(super) fn donor_floor(b: &Bodies, i: usize) -> f64 {
-    let m0 = b.m_init[i];
-    if b.age_gyr[i] < star_lifetime_gyr(BodyKind::Star, m0) {
-        STAR_M_MIN
-    } else {
-        remnant_of(m0).1
-    }
-}
-
-/// A star that gains mass keeps the same fraction of its main-sequence life,
-/// so it looks younger (it gets fresh fuel).
+/// Add `dm` to a star's initial mass.
+///
+/// A main-sequence star keeps the same fraction of its (now longer)
+/// MS lifetime, so accretion makes it appear rejuvenated. A post-MS
+/// star keeps its age but must not overrun the new end of life, so
+/// its age is clamped to just below the new total lifetime.
 pub(super) fn add_mass_to_star(b: &mut Bodies, i: usize, dm: f64) {
     let t0 = star_lifetime_gyr(BodyKind::Star, b.m_init[i]);
     if b.age_gyr[i] < t0 {
@@ -316,18 +422,30 @@ pub(super) fn add_mass_to_star(b: &mut Bodies, i: usize, dm: f64) {
         b.age_gyr[i] = f * star_lifetime_gyr(BodyKind::Star, b.m_init[i]);
     } else {
         b.m_init[i] += dm;
-        let end = star_total_life_gyr(b.m_init[i]);
+        let t_ms = star_lifetime_gyr(BodyKind::Star, b.m_init[i]);
+        let end = t_ms * (1.0 + post_ms_frac(b.m_init[i]));
         b.age_gyr[i] = b.age_gyr[i].min(0.999 * end);
     }
 }
 
-/// Move `dm` from donor `d` to accretor `a`. A compact accretor keeps only
-/// `MT_EFF_COMPACT` of it. The rest leaves the system with the donor's velocity.
+/// Move `dm` from donor `d` to accretor `a`.
 ///
-/// Linear momentum and angular momentum are both conserved. The accretor
-/// takes the donor's momentum. A pair of equal and opposite impulses then
-/// restores the angular momentum that the move of mass would change.
-/// Returns true if the accretor was destroyed (Type Ia supernova).
+/// Compact accretors (WD, NS, BH) retain only `MT_EFF_COMPACT`; the
+/// rest is carried out of the system by the donor's wind (not tracked).
+///
+/// Momentum bookkeeping: the accretor absorbs the incoming mass at the
+/// donor's velocity. Because the mass moves along the line of centers,
+/// that transfer would change the system's angular momentum, so an
+/// equal-and-opposite corrective impulse is applied to donor and
+/// accretor to cancel the change. Linear and angular momentum are both
+/// conserved as a result.
+///
+/// After the transfer, the accretor's fate is checked:
+///   * super-Chandrasekhar white dwarf → Type Ia supernova (destroyed);
+///   * heavy neutron star → collapse to black hole;
+///   * brown dwarf crossing the hydrogen-burning limit → ignites.
+///
+/// Returns true if the accretor was destroyed.
 pub(super) fn transfer_mass(b: &mut Bodies, d: usize, a: usize, dm: f64) -> bool {
     let eff = if matches!(
         b.kind[a],
@@ -343,9 +461,12 @@ pub(super) fn transfer_mass(b: &mut Bodies, d: usize, a: usize, dm: f64) -> bool
     let m_a = m_a_old + dm_acc;
     let (vdx, vdy) = (b.vx[d], b.vy[d]);
 
+    // New accretor velocity from momentum mixing.
     let vax = (m_a_old * b.vx[a] + dm_acc * vdx) / m_a;
     let vay = (m_a_old * b.vy[a] + dm_acc * vdy) / m_a;
 
+    // Tangential component of the donor velocity relative to the
+    // accretor, used to build the corrective impulse pair.
     let sx = b.x[d] - b.x[a];
     let sy = b.y[d] - b.y[a];
     let s = sx.hypot(sy).max(1e-12);
@@ -396,8 +517,29 @@ pub(super) fn transfer_mass(b: &mut Bodies, d: usize, a: usize, dm: f64) -> bool
     false
 }
 
-/// One step of Roche-lobe overflow for every star that fills its lobe.
-/// Returns true if any mass changed.
+/// Least mass the donor can reach before transfer stalls.
+///
+/// A still-main-sequence star stops at the hydrogen-burning limit;
+/// a post-MS star stops at its future remnant mass (the core it
+/// cannot shed). `t_ms` is the donor's MS lifetime, passed in so the
+/// hot loop doesn't re-evaluate it.
+pub(super) fn donor_floor_pre(b: &Bodies, i: usize, t_ms: f64) -> f64 {
+    if b.age_gyr[i] < t_ms {
+        STAR_M_MIN
+    } else {
+        remnant_of(b.m_init[i]).1
+    }
+}
+
+/// One step of Roche-lobe overflow.
+///
+/// For every star that fills its Roche lobe with respect to its binary
+/// partner, transfer mass at the dynamical rate scaled by the cube of
+/// the overflow depth, capped by a small fraction of the donor per
+/// step and by the donor floor. A giant that has been stripped of its
+/// entire envelope is converted to its remnant in place.
+///
+/// Returns true if any mass changed (the caller must recompute forces).
 pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
     let hosts = host_list(b);
     if hosts.len() < 2 {
@@ -405,7 +547,6 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
     }
     let mut changed = false;
     let mut destroyed = false;
-    let mut stripped: Vec<usize> = Vec::new();
     for &d in &hosts {
         if b.dead[d] || b.kind[d] != BodyKind::Star {
             continue;
@@ -420,11 +561,15 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
         } else {
             None
         };
+
+        // Overflow fraction x ∈ (0, 1]: how far inside the Roche lobe
+        // the donor's surface has moved. 0 means it exactly fills.
         let overflow = partner.filter(|&a| !b.dead[a]).and_then(|a| {
             let sep = (b.x[a] - b.x[d]).hypot(b.y[a] - b.y[d]);
             let x = ((rd - roche_lobe_radius(sep, b.m[d], b.m[a])) / rd).clamp(0.0, 1.0);
             (x > 0.0).then_some((a, x))
         });
+
         let Some((a, x)) = overflow else {
             if b.rlof[d] {
                 b.rlof[d] = false;
@@ -440,7 +585,9 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
             let (px, py) = (b.x[d], b.y[d]);
             b.log(EventKind::Evolve, text, px, py);
         }
-        let floor = donor_floor(b, d);
+
+        let t_ms = star_lifetime_gyr(BodyKind::Star, b.m_init[d]).max(1e-12);
+        let floor = donor_floor_pre(b, d, t_ms);
         let room = (b.m[d] - floor).max(0.0);
         let t_dyn = (rd.powi(3) / (G * b.m[d])).sqrt();
         let rate = MT_RATE_COEFF * b.m[d] / t_dyn * x.powi(3);
@@ -452,14 +599,10 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
             }
             changed = true;
         }
-        // A low-mass giant with no envelope left is a bare core: a white dwarf.
-        let t_ms = star_lifetime_gyr(BodyKind::Star, b.m_init[d]);
+
+        // A low-mass giant with no envelope left is a bare core: a
+        // white dwarf. Convert in place so the next step sees a WD.
         if b.m_init[d] < EVO_MASSIVE_M && b.age_gyr[d] >= t_ms && b.m[d] - floor <= 1e-9 * floor {
-            stripped.push(d);
-        }
-    }
-    for d in stripped {
-        if !b.dead[d] {
             b.rlof[d] = false;
             become_remnant(b, d);
             changed = true;
@@ -472,26 +615,33 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
     changed
 }
 
-/// km/s per simulation velocity unit.
+/// km/s per simulation velocity unit. Used to convert supernova kick
+/// dispersions (given in km/s) into simulation units.
 pub(super) fn vel_unit_kms() -> f64 {
     LEN_KM / time_unit_s()
 }
 
-/// Orbits that loosely follow a host that loses mass slowly (adiabatic loss).
+/// Rescale the orbit of everything bound to a host that lost mass
+/// slowly, i.e. adiabatically with respect to the orbital period.
 ///
-/// For a mass loss slow against the orbital period, `a * M` stays constant,
-/// the eccentricity and orientation stay the same, and the body keeps its
-/// place on the orbit. In the host frame that scales the separation by
-/// `M_old / M_new` and the velocity by `M_new / M_old`. Positions and
-/// velocities alone cannot express this (a plain change of mass at fixed
-/// state is the *sudden* case), so the state is rewritten here.
+/// Under adiabatic mass loss the orbital action a·M is invariant, so
+/// separations grow as M_old / M_new and orbital velocities shrink by
+/// the inverse factor. This is not expressible by simply changing the
+/// host's mass while leaving the state alone — that would correspond
+/// to impulsive loss. So positions and velocities are rewritten
+/// explicitly here.
 ///
-/// Only what orbits `i` moves: planets and debris whose parent is `i`, and a
-/// close bound stellar companion (wide pairs stay as they are). Their own satellites (moons, S-type planets)
-/// travel with them, so those orbits stay intact. Bodies of other systems
-/// are left alone. Linear momentum is not conserved: the envelope carries it.
+/// Only bodies orbiting `i` are touched:
+///   * its planets and debris, whose stored parent is `i`;
+///   * a close bound stellar companion. Wide pairs are left alone,
+///     because on a ring they cannot be told apart from neighboring
+///     systems that must not move.
+/// Their own satellites (moons, S-type planets) ride along with them
+/// so their internal orbits stay intact. Linear momentum is not
+/// conserved here: the ejected envelope carries the difference.
 pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64) {
-    /// Companion stars closer than this (about 100 AU, in Gm) expand with the orbit.
+    /// Companion stars closer than this (about 100 AU, in Gm) expand
+    /// with the orbit; wider pairs stay put.
     const ADIABATIC_COMPANION_MAX_GM: f64 = 15_000.0;
     let n = b.len();
     if m_new >= m_old || n < 2 {
@@ -510,16 +660,19 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
             }
         })
         .collect();
+
+    // Host state at the start of the expansion.
     let (sx, sy, svx, svy) = (b.x[i], b.y[i], b.vx[i], b.vy[i]);
-    // (dx, dy, dvx, dvy) to add to each body.
+
+    // (dx, dy, dvx, dvy) to apply to each body.
     let mut delta: Vec<Option<[f64; 4]>> = vec![None; n];
     for k in 0..n {
         if k == i || b.dead[k] {
             continue;
         }
         let direct = if is_host_kind(b.kind[k]) {
-            // Only a close companion. Wider pairs cannot be told from
-            // neighbouring systems on a ring, which must stay where they are.
+            // Close bound stellar companion only; wide pairs may be
+            // other systems.
             (b.x[k] - sx).hypot(b.y[k] - sy) < ADIABATIC_COMPANION_MAX_GM
                 && binary_partner_in(b, &hosts, k) == Some(i)
         } else {
@@ -528,7 +681,9 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
         if !direct {
             continue;
         }
-        // Include the body's own mass in the two-body parameter.
+
+        // Two-body parameter: include the satellite's own mass in the
+        // total, so a massive companion shrinks less than a light one.
         let rho = (m_new + b.m[k]) / (m_old + b.m[k]);
         let (rx, ry) = (b.x[k] - sx, b.y[k] - sy);
         let (rvx, rvy) = (b.vx[k] - svx, b.vy[k] - svy);
@@ -539,7 +694,9 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
             rvy * rho - rvy,
         ]);
     }
-    // Satellites of a moved body keep their orbit by moving with it.
+
+    // Satellites of a moved body ride along with it. Their own orbit
+    // around their parent is preserved because both get the same delta.
     let mut ride: Vec<Option<[f64; 4]>> = vec![None; n];
     for k in 0..n {
         if k == i || b.dead[k] || delta[k].is_some() {
@@ -551,6 +708,7 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
             }
         }
     }
+
     for k in 0..n {
         if let Some(d) = delta[k].or(ride[k]) {
             b.x[k] += d[0];
@@ -563,12 +721,17 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
     }
 }
 
-/// End of a star's life: it becomes a white dwarf, or explodes and leaves a
-/// neutron star or black hole.
+/// End of a star's life: turn it into its remnant.
 ///
-/// A white dwarf forms by slow (adiabatic) mass loss, so the orbits around it
-/// expand (`adiabatic_expand`). A supernova throws the mass out at once: the
-/// velocities stay as they were, so wide planets may become unbound.
+/// The evolutionary path matters:
+///   * White dwarfs form by slow (adiabatic) envelope ejection, so
+///     surrounding orbits expand with `adiabatic_expand`.
+///   * Neutron stars and black holes form in a sudden supernova: the
+///     envelope leaves before the orbiting bodies can respond, so
+///     velocities are kept as they are and wide planets may become
+///     unbound. A stochastic kick is added if `sn_kicks` is enabled.
+///     Black holes receive the same impulse as a canonical neutron
+///     star, so a heavier remnant moves more slowly.
 pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
     mark_energy(b);
     let (kind, m_rem) = remnant_of(b.m_init[i]);
@@ -600,8 +763,8 @@ pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
             flash_at(b, x, y, 5.0);
             b.log(EventKind::Evolve, text, x, y);
             if b.sn_kicks {
-                // Black holes get the same momentum as neutron stars, so a
-                // heavier remnant moves slower.
+                // Same momentum kick for BH as for NS, so heavier
+                // remnants recoil more slowly.
                 let scale = (NS_M_MIN / b.m[i]).min(1.0);
                 let sigma = SN_KICK_SIGMA_KMS / vel_unit_kms() * scale;
                 let kx = sample_normal(&mut b.rng, 0.0, sigma);
@@ -616,8 +779,18 @@ pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
     b.parent_cache_valid = false;
 }
 
-/// Age every star by `dt` and apply the results: radius, mass loss and the
-/// last stage of life. Does nothing while `b.evo_rate` is 0.
+/// Advance every evolving body by `dt` simulation time.
+///
+/// Order of operations:
+///   1. White and brown dwarfs: age only; their structure follows from
+///      age alone, so just refresh the radius.
+///   2. Stars: detect the MS → giant transition (for logging), advance
+///      mass loss, and collect those that reached end of life.
+///   3. Convert dying stars to remnants.
+///   4. Run one mass-transfer step if the feature is enabled.
+///   5. Recompute accelerations if mass or membership changed.
+///
+/// A no-op while `evolution_rate` is zero.
 pub(super) fn evolve_stars(b: &mut Bodies, dt: f64) {
     if b.evolution_rate <= 0.0 {
         return;
@@ -643,10 +816,14 @@ pub(super) fn evolve_stars(b: &mut Bodies, dt: f64) {
             _ => continue,
         }
         let m0 = b.m_init[i];
-        let t_ms = star_lifetime_gyr(BodyKind::Star, m0);
-        let end = star_total_life_gyr(m0);
+        let t_ms = star_lifetime_gyr(BodyKind::Star, m0).max(1e-12);
+        let end = t_ms * (1.0 + post_ms_frac(m0));
+
+        // Detect the MS → giant crossing within this step (only for
+        // logging; the structure itself doesn't need it).
         let leaving_ms = b.age_gyr[i] < t_ms && b.age_gyr[i] + dage >= t_ms;
-        let before = if leaving_ms { Some(tag(b, i)) } else { None };
+        let before = leaving_ms.then(|| tag(b, i));
+
         b.age_gyr[i] += dage;
         let age = b.age_gyr[i];
         if age >= end {
@@ -658,14 +835,24 @@ pub(super) fn evolve_stars(b: &mut Bodies, dt: f64) {
             let (x, y) = (b.x[i], b.y[i]);
             b.log(EventKind::Evolve, text, x, y);
         }
-        let target = star_mass_at(m0, age);
-        if target < b.m[i] {
-            mark_energy(b);
-            adiabatic_expand(b, i, b.m[i], target);
-            b.set_mass(i, target);
-            mass_changed = true;
+
+        if age < t_ms {
+            // Still on the MS: no mass loss, just grow the radius in
+            // place. Luminosity and T are recomputed lazily by
+            // `luminosity_of` / `temperature_of` when needed.
+            let f = (age / t_ms).clamp(0.0, 1.0);
+            b.r[i] = physical_radius(BodyKind::Star, b.m[i]) * (1.0 + EVO_MS_RADIUS_GROWTH * f);
         } else {
-            b.r[i] = b.radius_now(i);
+            // Post-MS: mass loss.
+            let target = star_mass_at_pre(m0, t_ms, age);
+            if target < b.m[i] {
+                mark_energy(b);
+                adiabatic_expand(b, i, b.m[i], target);
+                b.set_mass(i, target);
+                mass_changed = true;
+            } else {
+                b.r[i] = b.radius_now(i);
+            }
         }
     }
     for &i in &dying {
@@ -674,7 +861,7 @@ pub(super) fn evolve_stars(b: &mut Bodies, dt: f64) {
     if b.mass_transfer && mass_transfer_step(b, dt) {
         mass_changed = true;
     }
-    // Masses changed, so the stored accelerations are out of date.
+    // Masses changed, so the stored accelerations are stale.
     if mass_changed || !dying.is_empty() {
         compute_accel(b);
     }
