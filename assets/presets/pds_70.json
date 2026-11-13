@@ -1,0 +1,46 @@
+{
+    "name": "PDS 70",
+    "dust_boost": 3.0,
+    "star": {
+        "name": "PDS 70",
+        "mass_earth": 253040.0,
+        "age_gyr": 0.0054,
+        "metallicity": 0.0
+    },
+    "planets": [
+        {
+            "name": "b",
+            "a_au": 20.8,
+            "e": 0.17,
+            "m_earth": 954.0,
+            "density_gcc": 0.2
+        },
+        {
+            "name": "c",
+            "a_au": 34.3,
+            "e": 0.037,
+            "m_earth": 700.0,
+            "density_gcc": 0.2
+        }
+    ],
+    "belts": {
+        "belt_budget": 2000,
+        "total_mass_earth": 70.0,
+        "inner": {
+            "a_lo_au": 0.2,
+            "a_hi_au": 6.0,
+            "mass_frac": 0.05
+        },
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 54.0,
+                    "a_hi_au": 140.0,
+                    "mass_frac": 0.95,
+                    "e_sigma": 0.03
+                }
+            ]
+        }
+    }
+}

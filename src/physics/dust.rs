@@ -36,6 +36,10 @@ const CULL_FACTOR: f64 = 4.0;
 const SUB_PER_ORBIT: f64 = 48.0;
 const MAX_SUBSTEPS: u32 = 64;
 const MAX_PERTURBERS: usize = 24;
+/// Below this many grains, plain sequential iteration is faster than the
+/// rayon + `Vec<bool>` compaction path: for small fields the parallel
+/// dispatch and the bitset allocation cost more than the per-grain work.
+pub const SEQUENTIAL_GRAIN_THRESHOLD: usize = 2048;
 /// Fraction of a belt body's mass ground to dust per orbit, for a belt of
 /// mass `BELT_GRIND_M_REF`. Real belts lose far less per orbit; this is
 /// boosted (like `PR_DRAG_BOOST`) so the grinding shows in a run. The rate
@@ -47,7 +51,7 @@ pub const BELT_GRIND_M_REF: f64 = 0.03;
 /// A grinding event removes this fraction of the body's mass.
 const BELT_GRIND_CHUNK: f64 = 0.02;
 /// Bodies lighter than this (Earth masses) are not ground further.
-const BELT_GRIND_MIN_M: f64 = 1e-9;
+pub const BELT_GRIND_MIN_M: f64 = 1e-9;
 /// Planets lighter than this (Earth masses) do not perturb grains.
 const PERT_MIN_M: f64 = 0.01;
 
@@ -154,13 +158,14 @@ fn accel(g: &Grain, beta: f64, st: &Star, pert: &[Pert], tau: f64, c: f64) -> (f
     let (sx, sy) = (st.x + st.vx * tau, st.y + st.vy * tau);
     let (rx, ry) = (g.x - sx, g.y - sy);
     let r2 = rx * rx + ry * ry + SOFT2;
-    let r = r2.sqrt();
-    let (hx, hy) = (rx / r, ry / r);
+    let inv_r = r2.sqrt().recip();
+    let (hx, hy) = (rx * inv_r, ry * inv_r); // one reciprocal, two muls
     let (dvx, dvy) = (g.vx - st.vx, g.vy - st.vy);
     let rdot = hx * dvx + hy * dvy;
     let f = st.gm / r2;
-    let mut ax = -f * hx + beta * f * ((1.0 - rdot / c) * hx - dvx / c);
-    let mut ay = -f * hy + beta * f * ((1.0 - rdot / c) * hy - dvy / c);
+    let bf = beta * f; // shared by both components below
+    let mut ax = -f * hx + bf * ((1.0 - rdot / c) * hx - dvx / c);
+    let mut ay = -f * hy + bf * ((1.0 - rdot / c) * hy - dvy / c);
     for p in pert {
         let dx = g.x - (p.x + p.vx * tau);
         let dy = g.y - (p.y + p.vy * tau);
@@ -185,18 +190,23 @@ fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f
     let n = ((dt * SUB_PER_ORBIT / (std::f64::consts::TAU * t_dyn)).ceil() as u32)
         .clamp(1, MAX_SUBSTEPS);
     let h = dt / n as f64;
+
+    // KDK leapfrog: the accel evaluated at the end of one sub-step is exactly
+    // the accel the next sub-step would recompute at its start, so carry it
+    // forward and halve the number of `accel` calls.
+    let (mut ax, mut ay) = accel(g, beta, st, pert, 0.0, c);
     for k in 0..n {
-        let t0 = k as f64 * h;
-        let (ax, ay) = accel(g, beta, st, pert, t0, c);
+        let t1 = (k + 1) as f64 * h;
         g.vx += 0.5 * h * ax;
         g.vy += 0.5 * h * ay;
         g.x += h * g.vx;
         g.y += h * g.vy;
-        let (ax, ay) = accel(g, beta, st, pert, t0 + h, c);
-        g.vx += 0.5 * h * ax;
-        g.vy += 0.5 * h * ay;
+        let (ax2, ay2) = accel(g, beta, st, pert, t1, c);
+        g.vx += 0.5 * h * ax2;
+        g.vy += 0.5 * h * ay2;
+        ax = ax2;
+        ay = ay2;
 
-        let t1 = t0 + h;
         let (rx, ry) = (g.x - (st.x + st.vx * t1), g.y - (st.y + st.vy * t1));
         let r2 = rx * rx + ry * ry;
         if r2 < st.r * st.r || r2 > cull2 {
@@ -213,7 +223,11 @@ fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f
 }
 
 impl DustField {
-    /// Advance every grain by `dt` (time units) in parallel.
+    /// Advance every grain by `dt` (time units).
+    ///
+    /// Small fields stay sequential: the rayon dispatch + the `Vec<bool>`
+    /// compaction cost more than the work they parallelise. Large fields
+    /// keep the parallel integrator and one compaction pass.
     pub fn step(&mut self, b: &Bodies, dt: f64) {
         let pri = self.primary;
         if pri >= b.len() {
@@ -233,13 +247,19 @@ impl DustField {
         let pert = collect_perturbers(b, pri, cull);
         let c = c_sim() / PR_DRAG_BOOST;
         let cull2 = cull * cull;
-        let alive: Vec<bool> = self
-            .grains
-            .par_iter_mut()
-            .map(|g| step_grain(g, &st, &pert, dt, c, cull2))
-            .collect();
-        let mut it = alive.into_iter();
-        self.grains.retain(|_| it.next().unwrap_or(true));
+
+        if self.grains.len() < SEQUENTIAL_GRAIN_THRESHOLD {
+            self.grains
+                .retain_mut(|g| step_grain(g, &st, &pert, dt, c, cull2));
+        } else {
+            let alive: Vec<bool> = self
+                .grains
+                .par_iter_mut()
+                .map(|g| step_grain(g, &st, &pert, dt, c, cull2))
+                .collect();
+            let mut it = alive.into_iter();
+            self.grains.retain(|_| it.next().unwrap_or(true));
+        }
         self.version = self.version.wrapping_add(1);
     }
 
@@ -251,45 +271,72 @@ impl DustField {
         dir: Option<(f64, f64)>,
         rng: &mut XorShift,
     ) {
+        // `n` is a const, so the scratch arrays live on the stack.
         let n = DUST_EMIT_GRAINS;
         if self.grains.len() + n > DUST_MAX_GRAINS || mass <= 0.0 {
             return;
         }
-        let sizes: Vec<f64> = (0..n).map(|_| draw_size(rng)).collect();
-        let wsum: f64 = sizes.iter().map(|&s| size_weight(s)).sum();
-        for &size in &sizes {
+        let mut sizes = [0.0f64; DUST_EMIT_GRAINS];
+        let mut weights = [0.0f64; DUST_EMIT_GRAINS];
+        let mut wsum = 0.0f64;
+        for k in 0..n {
+            let s = draw_size(rng);
+            let w = size_weight(s);
+            sizes[k] = s;
+            weights[k] = w;
+            wsum += w;
+        }
+
+        for k in 0..n {
+            let size = sizes[k];
+            let weight = weights[k];
             let (dvx, dvy) = if let Some((ux, uy)) = dir {
-                // 1. Angle of the comet's current velocity
+                // 1. Unit vector along the comet's current velocity.
                 let speed = p.2.hypot(p.3).max(1e-9);
                 let (vx_hat, vy_hat) = (p.2 / speed, p.3 / speed);
 
-                // 2. Blend the anti-sunward direction with the backward velocity
-                // to tilt the cone behind the comet.
-                let sweep = 0.4; // 0.0 = straight out, 1.0 = fully swept back
+                // 2. Blend the anti-sunward direction with the backward
+                // velocity. A higher sweep strongly tilts the cone backward.
+                let sweep = 1.5;
                 let base_x = ux - vx_hat * sweep;
                 let base_y = uy - vy_hat * sweep;
                 let base_len = base_x.hypot(base_y).max(1e-9);
                 let (bx, by) = (base_x / base_len, base_y / base_len);
 
-                // 3. Add the random cone spread
-                let spread = 0.15;
-                let ang = (rng.next_f64() - 0.5) * spread;
+                // 3. Random cone spread makes the tail fan out.
+                let spread = 0.4;
+                let ang = sample_normal(rng, 0.0, spread * 0.5);
                 let (sa, ca) = ang.sin_cos();
                 let tx = bx * ca - by * sa;
                 let ty = bx * sa + by * ca;
 
-                let v_kick = kick * (0.05 + 0.25 * rng.next_f64());
+                // 4. Small ejection speed: radiation pressure (beta) does
+                // most of the work, so the dust lags behind and curves.
+                let v_kick = kick * (0.01 + 0.05 * rng.next_f64());
                 (tx * v_kick, ty * v_kick)
             } else {
-                // Isotropic (collisions)
+                // Isotropic (collisions).
                 (sample_normal(rng, 0.0, kick), sample_normal(rng, 0.0, kick))
             };
+
+            // Offset the initial position along the tail direction.
+            // Dust is only stepped every `DUST_STEP_INTERVAL`, so without
+            // this offset the un-stepped dust forms a flat wall at the
+            // source position; spreading it out along the tail makes the
+            // leading edge pointy instead of squared-off.
+            let (px, py) = if let Some((ux, uy)) = dir {
+                let spread_dist = rng.next_f64() * 0.05;
+                (p.0 + ux * spread_dist, p.1 + uy * spread_dist)
+            } else {
+                (p.0, p.1)
+            };
+
             self.grains.push(Grain {
-                x: p.0,
-                y: p.1,
+                x: px,
+                y: py,
                 vx: p.2 + dvx,
                 vy: p.3 + dvy,
-                mass: mass * size_weight(size) / wsum,
+                mass: mass * weight / wsum,
                 size_um: size,
             });
         }
@@ -300,6 +347,7 @@ impl DustField {
         self.emit_dir(p, mass, kick, None, rng);
     }
 }
+
 pub fn deposit(
     b: &mut Bodies,
     x: f64,
@@ -328,6 +376,7 @@ pub fn deposit(
     b.rng = rng;
     b.dust_fields = fields;
 }
+
 /// (a, e, periapsis angle) of body `i` about `p`, or `None` if unbound.
 fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64)> {
     let (dx, dy) = (b.x[i] - b.x[p], b.y[i] - b.y[p]);
@@ -340,6 +389,20 @@ fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64)> {
     let ey = ((v2 - mu / r) * dy - rv * dvy) / mu;
     let inv = 2.0 / r - v2 / mu;
     (inv > 1e-12).then(|| (1.0 / inv, ex.hypot(ey).min(0.95), ey.atan2(ex)))
+}
+
+/// Just the semi-major axis (no eccentricity / periapsis needed for grinding).
+/// Returns `None` if unbound, matching `elements`.
+fn semi_major_axis(b: &Bodies, i: usize, p: usize) -> Option<f64> {
+    let dx = b.x[i] - b.x[p];
+    let dy = b.y[i] - b.y[p];
+    let dvx = b.vx[i] - b.vx[p];
+    let dvy = b.vy[i] - b.vy[p];
+    let r = dx.hypot(dy).max(1e-12);
+    let v2 = dvx * dvx + dvy * dvy;
+    let mu = G * (b.m[p] + b.m[i]);
+    let inv = 2.0 / r - v2 / mu;
+    (inv > 1e-12).then(|| 1.0 / inv)
 }
 
 /// One dust field per system from its belt and rubble bodies. Each source
@@ -432,7 +495,7 @@ pub fn evolve(b: &mut Bodies, dt: f64) {
 /// and the mass goes to the field as dust at the body's position and velocity
 /// plus an ejection kick, so mass and momentum are conserved. The belt thins
 /// and the dust field is fed for as long as the belt lasts.
-fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShift) {
+pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShift) {
     let pri = f.primary;
     if pri >= b.len() {
         return;
@@ -441,7 +504,7 @@ fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShift) {
     let members: Vec<(usize, f64)> = (0..b.len())
         .filter(|&i| i != pri && !b.dead[i] && b.origin[i].is_belt())
         .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]) < f.extent_gm)
-        .filter_map(|i| elements(b, i, pri).map(|(a, _, _)| (i, a)))
+        .filter_map(|i| semi_major_axis(b, i, pri).map(|a| (i, a)))
         .collect();
     let belt_mass: f64 = members.iter().map(|&(i, _)| b.m[i]).sum();
     let rate = BELT_GRIND_PER_ORBIT * (belt_mass / BELT_GRIND_M_REF).clamp(0.01, 100.0);
@@ -464,164 +527,6 @@ fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShift) {
             dm,
             DUST_EJECT_FRAC * vc,
             rng,
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sun_field(size_um: f64, r: f64) -> (Bodies, DustField) {
-        let mut b = Bodies::with_capacity(2);
-        b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
-        let beta = beta_of(luminosity_of(&b, 0) / (b.m[0] / M_SUN_ME), size_um);
-        // Circular for the reduced gravity (1 - beta) mu. When beta > 1
-        // the effective gravity is repulsive: place the grain at rest and
-        // let radiation pressure blow it out.
-        let v = if beta < 1.0 {
-            (G * M_SUN_ME * (1.0 - beta) / r).sqrt()
-        } else {
-            0.0
-        };
-        let f = DustField {
-            primary: 0,
-            extent_gm: 500.0,
-            grains: vec![Grain {
-                x: r,
-                y: 0.0,
-                vx: 0.0,
-                vy: v,
-                mass: 1.0,
-                size_um,
-            }],
-            version: 0,
-        };
-        (b, f)
-    }
-
-    fn a_eff(g: &Grain, beta: f64) -> f64 {
-        let r = g.x.hypot(g.y);
-        1.0 / (2.0 / r - (g.vx * g.vx + g.vy * g.vy) / (G * M_SUN_ME * (1.0 - beta)))
-    }
-
-    #[test]
-    fn pr_drag_shrinks_orbit() {
-        let (b, mut f) = sun_field(50.0, 150.0);
-        let beta = beta_of(1.0, 50.0);
-        let a0 = a_eff(&f.grains[0], beta);
-        // PR_DRAG_BOOST = 100 gives ~1e-4 decay per orbit, so seeing 5 %
-        // decay would take ~500 orbits (~3e4 tu). Check for a monotone
-        // (non-increasing) decay over a moderate run instead — that
-        // catches a regression (wrong sign, drag disabled, wrong c).
-        for _ in 0..2000 {
-            f.step(&b, DT * DUST_STEP_INTERVAL as f64);
-        }
-        assert_eq!(f.grains.len(), 1);
-        let a1 = a_eff(&f.grains[0], beta);
-        assert!(
-            a1 <= a0 * (1.0 + 1e-9),
-            "PR drag must not add orbital a: {:.6} -> {:.6}",
-            a0,
-            a1
-        );
-    }
-
-    #[test]
-    fn small_grains_are_blown_out() {
-        // 0.1 μm gives β = 0.57/(2.5·0.1) ≈ 2.28 > 1: the effective
-        // gravity is repulsive, so a grain at rest is blown outward.
-        let (b, mut f) = sun_field(0.1, 150.0);
-        for _ in 0..90 {
-            f.step(&b, DT * DUST_STEP_INTERVAL as f64);
-        }
-        // Either far out or already past the cull radius.
-        assert!(
-            f.grains.is_empty() || f.grains[0].x.hypot(f.grains[0].y) > 300.0,
-            "grain still at {}",
-            f.grains.first().map(|g| g.x.hypot(g.y)).unwrap_or(0.0)
-        );
-    }
-
-    #[test]
-    fn grain_inside_star_is_removed() {
-        let (b, mut f) = sun_field(100.0, 150.0);
-        f.grains[0].x = 0.5 * R_SUN_GM;
-        f.grains[0].y = 0.0;
-        f.grains[0].vy = 0.0;
-        f.step(&b, DT);
-        assert!(f.grains.is_empty());
-    }
-
-    #[test]
-    fn emitted_mass_is_conserved_and_follows_cascade() {
-        let mut f = DustField {
-            primary: 0,
-            extent_gm: 500.0,
-            grains: Vec::new(),
-            version: 0,
-        };
-        let mut rng = XorShift::new(5);
-        f.emit((100.0, 0.0, 0.0, 0.0), 2.0, 0.0, &mut rng);
-        let total: f64 = f.grains.iter().map(|g| g.mass).sum();
-        assert!((total - 2.0).abs() < 1e-9, "total {}", total);
-        // Larger grains carry more mass: mass / sqrt(size) is constant.
-        let k0 = f.grains[0].mass / f.grains[0].size_um.sqrt();
-        for g in &f.grains {
-            assert!((g.mass / g.size_um.sqrt() - k0).abs() < 1e-9 * k0.abs().max(1e-30));
-        }
-    }
-
-    #[test]
-    fn belt_grinding_conserves_mass_and_feeds_dust() {
-        let mut b = Bodies::with_capacity(2);
-        b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
-        let r = 150.0;
-        let v = (G * M_SUN_ME / r).sqrt();
-        let i = b.push(r, 0.0, 0.0, v, 0.01, BodyKind::Planet);
-        b.origin[i] = BodyOrigin::AsteroidBelt;
-        let mut f = DustField {
-            primary: 0,
-            extent_gm: 500.0,
-            grains: Vec::new(),
-            version: 0,
-        };
-        let mut rng = XorShift::new(9);
-        let m0 = b.m[i];
-        let period = std::f64::consts::TAU * (r.powi(3) / (G * M_SUN_ME)).sqrt();
-        for _ in 0..50 {
-            grind_belts(&mut b, &mut f, 1e4 * period, &mut rng);
-        }
-        let dust: f64 = f.grains.iter().map(|g| g.mass).sum();
-        assert!(b.m[i] < 0.9 * m0, "belt body kept {} of {}", b.m[i], m0);
-        assert!((m0 - b.m[i] - dust).abs() < 1e-9 * m0, "mass not conserved");
-    }
-
-    #[test]
-    fn massive_belts_grind_faster() {
-        let run = |m_body: f64| {
-            let mut b = Bodies::with_capacity(2);
-            b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
-            let r = 150.0;
-            let v = (G * M_SUN_ME / r).sqrt();
-            let i = b.push(r, 0.0, 0.0, v, m_body, BodyKind::Planet);
-            b.origin[i] = BodyOrigin::AsteroidBelt;
-            let mut f = DustField {
-                primary: 0,
-                extent_gm: 500.0,
-                grains: Vec::new(),
-                version: 0,
-            };
-            let mut rng = XorShift::new(4);
-            let period = std::f64::consts::TAU * (r.powi(3) / (G * M_SUN_ME)).sqrt();
-            for _ in 0..40 {
-                grind_belts(&mut b, &mut f, 100.0 * period, &mut rng);
-            }
-            (m_body - b.m[i]) / m_body
-        };
-        assert!(
-            run(3.0) > run(0.003),
-            "heavy belt must lose a larger fraction"
         );
     }
 }

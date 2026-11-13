@@ -1,0 +1,28 @@
+{
+    "name": "Kepler-1625 (exomoon candidate)",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Kepler-1625",
+        "mass_earth": 346300.0,
+        "age_gyr": 8.7,
+        "metallicity": 0.0
+    },
+    "planets": [
+        {
+            "name": "Kepler-1625 b",
+            "a_au": 0.87,
+            "e": 0.0,
+            "m_earth": 1000.0,
+            "density_gcc": 4.1,
+            "moons": [
+                {
+                    "name": "Kepler-1625 b-i",
+                    "a_au": 0.0090,
+                    "e": 0.0,
+                    "m_earth": 19.0,
+                    "density_gcc": 0.9
+                }
+            ]
+        }
+    ]
+}

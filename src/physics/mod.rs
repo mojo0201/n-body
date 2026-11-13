@@ -519,7 +519,7 @@ pub const PR_DRAG_BOOST: f64 = 100.0;
 
 pub const DUST_TO_BELT_MASS: f64 = 0.3;
 
-pub const DUST_STEP_INTERVAL: u64 = 16;
+pub const DUST_STEP_INTERVAL: u64 = 2;
 
 pub const COMET_SUBLIMATE_FLUX_COEFF: f64 = 1e-3;
 

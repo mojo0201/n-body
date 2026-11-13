@@ -1,29 +1,43 @@
 {
+  "name": "WD 1145+017",
+  "dust_boost": 5.0,
+  "star": {
     "name": "WD 1145+017",
-    "dust_boost": 5.0,
-    "star": {
-        "name": "WD 1145+017",
-        "mass_earth": 199768.0,
-        "age_gyr": 0.25,
-        "metallicity": 0.0,
-        "kind": "white_dwarf"
+    "mass_earth": 199768.0,
+    "age_gyr": 0.25,
+    "metallicity": 0.0,
+    "kind": "white_dwarf"
+  },
+  "planets": [
+    {
+      "name": "WD 1145+017 b",
+      "a_au": 0.0054,
+      "e": 0.0,
+      "m_earth": 1.6e-5,
+      "density_gcc": 3.0
     },
-    "planets": [
-        {
-            "name": "WD 1145+017 b",
-            "a_au": 0.0054,
-            "e": 0.0,
-            "m_earth": 1.6e-5,
-            "density_gcc": 3.0
-        }
-    ],
-    "belts": {
-        "belt_budget": 300,
-        "total_mass_earth": 0.0002,
-        "inner": {
-            "a_lo_au": 0.003,
-            "a_hi_au": 0.007,
-            "mass_frac": 1.0
-        }
+    {
+      "name": "WD 1145+017 c",
+      "a_au": 0.0056,
+      "e": 0.0,
+      "m_earth": 1.2e-5,
+      "density_gcc": 3.0
+    },
+    {
+      "name": "WD 1145+017 d",
+      "a_au": 0.0058,
+      "e": 0.0,
+      "m_earth": 9.0e-6,
+      "density_gcc": 3.0
     }
+  ],
+  "belts": {
+    "belt_budget": 300,
+    "total_mass_earth": 0.0002,
+    "inner": {
+      "a_lo_au": 0.003,
+      "a_hi_au": 0.007,
+      "mass_frac": 1.0
+    }
+  }
 }

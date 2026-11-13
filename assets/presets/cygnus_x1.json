@@ -4,7 +4,7 @@
     "star": {
         "name": "HDE 226868",
         "mass_earth": 13517608.0,
-        "age_gyr": 0.005,
+        "age_gyr": 0.0009,
         "metallicity": 0.0
     },
     "companions": [

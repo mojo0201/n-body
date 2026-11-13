@@ -1,0 +1,20 @@
+{
+    "name": "2MASS J1207 (2M1207)",
+    "dust_boost": 3.0,
+    "star": {
+        "name": "2M1207 A",
+        "mass_earth": 7950.0,
+        "age_gyr": 0.008,
+        "metallicity": 0.0,
+        "kind": "brown_dwarf"
+    },
+    "planets": [
+        {
+            "name": "2M1207 b",
+            "a_au": 46.0,
+            "e": 0.0,
+            "m_earth": 1590.0,
+            "density_gcc": 2.0
+        }
+    ]
+}

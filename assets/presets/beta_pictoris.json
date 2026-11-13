@@ -1,0 +1,49 @@
+{
+    "name": "β Pictoris",
+    "dust_boost": 2.0,
+    "star": {
+        "name": "β Pic",
+        "mass_earth": 582656.0,
+        "age_gyr": 0.023,
+        "metallicity": 0.0
+    },
+    "planets": [
+        {
+            "name": "c",
+            "a_au": 2.68,
+            "e": 0.32,
+            "m_earth": 2825.5,
+            "density_gcc": 0.5
+        },
+        {
+            "name": "b",
+            "a_au": 9.9,
+            "e": 0.1,
+            "m_earth": 2908.1,
+            "density_gcc": 0.5
+        }
+    ],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 15.0,
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 50.0,
+                    "a_hi_au": 130.0,
+                    "mass_frac": 0.9,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "scattered",
+                    "a_lo_au": 130.0,
+                    "a_hi_au": 500.0,
+                    "mass_frac": 0.1,
+                    "e_sigma": 0.2,
+                    "q_frac": 80.0
+                }
+            ]
+        }
+    }
+}

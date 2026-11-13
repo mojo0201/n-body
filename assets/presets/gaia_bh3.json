@@ -1,0 +1,23 @@
+{
+    "name": "Gaia BH3",
+    "dust_boost": 0.1,
+    "star": {
+        "name": "Gaia BH3 giant",
+        "mass_earth": 253039.0,
+        "age_gyr": 12.0,
+        "metallicity": -2.56,
+        "kind": "giant"
+    },
+    "companions": [
+        {
+            "name": "Gaia BH3",
+            "mass_earth": 10887334.0,
+            "kind": "black_hole",
+            "age_gyr": 12.0,
+            "a_au": 16.55,
+            "e": 0.7291,
+            "phase": 0.0
+        }
+    ],
+    "planets": []
+}

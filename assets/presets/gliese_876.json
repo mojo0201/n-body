@@ -1,0 +1,44 @@
+{
+    "name": "Gliese 876",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Gliese 876",
+        "mass_earth": 115200.0,
+        "age_gyr": 2.5,
+        "metallicity": 0.19
+    },
+    "planets": [
+        {
+            "name": "d",
+            "a_au": 0.0208,
+            "e": 0.207,
+            "m_earth": 6.83,
+            "density_gcc": 5.5,
+            "phase": 0.5
+        },
+        {
+            "name": "c",
+            "a_au": 0.1303,
+            "e": 0.256,
+            "m_earth": 227.0,
+            "density_gcc": 0.95,
+            "phase": 0.0
+        },
+        {
+            "name": "b",
+            "a_au": 0.2081,
+            "e": 0.032,
+            "m_earth": 723.6,
+            "density_gcc": 3.0,
+            "phase": 0.0
+        },
+        {
+            "name": "e",
+            "a_au": 0.3343,
+            "e": 0.055,
+            "m_earth": 14.6,
+            "density_gcc": 2.5,
+            "phase": 0.25
+        }
+    ]
+}

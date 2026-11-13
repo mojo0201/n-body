@@ -1,0 +1,49 @@
+{
+    "name": "AU Microscopii",
+    "dust_boost": 2.0,
+    "star": {
+        "name": "AU Mic",
+        "mass_earth": 166473.0,
+        "age_gyr": 0.022,
+        "metallicity": 0.0
+    },
+    "planets": [
+        {
+            "name": "b",
+            "a_au": 0.0645,
+            "e": 0.01,
+            "m_earth": 11.7,
+            "density_gcc": 0.88
+        },
+        {
+            "name": "c",
+            "a_au": 0.11,
+            "e": 0.01,
+            "m_earth": 22.2,
+            "density_gcc": 3.6
+        }
+    ],
+    "belts": {
+        "belt_budget": 2000,
+        "total_mass_earth": 1.0,
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 9.0,
+                    "a_hi_au": 40.0,
+                    "mass_frac": 0.85,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "scattered",
+                    "a_lo_au": 40.0,
+                    "a_hi_au": 150.0,
+                    "mass_frac": 0.15,
+                    "e_sigma": 0.2,
+                    "q_frac": 20.0
+                }
+            ]
+        }
+    }
+}

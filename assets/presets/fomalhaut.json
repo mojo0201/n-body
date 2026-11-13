@@ -1,0 +1,38 @@
+{
+    "name": "Fomalhaut",
+    "dust_boost": 2.0,
+    "star": {
+        "name": "Fomalhaut A",
+        "mass_earth": 639256.0,
+        "age_gyr": 0.44,
+        "metallicity": 0.0
+    },
+    "planets": [],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 20.0,
+        "inner": {
+            "a_lo_au": 8.0,
+            "a_hi_au": 14.0,
+            "mass_frac": 0.03
+        },
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 136.0,
+                    "a_hi_au": 150.0,
+                    "mass_frac": 0.8,
+                    "e_sigma": 0.12
+                },
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 78.0,
+                    "a_hi_au": 100.0,
+                    "mass_frac": 0.17,
+                    "e_sigma": 0.05
+                }
+            ]
+        }
+    }
+}

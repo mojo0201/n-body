@@ -22,16 +22,6 @@
 //! `camera_bg` is the *relative* camera (pos = 0): bodies, flashes and dust
 //! are pre-subtracted by the camera on the CPU, which keeps f32 precision
 //! when zoomed in. `orbit_camera_bg` is the *world* camera (orbits, trails).
-//!
-//! Dust
-//! ----
-//! Grains are stored per field relative to the field's primary (precision),
-//! plus a camera-relative centre per field that is rewritten every frame (a
-//! 2 KiB uniform). The point buffer is only rebuilt when a visible field's
-//! `version` changed, at most every `DUST_UPLOAD_MIN`, or when the set of
-//! visible fields changed. Fields that are off-screen or smaller than
-//! `DUST_MIN_PX` are skipped entirely, so a zoomed-out view of many systems
-//! draws no dust and costs nothing.
 
 use std::time::{Duration, Instant};
 
@@ -160,7 +150,7 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
         BodyKind::Planet | BodyKind::DwarfPlanet => {
             // Comets get their own colour regardless of the class
             // machinery below. Active (close to the host) is pale
-            // cyan-white, matching C₂ / dust emission. Dormant (far
+            // cyan-white, matching C2 / dust emission. Dormant (far
             // out) fades to a dull blue-gray, matching the tarlike
             // surface of a real comet nucleus.
             if b.origin[i] == BodyOrigin::Comet {

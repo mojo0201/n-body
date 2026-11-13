@@ -265,7 +265,16 @@
             "e": 0.227,
             "m_earth": 1.055e-4,
             "density_gcc": 1.53,
-            "is_dwarf": true
+            "is_dwarf": true,
+            "moons": [
+                {
+                    "name": "Vanth",
+                    "a_au": 0.0000600,
+                    "e": 0.0,
+                    "m_earth": 0.0000146,
+                    "density_gcc": 1.0
+                }
+            ]
         },
         {
             "name": "Pluto",
@@ -279,7 +288,7 @@
                     "name": "Charon",
                     "a_au": 0.0001310,
                     "e": 0.0002,
-                    "m_earth": 0.000254,
+                    "m_earth": 0.000266,
                     "density_gcc": 1.65
                 },
                 {
@@ -328,7 +337,16 @@
             "e": 0.0405,
             "m_earth": 2.0e-4,
             "density_gcc": 1.7,
-            "is_dwarf": true
+            "is_dwarf": true,
+            "moons": [
+                {
+                    "name": "Weywot",
+                    "a_au": 0.0000970,
+                    "e": 0.0,
+                    "m_earth": 0.000017,
+                    "density_gcc": 1.0
+                }
+            ]
         },
         {
             "name": "Makemake",
@@ -352,7 +370,16 @@
             "e": 0.4407,
             "m_earth": 0.00278,
             "density_gcc": 2.52,
-            "is_dwarf": true
+            "is_dwarf": true,
+            "moons": [
+                {
+                    "name": "Dysnomia",
+                    "a_au": 0.000249,
+                    "e": 0.0,
+                    "m_earth": 0.000234,
+                    "density_gcc": 1.0
+                }
+            ]
         },
         {
             "name": "67P/Churyumov-Gerasimenko",
@@ -361,7 +388,7 @@
             "m_earth": 1.67e-12,
             "density_gcc": 0.53,
             "origin": "comet",
-            "phase": 0.0
+            "phase": 0.78
         },
         {
             "name": "1P/Halley",
@@ -370,7 +397,7 @@
             "m_earth": 3.68e-11,
             "density_gcc": 0.6,
             "origin": "comet",
-            "phase": 0.0
+            "phase": 0.54
         }
     ],
     "belts": {
@@ -387,7 +414,7 @@
                     "kind": "cold_classical",
                     "a_lo_au": 42.0,
                     "a_hi_au": 48.0,
-                    "mass_frac": 0.55,
+                    "mass_frac": 0.538,
                     "e_sigma": 0.03
                 },
                 {

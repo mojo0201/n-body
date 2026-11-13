@@ -1,0 +1,22 @@
+{
+    "name": "Gaia BH1",
+    "dust_boost": 0.1,
+    "star": {
+        "name": "Gaia BH1 star",
+        "mass_earth": 309640.0,
+        "age_gyr": 5.0,
+        "metallicity": -0.2
+    },
+    "companions": [
+        {
+            "name": "Gaia BH1",
+            "mass_earth": 3202941.0,
+            "kind": "black_hole",
+            "age_gyr": 10.0,
+            "a_au": 1.4,
+            "e": 0.451,
+            "phase": 0.0
+        }
+    ],
+    "planets": []
+}

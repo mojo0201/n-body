@@ -4,7 +4,7 @@
     "star": {
         "name": "Algol Aa1",
         "mass_earth": 1055439.0,
-        "age_gyr": 0.57,
+        "age_gyr": 0.5,
         "metallicity": 0.0
     },
     "companions": [

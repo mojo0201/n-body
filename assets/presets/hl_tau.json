@@ -1,0 +1,40 @@
+{
+    "name": "HL Tauri",
+    "dust_boost": 5.0,
+    "star": {
+        "name": "HL Tau",
+        "mass_earth": 332946.0,
+        "age_gyr": 0.001,
+        "metallicity": 0.0
+    },
+    "planets": [],
+    "belts": {
+        "belt_budget": 2500,
+        "total_mass_earth": 300.0,
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 10.0,
+                    "a_hi_au": 120.0,
+                    "mass_frac": 1.0,
+                    "e_sigma": 0.02
+                }
+            ]
+        },
+        "gaps": [
+            {
+                "a_au": 13.2,
+                "width_au": 4.0
+            },
+            {
+                "a_au": 32.3,
+                "width_au": 8.0
+            },
+            {
+                "a_au": 63.0,
+                "width_au": 8.0
+            }
+        ]
+    }
+}

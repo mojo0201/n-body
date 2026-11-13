@@ -1,0 +1,36 @@
+{
+    "name": "Kepler-51",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Kepler-51",
+        "mass_earth": 327952.0,
+        "age_gyr": 0.5,
+        "metallicity": 0.05
+    },
+    "planets": [
+        {
+            "name": "b",
+            "a_au": 0.247,
+            "e": 0.03,
+            "m_earth": 3.69,
+            "density_gcc": 0.064,
+            "phase": 0.0
+        },
+        {
+            "name": "c",
+            "a_au": 0.3773,
+            "e": 0.01,
+            "m_earth": 4.43,
+            "density_gcc": 0.034,
+            "phase": 0.33
+        },
+        {
+            "name": "d",
+            "a_au": 0.5003,
+            "e": 0.01,
+            "m_earth": 5.7,
+            "density_gcc": 0.038,
+            "phase": 0.0
+        }
+    ]
+}

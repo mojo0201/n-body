@@ -1,0 +1,19 @@
+{
+    "name": "KELT-9",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "KELT-9",
+        "mass_earth": 839024.0,
+        "age_gyr": 0.3,
+        "metallicity": 0.14
+    },
+    "planets": [
+        {
+            "name": "KELT-9 b",
+            "a_au": 0.0346,
+            "e": 0.0,
+            "m_earth": 915.4,
+            "density_gcc": 0.57
+        }
+    ]
+}

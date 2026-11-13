@@ -1,0 +1,22 @@
+{
+    "name": "Sagittarius A* (S2)",
+    "dust_boost": 0.1,
+    "star": {
+        "name": "Sgr A*",
+        "mass_earth": 1.4307e12,
+        "age_gyr": 10.0,
+        "metallicity": 0.0,
+        "kind": "black_hole"
+    },
+    "companions": [
+        {
+            "name": "S2",
+            "mass_earth": 4528000.0,
+            "age_gyr": 0.0066,
+            "a_au": 1031.0,
+            "e": 0.8843,
+            "phase": 0.54
+        }
+    ],
+    "planets": []
+}

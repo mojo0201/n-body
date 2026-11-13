@@ -1,0 +1,42 @@
+{
+    "name": "Kepler-47",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Kepler-47 A",
+        "mass_earth": 318629.0,
+        "age_gyr": 3.5,
+        "metallicity": -0.25
+    },
+    "companions": [
+        {
+            "name": "Kepler-47 B",
+            "mass_earth": 113868.0,
+            "a_au": 0.0814,
+            "e": 0.0234,
+            "phase": 0.0
+        }
+    ],
+    "planets": [
+        {
+            "name": "Kepler-47 b",
+            "a_au": 0.2879,
+            "e": 0.0,
+            "m_earth": 8.0,
+            "density_gcc": 1.5
+        },
+        {
+            "name": "Kepler-47 d",
+            "a_au": 0.699,
+            "e": 0.0,
+            "m_earth": 19.0,
+            "density_gcc": 0.31
+        },
+        {
+            "name": "Kepler-47 c",
+            "a_au": 0.964,
+            "e": 0.0,
+            "m_earth": 18.0,
+            "density_gcc": 0.96
+        }
+    ]
+}

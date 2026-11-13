@@ -1,0 +1,28 @@
+{
+    "name": "Kepler-36",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Kepler-36",
+        "mass_earth": 356585.0,
+        "age_gyr": 6.8,
+        "metallicity": -0.2
+    },
+    "planets": [
+        {
+            "name": "b",
+            "a_au": 0.1153,
+            "e": 0.01,
+            "m_earth": 4.45,
+            "density_gcc": 7.46,
+            "phase": 0.0
+        },
+        {
+            "name": "c",
+            "a_au": 0.1283,
+            "e": 0.01,
+            "m_earth": 8.08,
+            "density_gcc": 0.89,
+            "phase": 0.5
+        }
+    ]
+}

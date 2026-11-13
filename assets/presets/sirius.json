@@ -1,0 +1,22 @@
+{
+    "name": "Sirius (A + white dwarf B)",
+    "dust_boost": 0.5,
+    "star": {
+        "name": "Sirius A",
+        "mass_earth": 686868.0,
+        "age_gyr": 0.24,
+        "metallicity": -0.13
+    },
+    "companions": [
+        {
+            "name": "Sirius B",
+            "mass_earth": 338939.0,
+            "kind": "white_dwarf",
+            "age_gyr": 0.12,
+            "a_au": 19.8,
+            "e": 0.5914,
+            "phase": 0.0            
+        }
+    ],
+    "planets": []
+}

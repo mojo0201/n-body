@@ -4,7 +4,7 @@
     "star": {
         "name": "PSR B1257+12",
         "mass_earth": 466000.0,
-        "age_gyr": 3.0,
+        "age_gyr": 0.85,
         "metallicity": 0.0,
         "kind": "neutron_star"
     },

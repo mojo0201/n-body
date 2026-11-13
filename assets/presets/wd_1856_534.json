@@ -1,0 +1,20 @@
+{
+    "name": "WD 1856+534",
+    "dust_boost": 0.3,
+    "star": {
+        "name": "WD 1856+534",
+        "mass_earth": 191777.0,
+        "age_gyr": 8.0,
+        "metallicity": 0.0,
+        "kind": "white_dwarf"
+    },
+    "planets": [
+        {
+            "name": "WD 1856+534 b",
+            "a_au": 0.0205,
+            "e": 0.0,
+            "m_earth": 953.5,
+            "density_gcc": 5.3
+        }
+    ]
+}

@@ -1,0 +1,41 @@
+{
+    "name": "ε Eridani",
+    "dust_boost": 1.0,
+    "star": {
+        "name": "ε Eri",
+        "mass_earth": 273016.0,
+        "age_gyr": 0.6,
+        "metallicity": -0.1
+    },
+    "planets": [
+        {
+            "name": "ε Eri b",
+            "a_au": 3.48,
+            "e": 0.07,
+            "m_earth": 209.8,
+            "density_gcc": 0.9
+        }
+    ],
+    "belts": {
+        "belt_budget": 1500,
+        "total_mass_earth": 1.0,
+        "outer": {
+            "populations": [
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 18.0,
+                    "a_hi_au": 25.0,
+                    "mass_frac": 0.1,
+                    "e_sigma": 0.05
+                },
+                {
+                    "kind": "cold_classical",
+                    "a_lo_au": 56.0,
+                    "a_hi_au": 76.0,
+                    "mass_frac": 0.9,
+                    "e_sigma": 0.05
+                }
+            ]
+        }
+    }
+}

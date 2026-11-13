@@ -1560,7 +1560,6 @@ impl ApplicationHandler for App {
                     size_in_pixels: [gfx.config.width, gfx.config.height],
                     pixels_per_point,
                 };
-
                 let mut encoder = gfx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

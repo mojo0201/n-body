@@ -624,6 +624,116 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
     LIB.get_or_init(|| {
         let sources: &[(&str, &str)] = &[
             (
+                "2mass_j1207",
+                include_str!("../../assets/presets/2mass_j1207.json"),
+            ),
+            (
+                "hot_jupiter",
+                include_str!("../../assets/presets/51_pegasi_b.json"),
+            ),
+            (
+                "55_cancri",
+                include_str!("../../assets/presets/55_cancri.json"),
+            ),
+            ("algol", include_str!("../../assets/presets/algol.json")),
+            (
+                "alpha_centauri",
+                include_str!("../../assets/presets/alpha_centauri.json"),
+            ),
+            (
+                "au_microscopii",
+                include_str!("../../assets/presets/au_microscopii.json"),
+            ),
+            (
+                "beta_pictoris",
+                include_str!("../../assets/presets/beta_pictoris.json"),
+            ),
+            (
+                "cygnus_x1",
+                include_str!("../../assets/presets/cygnus_x1.json"),
+            ),
+            (
+                "epsilon_eridani",
+                include_str!("../../assets/presets/epsilon_eridani.json"),
+            ),
+            (
+                "fomalhaut",
+                include_str!("../../assets/presets/fomalhaut.json"),
+            ),
+            (
+                "gaia_bh1",
+                include_str!("../../assets/presets/gaia_bh1.json"),
+            ),
+            (
+                "gaia_bh3",
+                include_str!("../../assets/presets/gaia_bh3.json"),
+            ),
+            (
+                "gamma_cephei",
+                include_str!("../../assets/presets/gamma_cephei.json"),
+            ),
+            (
+                "gliese_876",
+                include_str!("../../assets/presets/gliese_876.json"),
+            ),
+            (
+                "hd_40307",
+                include_str!("../../assets/presets/hd_40307.json"),
+            ),
+            (
+                "hd_80606",
+                include_str!("../../assets/presets/hd_80606.json"),
+            ),
+            ("hl_tau", include_str!("../../assets/presets/hl_tau.json")),
+            ("hr_8799", include_str!("../../assets/presets/hr_8799.json")),
+            ("kelt_9", include_str!("../../assets/presets/kelt_9.json")),
+            (
+                "kepler_16",
+                include_str!("../../assets/presets/kepler_16.json"),
+            ),
+            (
+                "kepler_1625",
+                include_str!("../../assets/presets/kepler_1625.json"),
+            ),
+            (
+                "kepler_36",
+                include_str!("../../assets/presets/kepler_36.json"),
+            ),
+            (
+                "kepler_47",
+                include_str!("../../assets/presets/kepler_47.json"),
+            ),
+            (
+                "kepler_51",
+                include_str!("../../assets/presets/kepler_51.json"),
+            ),
+            (
+                "kepler_90",
+                include_str!("../../assets/presets/kepler_90.json"),
+            ),
+            (
+                "luhman_16",
+                include_str!("../../assets/presets/luhman_16.json"),
+            ),
+            (
+                "nice_model",
+                include_str!("../../assets/presets/nice_model.json"),
+            ),
+            ("pds_70", include_str!("../../assets/presets/pds_70.json")),
+            (
+                "psr_b1257_plus_12",
+                include_str!("../../assets/presets/psr_b1257_plus_12.json"),
+            ),
+            (
+                "psr_b1620_26",
+                include_str!("../../assets/presets/psr_b1620_26.json"),
+            ),
+            (
+                "sgr_a_star",
+                include_str!("../../assets/presets/sgr_a_star.json"),
+            ),
+            ("sirius", include_str!("../../assets/presets/sirius.json")),
+            (
                 "solar_system",
                 include_str!("../../assets/presets/solar_system.json"),
             ),
@@ -631,60 +741,27 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
                 "trappist_1",
                 include_str!("../../assets/presets/trappist_1.json"),
             ),
-            (
-                "kepler_90",
-                include_str!("../../assets/presets/kepler_90.json"),
-            ),
-            (
-                "hot_jupiter",
-                include_str!("../../assets/presets/51_pegasi_b.json"),
-            ),
+            ("vega", include_str!("../../assets/presets/vega.json")),
             (
                 "wasp_12b",
                 include_str!("../../assets/presets/wasp_12b.json"),
-            ),
-            (
-                "hd_80606",
-                include_str!("../../assets/presets/hd_80606.json"),
-            ),
-            ("vega", include_str!("../../assets/presets/vega.json")),
-            ("hr_8799", include_str!("../../assets/presets/hr_8799.json")),
-            (
-                "hd_40307",
-                include_str!("../../assets/presets/hd_40307.json"),
-            ),
-            (
-                "gamma_cephei",
-                include_str!("../../assets/presets/gamma_cephei.json"),
-            ),
-            (
-                "kepler_16",
-                include_str!("../../assets/presets/kepler_16.json"),
-            ),
-            ("algol", include_str!("../../assets/presets/algol.json")),
-            (
-                "luhman_16",
-                include_str!("../../assets/presets/luhman_16.json"),
-            ),
-            (
-                "psr_b1257_plus_12",
-                include_str!("../../assets/presets/psr_b1257_plus_12.json"),
             ),
             (
                 "wd_1145_plus_017",
                 include_str!("../../assets/presets/wd_1145_plus_017.json"),
             ),
             (
-                "cygnus_x1",
-                include_str!("../../assets/presets/cygnus_x1.json"),
+                "wd_1856_534",
+                include_str!("../../assets/presets/wd_1856_534.json"),
             ),
         ];
+
         sources
             .iter()
-            .map(|(slug, src)| {
-                let preset: SystemPreset = serde_json::from_str(src)
-                    .unwrap_or_else(|e| panic!("preset {} is malformed: {}", slug, e));
-                (slug.to_string(), preset)
+            .map(|(name, json)| {
+                let preset = serde_json::from_str(json)
+                    .unwrap_or_else(|e| panic!("failed to parse preset {name}: {e}"));
+                ((*name).to_string(), preset)
             })
             .collect()
     })
