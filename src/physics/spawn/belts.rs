@@ -504,3 +504,51 @@ pub(in crate::physics) fn spawn_belts(
         }
     }
 }
+
+/// Spawn highly eccentric, icy comets from the outer system.
+///
+/// Real comets have extreme orbits. To guarantee we actually get to see
+/// their tails, we draw the *perihelion* (q) to be close to the star,
+/// and a large semi-major axis (a) in the outer system, then derive the
+/// eccentricity. This creates the classic "sungrazer" / long-period orbit.
+pub(in crate::physics) fn spawn_comets(
+    b: &mut Bodies,
+    centre: (f64, f64, f64, f64, f64),
+    snow_line_au: f64,
+    budget: usize,
+    rng: &mut XorShift,
+) {
+    if budget == 0 {
+        return;
+    }
+    // A system has 1-3 comets on average (Poisson mean 1.5).
+    let n = poisson(rng, 1.5).clamp(0, 4).min(budget);
+
+    for _ in 0..n {
+        // Perihelion: 0.2 to 3.0 AU (inside the snow line, so they become active).
+        let q_au = 0.2 + rng.next_f64() * 2.8;
+
+        // Semi-major axis: 20 to 500 AU (Kuiper belt to inner Oort cloud).
+        // Capped at 500 AU so they don't immediately hit HARD_CULL_DIST.
+        let a_au = 20.0 + rng.next_f64() * 480.0;
+
+        // Derive eccentricity from q and a. (q = a(1-e) -> e = 1 - q/a)
+        let e = (1.0 - q_au / a_au).clamp(0.0, 0.99);
+
+        // Comet nucleus mass: 1e-12 to 1e-9 Earth masses.
+        let m = sample_mass_power_law(rng, 1e-12, 1e-9, 1.8);
+
+        // spawn_belt_body handles the Keplerian orbit and velocity.
+        // class_for() automatically assigns BodyClass::Icy to Comet origins.
+        spawn_belt_body(
+            b,
+            centre,
+            a_au * au_in_gm(),
+            e,
+            m,
+            BodyOrigin::Comet,
+            snow_line_au,
+            rng,
+        );
+    }
+}

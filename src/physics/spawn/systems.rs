@@ -347,11 +347,22 @@ pub(in crate::physics) fn spawn_ms_frame(
     let len_before = b.len();
     spawn_belts(b, fr.centre, &spec, snow_line_au, belt_budget, rng);
     let belt_budget_used = b.len() - len_before;
+
+    // --- NEW: Spawn comets ---
+    let avail_after_belts = belt_budget.saturating_sub(belt_budget_used);
+    // Reserve up to 4 slots for comets so we don't starve the background debris
+    let comet_budget = avail_after_belts.min(4);
+    let len_before_comets = b.len();
+    spawn_comets(b, fr.centre, snow_line_au, comet_budget, rng);
+    let comet_budget_used = b.len() - len_before_comets;
+    // --------------------------
+
+    // Background debris gets the remaining budget
     spawn_background(
         b,
         fr.centre,
         snow_line_au,
-        belt_budget.saturating_sub(belt_budget_used),
+        avail_after_belts.saturating_sub(comet_budget_used),
         rng,
     );
 }
