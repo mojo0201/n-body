@@ -277,6 +277,7 @@ pub(super) fn collision_pass(b: &mut Bodies, dt: f64, hot: Option<&[usize]>) {
         let k = b.push(s.x, s.y, s.vx, s.vy, s.m, s.kind);
         b.imm[k] = t_imm;
         b.origin[k] = s.origin;
+        b.class[k] = s.class;
     }
 }
 
@@ -720,6 +721,13 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
             m: mk,
             kind: BodyKind::Planet,
             origin: BodyOrigin::ImpactDebris,
+            // Inherit the class of the surviving (dominant) body, so
+            // a fragment from a rocky impact is rocky and a fragment
+            // from an icy impact is icy. `rem` is still the pre-compact
+            // index of the merge survivor at this point, and `merge`
+            // does not touch `class`, so `b.class[rem]` is the class
+            // that body had before the impact.
+            class: b.class[rem],
         });
     }
     b.x[rem] -= sx / m_rem;

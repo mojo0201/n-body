@@ -313,9 +313,9 @@ pub const MASS_PLAW_ROCKY: f64 = 1.5;
 
 pub const MASS_PLAW_GIANT: f64 = 1.2;
 
-pub const MASS_PLAW_ASTEROID: f64 = 1.7;
+pub const MASS_PLAW_ASTEROID: f64 = 11.0 / 6.0;
 
-pub const MASS_PLAW_KUIPER: f64 = 1.8;
+pub const MASS_PLAW_KUIPER: f64 = 11.0 / 6.0;
 
 pub const MASS_ROCKY_MIN: f64 = 0.1;
 
@@ -325,11 +325,11 @@ pub const MASS_GIANT_MIN: f64 = 50.0;
 
 pub const MASS_GIANT_MAX: f64 = 300.0;
 
-pub const MASS_ASTEROID_MIN: f64 = 1e-5;
+pub const MASS_ASTEROID_MIN: f64 = 1e-10;
 
 pub const MASS_ASTEROID_MAX: f64 = 1e-3;
 
-pub const MASS_KUIPER_MIN: f64 = 1e-6;
+pub const MASS_KUIPER_MIN: f64 = 1e-11;
 
 pub const MASS_KUIPER_MAX: f64 = 0.013;
 
@@ -728,6 +728,11 @@ struct Spawn {
     m: f64,
     kind: BodyKind,
     origin: BodyOrigin,
+    /// Taxonomic class of the new body. Fresh spawns (`spawn_belt_body`)
+    /// decide it via `class_for`; debris fragments inherit the parent
+    /// body's class so an icy moon sheds ice and a rocky planet sheds
+    /// rock. `render.rs` reads `b.class[i]` directly.
+    class: BodyClass,
 }
 
 pub struct Bodies {

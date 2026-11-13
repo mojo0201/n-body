@@ -324,6 +324,11 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
             m: mk,
             kind: BodyKind::Planet,
             origin: BodyOrigin::TidalDebris,
+            // A tidally disrupted body sheds material of its own
+            // composition, so every fragment inherits `b.class[i]`
+            // (the body being torn apart). `i` is still valid — the
+            // `b.dead[i] = true` below runs *after* this loop.
+            class: b.class[i],
         });
     }
     let t_imm = b.time + IMMUNITY_TIME;
@@ -334,6 +339,7 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
         let k = b.push(s.x, s.y, vx, vy, s.m, s.kind);
         b.imm[k] = t_imm;
         b.origin[k] = BodyOrigin::TidalDebris;
+        b.class[k] = s.class;
         l_after += s.m * (s.x * vy - s.y * vx);
     }
     let dl = l_before - l_after;

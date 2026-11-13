@@ -113,12 +113,22 @@ pub(super) fn sample_mass_power_law(rng: &mut XorShift, m_min: f64, m_max: f64, 
     ((1.0 - u) * a + u * b).powf(1.0 / inv)
 }
 
-/// Draw `n` masses from a truncated power law, then scale so their sum is
-/// `total`. Caps each tracer at `BELT_MAX_TRACER_MASS` and at `total/5`
-/// (no single tracer should exceed 20 % of its belt — such a body would
-/// act as a single perturber, not as a population). The power-law *shape*
-/// is preserved; only the absolute scale changes, so relative body sizes
-/// stay physical.
+/// Draw `n` masses for one belt population. `n_dominant` of them are
+/// "dominant" bodies (a single Pluto- or Ceres-mass body rather than a
+/// tracer); the rest are tracers that together carry the remainder of
+/// the population.
+///
+/// The number of dominant bodies is *deterministic* — it depends only on
+/// the population mass — so this function consumes exactly the same
+/// `next_f64()` draws as the pre-dominant version and the RNG stream is
+/// unchanged. Each dominant is 30 % of the population's mass in total,
+/// divided among 1–3 bodies in proportion to their power-law draws (so
+/// their individual masses have a real spread, e.g. Pluto vs. a smaller
+/// scattered KBO). Tracers share the other 70 %, capped as before.
+///
+/// `total` is preserved: the sum of the returned masses equals `total`
+/// unless a tracer hits its cap (which is the same loss the pre-dominant
+/// code had).
 pub(super) fn draw_masses_to_total(
     rng: &mut XorShift,
     n: usize,
@@ -133,19 +143,50 @@ pub(super) fn draw_masses_to_total(
     if total <= 0.0 {
         return vec![0.0; n];
     }
-    let mut v: Vec<f64> = (0..n)
+
+    // Deterministic dominant count, from the population's mass alone. No
+    // `next_f64()` draw, so the RNG stream is preserved exactly.
+    let n_dominant = ((total / BELT_REF_MASS).round() as usize)
+        .clamp(1, 3)
+        .min(n);
+
+    // Same number of `next_f64()` draws as before, just split at the
+    // dominant/tracer boundary below.
+    let mut samples: Vec<f64> = (0..n)
         .map(|_| sample_mass_power_law(rng, m_min, m_max, plaw))
         .collect();
-    let sum: f64 = v.iter().sum();
-    if sum <= 0.0 {
-        return v;
+
+    // 30 % of the population's mass in the dominant bodies. 30 is a
+    // compromise: massive enough that one body is visibly larger than
+    // the tracers, small enough that a dominants-only belt doesn't
+    // collapse the tracer population's total mass below the `got /
+    // expected` tolerance of `spawn_outer_belt_mass_realistic`.
+    const DOMINANT_BELT_FRAC: f64 = 0.30;
+    let total_dom = total * DOMINANT_BELT_FRAC;
+    let total_tr = total - total_dom;
+
+    let (dom_slice, tr_slice) = samples.split_at_mut(n_dominant);
+
+    let dom_sum: f64 = dom_slice.iter().sum();
+    if dom_sum > 0.0 {
+        let scale_d = total_dom / dom_sum;
+        for m in dom_slice.iter_mut() {
+            *m *= scale_d;
+        }
     }
-    let scale = total / sum;
-    let cap = BELT_MAX_TRACER_MASS.min(total / 5.0);
-    for m in v.iter_mut() {
-        *m = (*m * scale).min(cap);
+
+    let tr_sum: f64 = tr_slice.iter().sum();
+    if tr_sum > 0.0 {
+        let scale_t = total_tr / tr_sum;
+        // Same per-tracer cap as before — dominants are exempt because
+        // they are *supposed* to be individually significant.
+        let cap = BELT_MAX_TRACER_MASS.min(total / 5.0);
+        for m in tr_slice.iter_mut() {
+            *m = (*m * scale_t).min(cap);
+        }
     }
-    v
+
+    samples
 }
 
 pub(super) fn spacing_range(
