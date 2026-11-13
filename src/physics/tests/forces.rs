@@ -25,7 +25,7 @@ use super::super::*;
 /// Central star plus `n - 1` planets on circular orbits at 5–505 Gm. That
 /// is well outside `SOFT2.sqrt()`, so the softening term has negligible
 /// effect and closed-form Newton comparisons are valid.
-fn solar_disc(n: usize, seed: u32) -> Bodies {
+fn solar_disc(n: usize, seed: u128) -> Bodies {
     let mut b = Bodies::with_capacity(n);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let mut rng = XorShift::new(seed);
@@ -219,7 +219,7 @@ fn am_range_empty_is_zero() {
 /// order-independent, so `dt_limit` is bit-identical.
 #[test]
 fn am_range_partition_matches_direct() {
-    for seed in 0..3u32 {
+    for seed in 0..3u128 {
         let b = solar_disc(15, seed);
         let n = b.len();
         for i in 0..n {
@@ -245,7 +245,7 @@ fn am_range_partition_matches_direct() {
 /// is order-independent, so it must match bit-for-bit.
 #[test]
 fn am_sym_matches_direct() {
-    for seed in 0..5u32 {
+    for seed in 0..5u128 {
         let mut b = solar_disc(20, seed);
         let n = b.len();
         let ref_acc: Vec<(f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
@@ -529,7 +529,7 @@ fn am_compute_accel_single_body() {
 #[test]
 fn am_compute_accel_zeroes_com_accel() {
     for n in [5usize, 500] {
-        let mut b = solar_disc(n, n as u32);
+        let mut b = solar_disc(n, n as u128);
         compute_accel(&mut b);
         let mt: f64 = b.m.iter().sum();
         let (mut px, mut py) = (0.0, 0.0);
@@ -552,7 +552,7 @@ fn am_compute_accel_zeroes_com_accel() {
 #[test]
 fn am_compute_accel_matches_force_direct_on() {
     for n in [5usize, 200] {
-        let mut b = solar_disc(n, n as u32);
+        let mut b = solar_disc(n, n as u128);
         let ref_acc: Vec<(f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
         compute_accel(&mut b);
         let mt: f64 = b.m.iter().sum();
@@ -586,7 +586,7 @@ fn am_compute_accel_matches_force_direct_on() {
 #[test]
 fn am_compute_accel_finite_across_sizes() {
     for n in [2usize, 3, 10, 50, 200] {
-        let mut b = solar_disc(n, n as u32);
+        let mut b = solar_disc(n, n as u128);
         compute_accel(&mut b);
         for i in 0..n {
             assert!(b.ax[i].is_finite(), "n {n} body {i} ax");

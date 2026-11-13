@@ -11,6 +11,11 @@
 //!   * `BELT_GRIND_MIN_M` — floor below which a belt body is not ground.
 //!   * `grind_belts` — belt-collision routine that the tests drive directly.
 //!
+//! `MAX_COMETS`, `COMET_DUST_LIFE_TU`, `NONCOMET_DUST_LIFE_TU` and
+//! `DUST_COMET_FIELD_CAP` are `pub` in `physics/dust.rs`; `Grain::ttl` is a
+//! public field, so every `Grain { .. }` literal here sets it (use
+//! `f32::INFINITY` for "never expires").
+//!
 //! Everything else arrives through `physics/mod.rs`'s `pub use` re-exports,
 //! so the internal integrator (`step_grain`, `accel`, `emit_dir`) stays
 //! private and the tests exercise only the public surface.
@@ -46,6 +51,7 @@ fn sun_field(size_um: f64, r: f64) -> (Bodies, DustField) {
             vy: v,
             mass: 1.0,
             size_um,
+            ttl: f32::INFINITY,
         }],
         version: 0,
     };
@@ -242,6 +248,7 @@ fn step_skips_invalid_primary() {
             vy: 0.0,
             mass: 1.0,
             size_um: 100.0,
+            ttl: f32::INFINITY,
         }],
         version: 0,
     };
@@ -356,6 +363,7 @@ fn grain_near_companion_star_is_removed() {
             vy: 0.0,
             mass: 1.0,
             size_um: 100.0,
+            ttl: f32::INFINITY,
         }],
         version: 0,
     });
@@ -373,7 +381,7 @@ fn grain_near_companion_star_is_removed() {
 /// sub-step loop.
 #[test]
 fn sequential_and_parallel_agree() {
-    let make = |n: usize, seed: u32| -> (Bodies, DustField) {
+    let make = |n: usize, seed: u128| -> (Bodies, DustField) {
         let mut b = Bodies::with_capacity(2);
         b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
         let mut rng = XorShift::new(seed);
@@ -388,6 +396,7 @@ fn sequential_and_parallel_agree() {
                 vy: v,
                 mass: 1.0,
                 size_um: 100.0,
+                ttl: f32::INFINITY,
             });
         }
         (
@@ -590,6 +599,7 @@ fn grinding_respects_grain_cap() {
             vy: 0.0,
             mass: 0.0,
             size_um: 1.0,
+            ttl: f32::INFINITY,
         },
     );
     let mut rng = XorShift::new(2);
@@ -600,4 +610,216 @@ fn grinding_respects_grain_cap() {
         DUST_MAX_GRAINS,
         "grind_belts must not push past DUST_MAX_GRAINS"
     );
+}
+
+// ===========================================================================
+// Grain lifetime, comet dust cap, comet limit
+// ===========================================================================
+
+/// The comet cap must sit below the hard cap with room for one emission, or
+/// the comet-specific guard would be unreachable.
+const _: () = assert!(DUST_COMET_FIELD_CAP + DUST_EMIT_GRAINS <= DUST_MAX_GRAINS);
+
+/// A grain that never leaves the field and carries no mass, for padding a
+/// field up to a given population.
+fn filler_grain() -> Grain {
+    Grain {
+        x: 0.0,
+        y: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        mass: 0.0,
+        size_um: 1.0,
+        ttl: f32::INFINITY,
+    }
+}
+
+/// Sun + `n` comets on circular orbits, 100 Gm apart radially by 10 Gm each.
+/// Comet `k` sits at index `k + 1`, so a higher index means farther out.
+fn comet_rig(n: usize) -> Bodies {
+    let mut b = Bodies::with_capacity(n + 1);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    for k in 0..n {
+        let r = 100.0 + 10.0 * k as f64;
+        let v = (G * M_SUN_ME / r).sqrt();
+        let i = b.push(r, 0.0, 0.0, v, 1e-6, BodyKind::Planet);
+        b.origin[i] = BodyOrigin::Comet;
+        b.class[i] = BodyClass::Icy;
+    }
+    b.refresh_parent_cache();
+    b
+}
+
+/// A grain is removed once its `ttl` runs out, even on a safe bound orbit.
+/// With `ttl = 1.0` and `dt = 0.4` it survives two steps (ttl 0.2 left) and
+/// expires on the third.
+#[test]
+fn grain_with_expired_ttl_is_removed() {
+    let (b, mut f) = sun_field(100.0, 150.0);
+    f.grains[0].ttl = 1.0;
+    f.step(&b, 0.4);
+    f.step(&b, 0.4);
+    assert_eq!(
+        f.grains.len(),
+        1,
+        "grain should survive 0.8 tu of a 1.0 tu ttl"
+    );
+    f.step(&b, 0.4);
+    assert!(f.grains.is_empty(), "grain should expire once ttl <= 0");
+}
+
+/// An infinite `ttl` is never consumed: the grain stays alive and its `ttl`
+/// stays infinite, so belt dust is unaffected by the lifetime logic.
+#[test]
+fn infinite_ttl_never_expires() {
+    let (b, mut f) = sun_field(100.0, 150.0);
+    assert!(f.grains[0].ttl.is_infinite());
+    for _ in 0..100 {
+        f.step(&b, 0.05);
+    }
+    assert_eq!(f.grains.len(), 1);
+    assert!(f.grains[0].ttl.is_infinite());
+}
+
+/// Comet tracers (`deposit` with a direction) get a finite lifetime drawn from
+/// 0.5-1.5 x `COMET_DUST_LIFE_TU`, and the draws differ from grain to grain.
+#[test]
+fn comet_dust_gets_finite_lifetime() {
+    let mut b = deposit_rig(500.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    let grains = &b.dust_fields[0].grains;
+    assert_eq!(grains.len(), DUST_EMIT_GRAINS);
+    let (lo, hi) = (0.5 * COMET_DUST_LIFE_TU, 1.5 * COMET_DUST_LIFE_TU);
+    for g in grains {
+        let t = g.ttl as f64;
+        assert!(
+            t.is_finite() && t >= lo - 1e-4 && t <= hi + 1e-4,
+            "comet grain ttl {t} outside [{lo}, {hi}]"
+        );
+    }
+    let first = grains[0].ttl;
+    assert!(
+        grains.iter().any(|g| g.ttl != first),
+        "all comet grains drew the same lifetime"
+    );
+}
+
+/// Collision and belt dust (`deposit` without a direction) take
+/// `NONCOMET_DUST_LIFE_TU`, which is infinite by default.
+#[test]
+fn collision_dust_uses_noncomet_lifetime() {
+    let mut b = deposit_rig(500.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    let grains = &b.dust_fields[0].grains;
+    assert_eq!(grains.len(), DUST_EMIT_GRAINS);
+    for g in grains {
+        assert_eq!(g.ttl, NONCOMET_DUST_LIFE_TU as f32);
+    }
+}
+
+/// Comets may fill a field up to exactly `DUST_COMET_FIELD_CAP` and no
+/// further. One emission that lands on the cap is allowed; the next is dropped.
+#[test]
+fn comet_dust_stops_at_field_cap() {
+    let mut b = deposit_rig(500.0);
+    b.dust_fields[0]
+        .grains
+        .resize(DUST_COMET_FIELD_CAP - DUST_EMIT_GRAINS, filler_grain());
+    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    assert_eq!(b.dust_fields[0].grains.len(), DUST_COMET_FIELD_CAP);
+    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    assert_eq!(
+        b.dust_fields[0].grains.len(),
+        DUST_COMET_FIELD_CAP,
+        "comet emission must not push past DUST_COMET_FIELD_CAP"
+    );
+}
+
+/// The lower comet cap must not throttle collision dust: with the field at
+/// the comet cap, an isotropic deposit still goes through.
+#[test]
+fn collision_dust_ignores_comet_cap() {
+    let mut b = deposit_rig(500.0);
+    b.dust_fields[0]
+        .grains
+        .resize(DUST_COMET_FIELD_CAP, filler_grain());
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    assert_eq!(
+        b.dust_fields[0].grains.len(),
+        DUST_COMET_FIELD_CAP + DUST_EMIT_GRAINS
+    );
+}
+
+/// Over the limit, `evolve` marks the surplus comets dead, the farthest first,
+/// leaves the rest alone, logs a `Comet` event, and a second call does not
+/// kill more. `compact` then leaves exactly `MAX_COMETS` comets.
+#[test]
+fn comet_limit_removes_farthest_surplus() {
+    let extra = 5;
+    let mut b = comet_rig(MAX_COMETS + extra);
+    b.stats.steps = DUST_STEP_INTERVAL;
+    evolve(&mut b, DT);
+
+    let dead: Vec<usize> = (0..b.len()).filter(|&i| b.dead[i]).collect();
+    let n = b.len();
+    let expected: Vec<usize> = ((n - extra)..n).collect();
+    assert_eq!(
+        dead, expected,
+        "the {extra} farthest comets should be removed"
+    );
+    assert!(!b.dead[0], "the star must never be touched");
+    assert_eq!(b.events.back().map(|e| e.kind), Some(EventKind::Comet));
+
+    evolve(&mut b, DT);
+    assert_eq!(
+        (0..b.len()).filter(|&i| b.dead[i]).count(),
+        extra,
+        "a second call must not remove more comets"
+    );
+
+    b.compact();
+    let comets = (0..b.len())
+        .filter(|&i| b.origin[i] == BodyOrigin::Comet)
+        .count();
+    assert_eq!(comets, MAX_COMETS);
+}
+
+/// Named (preset) comets are kept in preference to unnamed ones, even when
+/// they are the farthest from the host.
+#[test]
+fn comet_limit_keeps_named_comets() {
+    let mut b = comet_rig(MAX_COMETS + 1);
+    let farthest = b.len() - 1;
+    b.name[farthest] = Some("Halley".to_string());
+    b.stats.steps = DUST_STEP_INTERVAL;
+    evolve(&mut b, DT);
+
+    assert!(!b.dead[farthest], "named comet must survive the limit");
+    assert!(
+        b.dead[farthest - 1],
+        "the farthest unnamed comet should go instead"
+    );
+    assert_eq!((0..b.len()).filter(|&i| b.dead[i]).count(), 1);
+}
+
+/// At exactly `MAX_COMETS` nothing is removed.
+#[test]
+fn comet_limit_noop_at_limit() {
+    let mut b = comet_rig(MAX_COMETS);
+    b.stats.steps = DUST_STEP_INTERVAL;
+    evolve(&mut b, DT);
+    assert!((0..b.len()).all(|i| !b.dead[i]));
+}
+
+/// The limit is enforced on the dust cadence, like the rest of `evolve`: off
+/// the interval nothing is removed.
+#[test]
+fn comet_limit_gated_by_step_interval() {
+    if DUST_STEP_INTERVAL <= 1 {
+        return; // every step is a multiple, no gating to test
+    }
+    let mut b = comet_rig(MAX_COMETS + 3);
+    b.stats.steps = 1;
+    evolve(&mut b, DT);
+    assert!((0..b.len()).all(|i| !b.dead[i]));
 }

@@ -229,7 +229,7 @@ pub(super) fn range_com(b: &Bodies, (s, e): (usize, usize)) -> (f64, f64) {
 /// A solar-mass, 4.6-Gyr, solar-metallicity host with the main-sequence
 /// architecture of `spawn_architecture` (no binary, so the compact-chain
 /// statistics are isolated).
-pub(super) fn solar_mass_system(seed: u32, n: usize) -> Bodies {
+pub(super) fn solar_mass_system(seed: u128, n: usize) -> Bodies {
     let mut b = Bodies::with_capacity(n);
     b.rng = XorShift::new(seed ^ 0xA5A5_5A5A);
     b.metallicity = 0.0;

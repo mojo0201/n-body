@@ -393,11 +393,13 @@ pub(super) fn rho1_sim() -> f64 {
 /// erode less than head-on ones.
 pub(super) fn interact_frac(rt: f64, rp: f64, bb: f64) -> f64 {
     let l = (rt + rp) * (1.0 - bb);
-    if l >= 2.0 * rp {
-        1.0
-    } else {
-        ((3.0 * rp * l * l - l * l * l) / (4.0 * rp * rp * rp)).clamp(0.0, 1.0)
+    if l <= 0.0 {
+        return 0.0;
     }
+    if l >= 2.0 * rp {
+        return 1.0;
+    }
+    (3.0 * rp * l * l - l * l * l) / (4.0 * rp * rp * rp)
 }
 
 /// Specific disruption energy `Q*_RD` for the gravity regime, following

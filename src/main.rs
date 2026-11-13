@@ -503,7 +503,7 @@ fn build_comet_tails(b: &Bodies, _cam: [f64; 2]) -> Vec<OrbitVertex> {
         // 0.05-0.3 AU). 0.06 AU no longer dominates the inner-system view.
         let tail_len_gm = 0.06 * au * activity;
         // Tail spread: real tails are narrow streams (aspect 20:1+), not
-        // wide fans. 0.018 rad gives ~55:1 at full length — a stream.
+        // wide fans. 0.008 rad total across the three rays — a stream.
         // An ion tail is extremely straight and narrow.
         const TAIL_LINES: usize = 3;
         const TAIL_STEPS: usize = 3;
@@ -521,7 +521,8 @@ fn build_comet_tails(b: &Bodies, _cam: [f64; 2]) -> Vec<OrbitVertex> {
         for k in 0..TAIL_LINES {
             let t = k as f64 / (TAIL_LINES - 1) as f64 - 0.5;
             let ang = t * TAIL_SPREAD;
-            let (ca, sa) = ang.cos().sin_cos();
+            // `f64::sin_cos` returns (sin, cos), in that order.
+            let (sa, ca) = ang.sin_cos();
             let tx = ux * ca - uy * sa;
             let ty = ux * sa + uy * ca;
             for s in 0..TAIL_STEPS {
@@ -550,7 +551,7 @@ fn build_comet_tails(b: &Bodies, _cam: [f64; 2]) -> Vec<OrbitVertex> {
             const COMA_RAYS: usize = 8;
             for k in 0..COMA_RAYS {
                 let ang = k as f64 / COMA_RAYS as f64 * std::f64::consts::TAU;
-                let (ca, sa) = ang.cos().sin_cos();
+                let (sa, ca) = ang.sin_cos();
                 let x0 = b.x[i];
                 let y0 = b.y[i];
                 let x1 = b.x[i] + ca * coma_r_gm;
@@ -578,7 +579,7 @@ struct SimState {
     /// for `Preset::SolarSystem` this is the actual Solar preset count
     /// (Sun + 13 planets + ~200 belt bodies), taken from `b.len()` after spawn.
     body_count: usize,
-    seed: u32,
+    seed: u128,
     fps_timer: Instant,
     fps_frames: u32,
     fps: f32,
@@ -606,6 +607,13 @@ struct SimState {
     t_window_start: Instant,
     t_window_frames: u32,
     t_frame_accum: f64,
+    // NBODY_TIMING breakdown (microseconds, summed over the window).
+    t_wait_accum: f64,
+    t_held_accum: f64,
+    t_inst_accum: f64,
+    t_comet_accum: f64,
+    last_comets: usize,
+    last_comet_verts: usize,
     trail: TrailState,
     evolution_rate: f64,
     sn_kicks: bool,
@@ -650,6 +658,12 @@ impl SimState {
             t_window_start: Instant::now(),
             t_window_frames: 0,
             t_frame_accum: 0.0,
+            t_wait_accum: 0.0,
+            t_held_accum: 0.0,
+            t_inst_accum: 0.0,
+            t_comet_accum: 0.0,
+            last_comets: 0,
+            last_comet_verts: 0,
             trail: TrailState::new(),
             evolution_rate: 0.0,
             sn_kicks: true,
@@ -664,7 +678,7 @@ impl SimState {
     /// the Solar preset takes the body count from the spawn (13 planets +
     /// ~200 belt bodies, not the old hard-coded 9). `seed` is used by both:
     /// `Random` uses it as the RNG seed, `Solar` as the planet-phase seed.
-    fn reset_with(&mut self, b: &mut Bodies, shared: &Shared, count: usize, seed: u32) {
+    fn reset_with(&mut self, b: &mut Bodies, shared: &Shared, count: usize, seed: u128) {
         self.seed = seed;
         match self.preset {
             Preset::Random => {
@@ -1384,7 +1398,12 @@ impl ApplicationHandler for App {
                 let mut orbit_out_taken: Option<(u64, Vec<OrbitVertex>)> = None;
 
                 {
+                    // Time spent waiting for the physics thread to release the
+                    // lock, then time spent holding it (NBODY_TIMING only).
+                    let t_wait0 = Instant::now();
                     let mut b = self.shared.lock_for_render();
+                    let t_held0 = Instant::now();
+                    self.sim.t_wait_accum += t_wait0.elapsed().as_secs_f64() * 1e6;
 
                     self.sim.fps_frames += 1;
                     let win = self.sim.fps_timer.elapsed().as_secs_f32();
@@ -1510,12 +1529,22 @@ impl ApplicationHandler for App {
                         self.sim.orbit_buf_valid = true;
                     }
 
+                    let t_inst0 = Instant::now();
                     gfx.renderer
                         .build_instances(&b, self.sim.zoom, self.sim.cam, vp);
+                    self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
                     let _ = std::mem::take(&mut self.sim.scene_dirty);
+                    let t_comet0 = Instant::now();
                     comet_tail_verts = build_comet_tails(&b, self.sim.cam);
+                    self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
                     flashes_active = !b.flashes.is_empty();
                     n_bodies = b.len();
+                    if self.timing_log {
+                        self.sim.last_comets =
+                            b.origin.iter().filter(|&&o| o == BodyOrigin::Comet).count();
+                        self.sim.last_comet_verts = comet_tail_verts.len();
+                    }
+                    self.sim.t_held_accum += t_held0.elapsed().as_secs_f64() * 1e6;
                 }
 
                 // ---- Everything below runs WITHOUT the bodies lock. ----
@@ -1607,12 +1636,27 @@ impl ApplicationHandler for App {
                         let phys_busy = self.shared.phys_ns.swap(0, Ordering::Relaxed) as f64
                             / (secs * 1e9)
                             * 100.0;
+                        let ms = |us: f64| us / frames / 1000.0;
+                        let dust_busy = physics::DUST_STAT_NS.swap(0, Ordering::Relaxed) as f64
+                            / (secs * 1e9)
+                            * 100.0;
+                        let dust_grains = physics::DUST_STAT_GRAINS.load(Ordering::Relaxed);
                         println!(
-                            "[timing] n={} fps={:.0} frame={:.2}ms physics_busy={:.0}%{}",
+                            "[timing] n={} comets={} (tail verts {}) fps={:.0} frame={:.2}ms \
+                             lock_wait={:.2}ms lock_held={:.2}ms (instances={:.2} comet_tails={:.2}) \
+                             physics_busy={:.0}% (dust={:.0}%, {} grains){}",
                             n_bodies,
+                            self.sim.last_comets,
+                            self.sim.last_comet_verts,
                             frames / secs,
-                            self.sim.t_frame_accum / frames / 1000.0,
+                            ms(self.sim.t_frame_accum),
+                            ms(self.sim.t_wait_accum),
+                            ms(self.sim.t_held_accum),
+                            ms(self.sim.t_inst_accum),
+                            ms(self.sim.t_comet_accum),
                             phys_busy,
+                            dust_busy,
+                            dust_grains,
                             if self.shared.behind.load(Ordering::Relaxed) {
                                 " (behind)"
                             } else {
@@ -1622,6 +1666,10 @@ impl ApplicationHandler for App {
                         self.sim.t_window_start = Instant::now();
                         self.sim.t_window_frames = 0;
                         self.sim.t_frame_accum = 0.0;
+                        self.sim.t_wait_accum = 0.0;
+                        self.sim.t_held_accum = 0.0;
+                        self.sim.t_inst_accum = 0.0;
+                        self.sim.t_comet_accum = 0.0;
                     }
                 }
                 if let Some(t) = new_title {

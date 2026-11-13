@@ -53,6 +53,7 @@
 //!      bulk density, random spawn)
 //!   am force dispatch (direct sum, symmetric pair sum, chunked parallel,
 //!      tree integration)
+//!   an orbit line rendering (gating, stride caps, colour, closure)
 //!
 //! Belts and bulk density are tested under `al_*` (they were introduced by
 //! the evolution-then-belts prompt pair) and under `mean_anomaly_*`,
@@ -70,6 +71,7 @@ mod evolution;
 mod forces;
 mod fuzz;
 mod kepler;
+mod orbit_lines;
 mod orbits;
 mod presets;
 mod shared;

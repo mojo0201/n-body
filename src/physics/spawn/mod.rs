@@ -587,13 +587,13 @@ pub(super) fn orbital_period_days(a_gm: f64, m_tot: f64) -> f64 {
     std::f64::consts::TAU * (a_gm.powi(3) / (G * m_tot)).sqrt() * time_unit_s() / 86_400.0
 }
 
-pub fn spawn_system(b: &mut Bodies, body_count: usize, seed: u32) {
+pub fn spawn_system(b: &mut Bodies, body_count: usize, seed: u128) {
     spawn_system_with_info(b, body_count, seed);
 }
 
 /// Like `spawn_system`, but also reports what was generated (binary
 /// parameters and architecture).
-pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u32) -> SystemInfo {
+pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> SystemInfo {
     *b = Bodies::with_capacity(body_count);
     b.rng = XorShift::new(seed ^ 0xA5A5_5A5A);
     let mut rng = XorShift::new(seed);

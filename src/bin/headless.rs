@@ -64,7 +64,7 @@ EXAMPLES:
 
 struct Args {
     n: usize,
-    seed: u32,
+    seed: u128,
     secs: f64,
     speed: f64,
     preset: Preset,

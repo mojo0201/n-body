@@ -722,7 +722,7 @@ fn belt_spec_returns_belt_for_most_systems() {
     // overall occurrence around 77 %. Threshold of 180/300 is a
     // comfortable two-sigma-plus floor.
     let mut with_belt = 0;
-    for seed in 0..300u32 {
+    for seed in 0..300u128 {
         let mut b = Bodies::with_capacity(50);
         spawn_system(&mut b, 50, seed);
         if (0..b.len()).any(|i| b.origin[i].is_belt()) {
@@ -747,7 +747,7 @@ fn kirkwood_gaps_at_jupiter_resonances() {
 fn belt_bodies_have_physical_bulk_density() {
     // Every spawned belt body must carry a bulk density in the
     // physical range (rock through ice, with headroom for porosity).
-    for seed in 0..40u32 {
+    for seed in 0..40u128 {
         let mut b = Bodies::with_capacity(50);
         spawn_system(&mut b, 50, seed);
         for i in 0..b.len() {
@@ -768,7 +768,7 @@ fn belt_bodies_have_physical_bulk_density() {
 fn belt_bodies_are_never_moons() {
     // Belt bodies orbit the primary, not another planet — the parent
     // finder must never classify one as a moon.
-    for seed in 0..30u32 {
+    for seed in 0..30u128 {
         let mut b = Bodies::with_capacity(50);
         spawn_system(&mut b, 50, seed);
         b.refresh_parent_cache();
@@ -841,7 +841,7 @@ fn ices_are_lighter_than_rocks() {
 fn belt_dwarf_planets_use_dwarf_kind() {
     // A belt body's kind is DwarfPlanet exactly when its mass falls in
     // the dwarf-planet window; outside that band it is a plain Planet.
-    for seed in 0..200u32 {
+    for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
         for i in 0..b.len() {
@@ -905,7 +905,7 @@ fn classify_small_body_matches_belt_spawn() {
             }
         }
     };
-    for seed in 0..100u32 {
+    for seed in 0..100u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
         check(&b, &format!("seed {seed}"));

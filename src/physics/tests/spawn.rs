@@ -15,7 +15,7 @@ fn g_ic_random_architecture_sane() {
     // and ~15 % of primaries are remnants whose belts are usually empty.
     // Expected belt fraction: 0.85 × 0.85 + 0.15 × 0.30 ≈ 0.77.
     let mut with_belt = 0;
-    for seed in 0..200u32 {
+    for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
         assert!(b.len() <= 100, "seed {} produced {} bodies", seed, b.len());
@@ -34,7 +34,7 @@ fn g_ic_random_architecture_sane() {
 #[test]
 fn g_ic_primary_diversity() {
     let mut seen = [false; 5];
-    for seed in 0..1500u32 {
+    for seed in 0..1500u128 {
         let mut b = Bodies::with_capacity(30);
         spawn_system(&mut b, 30, seed);
         match b.kind[0] {
@@ -69,7 +69,7 @@ fn g_ic_primary_imf_mass_vs_remnant_split() {
 fn g_ic_primary_mix_realistic() {
     // After aging: most primaries are still Stars, but a real share of the
     // 85 % stellar draws has already died, and every compact kind occurs.
-    let n = 3000u32;
+    let n = 3000u128;
     let (mut ms, mut bd, mut wd, mut ns, mut bh) = (0, 0, 0, 0, 0);
     for seed in 0..n {
         let mut b = Bodies::with_capacity(3);
@@ -98,7 +98,7 @@ fn g_ic_primary_mix_realistic() {
 #[test]
 fn g_ic_imf_median_mass() {
     let mut ms: Vec<f64> = Vec::new();
-    for seed in 0..1000u32 {
+    for seed in 0..1000u128 {
         let mut b = Bodies::with_capacity(30);
         spawn_system(&mut b, 30, seed);
         if b.kind[0] == BodyKind::Star {
@@ -115,7 +115,7 @@ fn g_ic_imf_median_mass() {
 fn g_ic_hot_jupiter_rate() {
     let au = au_in_gm();
     let (mut hosts, mut hj) = (0u32, 0u32);
-    for seed in 0..2000u32 {
+    for seed in 0..2000u128 {
         let mut b = Bodies::with_capacity(30);
         spawn_system(&mut b, 30, seed);
         assert!(b.len() <= 30, "seed {}: {} bodies", seed, b.len());
@@ -362,7 +362,7 @@ fn mean_anomaly_sampling_is_uniform_in_time() {
 fn random_systems_never_exceed_body_count() {
     // `body_count` is a ceiling: sparse systems may under-fill it, but no
     // system may exceed it.
-    for seed in 0..200u32 {
+    for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
         assert!(b.len() <= 100, "seed {}: {} bodies", seed, b.len());
@@ -481,7 +481,7 @@ fn m1_ring_accommodates_wide_binary() {
     assert!((ring_radius_for_extent(3, 0.0) - solar_ring_radius_gm(3)).abs() < 1e-9);
     assert!((ring_radius_for_extent(2, 44_880.0) - 3.0 * 44_880.0).abs() < 1e-6);
     assert_eq!(ring_radius_for_extent(1, 1e9), 0.0);
-    for seed in 0..500u32 {
+    for seed in 0..500u128 {
         let mut b = Bodies::with_capacity(0);
         let (infos, ranges) = spawn_random_systems_impl(&mut b, 30, seed, 2);
         let wide = infos
@@ -517,7 +517,7 @@ fn m2_radial_scatter() {
     let mut b = Bodies::with_capacity(0);
     let _ = spawn_random_systems(&mut b, 5, 42, 6);
     let prim: Vec<f64> = (0..b.len())
-        .filter(|&i| matches!(b.kind[i], BodyKind::Star | BodyKind::BrownDwarf))
+        .filter(|&i| is_host_kind(b.kind[i])) // Star | BD | WD | NS | BH
         .map(|i| b.x[i].hypot(b.y[i]))
         .collect();
     assert!(prim.len() >= 6);
@@ -579,7 +579,7 @@ fn m4_per_system_speed() {
 #[test]
 fn m5_body_count_scales_with_mass() {
     let mut any_scaled = false;
-    for seed in 0..20u32 {
+    for seed in 0..20u128 {
         let mut b = Bodies::with_capacity(0);
         let (_, ranges) = spawn_random_systems_impl(&mut b, 30, seed, 4);
         for &(s, e) in &ranges {
@@ -617,7 +617,7 @@ fn m6_eccentric_mutual_orbits() {
 #[test]
 fn spawn_compact_chain_is_bimodal() {
     let (mut zero, mut one, mut chain) = (0u32, 0u32, 0u32);
-    for seed in 0..1000u32 {
+    for seed in 0..1000u128 {
         let b = solar_mass_system(seed, 100);
         match count_compact_and_giants(&b).0 {
             0 => zero += 1,
@@ -634,7 +634,7 @@ fn spawn_compact_chain_is_bimodal() {
 #[test]
 fn spawn_compact_and_giant_coexist() {
     let mut both = 0u32;
-    for seed in 0..1000u32 {
+    for seed in 0..1000u128 {
         let b = solar_mass_system(seed, 100);
         let (c, g) = count_compact_and_giants(&b);
         if c >= 3 && g >= 1 {
@@ -651,7 +651,7 @@ fn spawn_outer_belt_mass_realistic() {
     let planets = [(1usize, 317.8, 5.2)];
     let mut spec_masses = Vec::new();
     let mut ratios = Vec::new();
-    for seed in 0..300u32 {
+    for seed in 0..300u128 {
         let mut rng = XorShift::new(seed.wrapping_mul(7919) + 1);
         let mut b = Bodies::with_capacity(2000);
         b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
@@ -724,7 +724,7 @@ fn debris_belt_occurrence_is_near_universal() {
 #[test]
 fn spawn_bd_binaries_exist() {
     let mut n = 0;
-    for seed in 0..500u32 {
+    for seed in 0..500u128 {
         let mut b = Bodies::with_capacity(30);
         let info = spawn_system_with_info(&mut b, 30, seed);
         if b.kind[0] == BodyKind::BrownDwarf && info.binary.is_some() {
@@ -758,7 +758,7 @@ fn sample_primary_bd_mass_skews_low() {
 
 #[test]
 fn spawn_never_exceeds_body_count() {
-    for seed in 0..200u32 {
+    for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
         assert!(b.len() <= 100, "seed {}: {} bodies", seed, b.len());
@@ -781,7 +781,7 @@ fn outer_belt_radii_follow_falling_surface_density() {
 #[test]
 fn spawn_lone_giants_are_eccentric() {
     let mut es = Vec::new();
-    for seed in 0..600u32 {
+    for seed in 0..600u128 {
         let b = solar_mass_system(seed, 100);
         let giants: Vec<usize> = (1..b.len())
             .filter(|&i| {
@@ -813,7 +813,7 @@ fn spawn_lone_giants_are_eccentric() {
 #[test]
 fn spawn_compact_chains_include_resonant_systems() {
     let (mut chains, mut resonant) = (0u32, 0u32);
-    for seed in 0..800u32 {
+    for seed in 0..800u128 {
         let b = solar_mass_system(seed, 100);
         let mut a: Vec<f64> = (1..b.len())
             .filter(|&i| {
@@ -854,7 +854,7 @@ fn spawn_unstable_giant_systems_exist() {
     // Tightly packed giants: adjacent pairs inside ~4.6 mutual Hill radii
     // (stable 1.5-2.2 period spacing gives > 10).
     let mut packed = 0u32;
-    for seed in 0..1000u32 {
+    for seed in 0..1000u128 {
         let b = solar_mass_system(seed, 100);
         let mut g: Vec<(f64, f64)> = (1..b.len())
             .filter(|&i| {
@@ -880,7 +880,7 @@ fn spawn_unstable_giant_systems_exist() {
 #[test]
 fn spawn_triples_and_quadruples_exist() {
     let (mut hosts, mut triples, mut quads) = (0u32, 0u32, 0u32);
-    for seed in 0..4000u32 {
+    for seed in 0..4000u128 {
         let mut b = Bodies::with_capacity(20);
         spawn_system(&mut b, 20, seed);
         assert!(b.len() <= 20, "seed {}: {} bodies", seed, b.len());
@@ -909,7 +909,7 @@ fn spawn_triples_and_quadruples_exist() {
 
 #[test]
 fn hierarchical_stars_respect_stability_limit() {
-    for seed in 0..3000u32 {
+    for seed in 0..3000u128 {
         let mut b = Bodies::with_capacity(20);
         let info = spawn_system_with_info(&mut b, 20, seed);
         let Some(bi) = info.binary else { continue };

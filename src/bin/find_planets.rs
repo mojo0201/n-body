@@ -20,7 +20,7 @@ use rayon::prelude::*;
 
 use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
 
-const SEED_MULT: u32 = 0x9E37_79B9;
+const SEED_MULT: u128 = 0x9E37_79B9;
 
 const USAGE: &str = "\
 find_planets: search random-system seeds for the highest planet count
@@ -57,7 +57,7 @@ struct Args {
     n: usize,
     systems: usize,
     seeds: u32,
-    start_seed: u32,
+    start_seed: u128,
     threads: usize,
     min_planets: Option<usize>,
     quiet: bool,
@@ -142,7 +142,7 @@ impl Args {
 
 #[derive(Clone, Debug)]
 struct Candidate {
-    seed: u32,
+    seed: u128,
     planets: usize,
     dwarfs: usize,
     total_bodies: usize,
@@ -167,14 +167,14 @@ fn count_spawned(b: &Bodies) -> (usize, usize) {
 
 /// Spawn one seed's systems and count. Returns the candidate.
 /// Uses the exact per-system seed derivation from `spawn_random_systems`.
-fn evaluate_seed(n: usize, systems: usize, seed: u32) -> Candidate {
+fn evaluate_seed(n: usize, systems: usize, seed: u128) -> Candidate {
     let mut planets = 0usize;
     let mut dwarfs = 0usize;
     let mut total_bodies = 0usize;
     let mut binaries = 0usize;
     let mut b = Bodies::with_capacity(0);
     for k in 0..systems {
-        let sys_seed = seed.wrapping_add((k as u32).wrapping_mul(SEED_MULT));
+        let sys_seed = seed.wrapping_add((k as u128).wrapping_mul(SEED_MULT));
         let info = physics::spawn_system_with_info(&mut b, n, sys_seed);
         let (p, d) = count_spawned(&b);
         planets += p;
@@ -232,7 +232,7 @@ fn main() -> ExitCode {
         if args_ref.min_planets.is_some() && found_min.load(Ordering::Relaxed) != 0 {
             return;
         }
-        let seed = args_ref.start_seed.wrapping_add(k);
+        let seed = args_ref.start_seed.wrapping_add(k as u128);
         let cand = evaluate_seed(args_ref.n, args_ref.systems, seed);
 
         // Hit the floor? Signal the others to stop.

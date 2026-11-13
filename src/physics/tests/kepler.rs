@@ -442,7 +442,7 @@ fn ah_osculating_ellipse_hyperbolic_none() {
 /// θ = 0.5 is more accurate than it is.
 #[test]
 fn ai_bh_error_below_documented_bound() {
-    for seed in 0..5u32 {
+    for seed in 0..5u128 {
         let mut b = Bodies::with_capacity(400);
         b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
         let mut rng = XorShift::new(seed);
@@ -857,7 +857,7 @@ fn l_bh_accel_single_body_dt_infinite() {
 /// or infinite for finite input, and `dt` must be non-negative (or `+∞`).
 #[test]
 fn l_bh_accel_never_nan_across_configs() {
-    for seed in 0..20u32 {
+    for seed in 0..20u128 {
         let mut b = Bodies::with_capacity(50);
         b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
         let mut rng = XorShift::new(seed);
@@ -1462,4 +1462,239 @@ fn ae_step_block_quiet_no_mutation() {
     assert_eq!(b.stats.merges, merges0);
     assert_eq!(b.stats.impacts, impacts0);
     assert!((b.m.iter().sum::<f64>() - m0).abs() < 1e-12 * m0);
+}
+
+// ===========================================================================
+// ah — osculating-ellipse geometry (every branch)
+// ===========================================================================
+//
+// `osculating_ellipse` has exactly four rejection branches and four
+// acceptance branches. Each is pinned here. The two original `ah_*` tests
+// cover (a) the circular accept path and (b) the hyperbolic reject path;
+// the tests below cover the other six.
+
+// --- Rejection branches ----------------------------------------------------
+
+/// `r < 1e-9`: body coincident with the reference. No well-defined orbit
+/// direction, must return `None`.
+#[test]
+fn ah_osculating_ellipse_degenerate_returns_none() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    // r = 1e-10 < 1e-9.
+    b.push(1e-10, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
+}
+
+/// `a > 100_000`: bound orbit, but too large to draw. Constructed with
+/// `r = 1e6 Gm`, perpendicular velocity giving `a = 2e6` and `e = 0.5`.
+#[test]
+fn ah_osculating_ellipse_huge_a_none() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let mu = G * (M_SUN_ME + 1.0);
+    let r = 1e6;
+    // 2/r = 2e-6. Choose v²/mu = 1.5e-6 ⇒ inv_a = 5e-7 ⇒ a = 2e6.
+    // Perpendicular velocity gives e = (v²-mu/r)·r/mu = 0.5, so the
+    // `e >= 0.9999` guard is NOT what rejects this.
+    let v = (1.5e-6 * mu).sqrt();
+    b.push(r, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
+}
+
+/// `e >= 0.9999`: near-parabolic but bound and finite-a. Constructed at
+/// perihelion of an `a = 1000, e = 0.99995` orbit.
+#[test]
+fn ah_osculating_ellipse_near_parabolic_none() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let mu = G * (M_SUN_ME + 1.0);
+    let (a, e) = (1000.0_f64, 0.99995_f64);
+    let r_peri = a * (1.0 - e); // = 0.05
+    let v_peri = (mu * (1.0 + e) / r_peri).sqrt();
+    b.push(r_peri, 0.0, 0.0, v_peri, 1.0, BodyKind::Planet);
+    // Sanity: this orbit is bound (inv_a > 0) and well under 1e5 in a.
+    let o = orbit_info(&b, 1, 0);
+    assert!(o.bound && o.semi_major < 100_000.0);
+    assert!(o.ecc >= 0.9999);
+    assert!(
+        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none(),
+        "e={} must be rejected",
+        o.ecc,
+    );
+}
+
+// --- Acceptance branches: point count --------------------------------------
+
+/// Adaptive count clamps to 32 for a tiny on-screen orbit.
+#[test]
+fn ah_osculating_ellipse_point_count_clamp_low() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 1e-4;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).unwrap();
+    assert_eq!(pts.len(), 32);
+}
+
+/// Adaptive count clamps to `ORBIT_TABLE_SIZE` (512) for a huge on-screen
+/// orbit.
+#[test]
+fn ah_osculating_ellipse_point_count_clamp_high() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 100.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1e6).unwrap();
+    assert_eq!(pts.len(), ORBIT_TABLE_SIZE);
+}
+
+/// Across a wide zoom range, `n_pts` must always be a power of two in
+/// `[32, ORBIT_TABLE_SIZE]`, and `n_pts * stride == ORBIT_TABLE_SIZE`.
+#[test]
+fn ah_osculating_ellipse_point_count_power_of_two_and_stride() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 5.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    for zoom_log in -6..=8 {
+        let zoom = 10f64.powi(zoom_log);
+        let n = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom)
+            .unwrap()
+            .len();
+        assert!(n.is_power_of_two(), "zoom=1e{zoom_log}: n={n} not pow2");
+        assert!(
+            (32..=ORBIT_TABLE_SIZE).contains(&n),
+            "zoom=1e{zoom_log}: n={n} out of range",
+        );
+        // Stride consistency: ORBIT_TABLE_SIZE must divide evenly by n.
+        assert_eq!(ORBIT_TABLE_SIZE % n, 0);
+        // Last used index is strictly inside the table.
+        let stride = ORBIT_TABLE_SIZE / n;
+        assert!((n - 1) * stride < ORBIT_TABLE_SIZE);
+    }
+}
+
+/// `n_pts_raw` at 100 rounds up to 128 via `next_power_of_two`.
+#[test]
+fn ah_osculating_ellipse_npts_rounds_up() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 5.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    // circum_px = 2000 ⇒ raw = 100 ⇒ next_pow2 = 128.
+    let zoom = 2000.0 / (a * std::f64::consts::TAU);
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
+    assert_eq!(pts.len(), 128);
+}
+
+/// Larger zoom ⇒ ≥ points (monotone, ignoring the clamp at the ends).
+#[test]
+fn ah_osculating_ellipse_zoom_monotone() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 5.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    let n = |z: f64| {
+        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, z)
+            .unwrap()
+            .len()
+    };
+    let mut prev = n(1.0);
+    for z in [10.0, 100.0, 1000.0] {
+        let cur = n(z);
+        assert!(cur >= prev, "zoom {z}: {prev} -> {cur}");
+        prev = cur;
+    }
+}
+
+/// `zoom.max(0.001)` clamps non-positive zoom to 0.001 — never a divide
+/// by zero and never a zero-length point list.
+#[test]
+fn ah_osculating_ellipse_zero_and_negative_zoom() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let a = 5.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+    b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    for zoom in [0.0, -1.0, -1e6] {
+        let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
+        assert_eq!(pts.len(), 32, "zoom={zoom} must clamp to min");
+    }
+}
+
+// --- Acceptance branches: geometry -----------------------------------------
+
+/// Eccentric orbit (`e = 0.3`): every returned point must lie on the
+/// ellipse defined by the closed-form `(a, e)` (checked via `orbit_info`
+/// as an independent reference), and the min/max radii must reach the
+/// periapsis/apapsis within sampling error.
+#[test]
+fn ah_osculating_ellipse_eccentric_geometry() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let mu = G * (M_SUN_ME + 1.0);
+    let (a, e) = (10.0, 0.3);
+    let (x, y, vx, vy) = kepler_state(mu, a, e, 1.1, 0.4);
+    b.push(x, y, vx, vy, 1.0, BodyKind::Planet);
+
+    let o = orbit_info(&b, 1, 0);
+    let peri = o.semi_major * (1.0 - o.ecc);
+    let apo = o.semi_major * (1.0 + o.ecc);
+
+    // High zoom covers the whole ellipse densely.
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
+    assert!(pts.len() >= 64);
+
+    // Every vertex is on the orbit: distance from focus ∈ [peri, apo].
+    for p in &pts {
+        let r = ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
+        assert!(r >= peri * 0.99, "r={r} < peri={peri}");
+        assert!(r <= apo * 1.01, "r={r} > apo={apo}");
+    }
+    // Min / max must approach peri / apo with dense sampling.
+    let min_r = pts
+        .iter()
+        .map(|p| ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt())
+        .fold(f64::INFINITY, f64::min);
+    let max_r = pts
+        .iter()
+        .map(|p| ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (min_r - peri).abs() < 0.02 * a,
+        "min_r={min_r} vs peri={peri}"
+    );
+    assert!((max_r - apo).abs() < 0.02 * a, "max_r={max_r} vs apo={apo}");
+}
+
+/// World-space translation: shifting both the reference and the body by
+/// `(sx, sy)` (with matching reference velocity) must produce the same
+/// ellipse shape, offset by exactly `(sx, sy)`.
+#[test]
+fn ah_osculating_ellipse_world_space_translation() {
+    let a = 5.0;
+    let v = (G * M_SUN_ME / a).sqrt();
+
+    let mut b1 = Bodies::with_capacity(2);
+    b1.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    b1.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
+    let pts1 = osculating_ellipse(&b1, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
+
+    let (sx, sy, svx, svy) = (1000.0, -500.0, 1.0, -2.0);
+    let mut b2 = Bodies::with_capacity(2);
+    b2.push(sx, sy, svx, svy, M_SUN_ME, BodyKind::Star);
+    b2.push(sx + a, sy, svx, svy + v, 1.0, BodyKind::Planet);
+    let pts2 = osculating_ellipse(&b2, 1, sx, sy, svx, svy, M_SUN_ME, 100.0).unwrap();
+
+    assert_eq!(pts1.len(), pts2.len());
+    for (p1, p2) in pts1.iter().zip(pts2.iter()) {
+        assert!(((p1[0] as f64 + sx) - p2[0] as f64).abs() < 1e-3, "x");
+        assert!(((p1[1] as f64 + sy) - p2[1] as f64).abs() < 1e-3, "y");
+    }
 }

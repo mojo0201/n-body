@@ -5,8 +5,7 @@
         "name": "Gaia BH3 giant",
         "mass_earth": 253039.0,
         "age_gyr": 12.0,
-        "metallicity": -2.56,
-        "kind": "giant"
+        "metallicity": -2.56
     },
     "companions": [
         {

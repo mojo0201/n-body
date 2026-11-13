@@ -54,6 +54,19 @@ const BELT_GRIND_CHUNK: f64 = 0.02;
 pub const BELT_GRIND_MIN_M: f64 = 1e-9;
 /// Planets lighter than this (Earth masses) do not perturb grains.
 const PERT_MIN_M: f64 = 0.01;
+/// Most comets that may exist at once. Extras are removed (named preset
+/// comets and the ones closest to their host are kept).
+pub const MAX_COMETS: usize = 32;
+/// Mean lifetime of a comet-tail tracer, in time units (1 tu is about 50
+/// days, so 12 tu is about 1.6 yr). Each grain draws 0.5-1.5 times this, so
+/// the tail thins out gradually instead of vanishing at once.
+pub const COMET_DUST_LIFE_TU: f64 = 12.0;
+/// Lifetime of belt-grinding and collision dust. Infinite: the belts keep
+/// feeding it, and it still leaves by hitting a body or crossing the cull radius.
+pub const NONCOMET_DUST_LIFE_TU: f64 = f64::INFINITY;
+/// Comets stop emitting tracers while a field already holds this many, which
+/// bounds the per-step cost no matter how many comets are active.
+pub const DUST_COMET_FIELD_CAP: usize = 100_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Grain {
@@ -64,6 +77,8 @@ pub struct Grain {
     /// Earth masses this tracer represents.
     pub mass: f64,
     pub size_um: f64,
+    /// Remaining lifetime in time units. `f32::INFINITY` never expires.
+    pub ttl: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +195,10 @@ fn accel(g: &Grain, beta: f64, st: &Star, pert: &[Pert], tau: f64, c: f64) -> (f
 /// Advance one grain by `dt` with adaptive sub-steps (kick-drift-kick).
 /// Returns false if the grain was removed.
 fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f64) -> bool {
+    g.ttl -= dt as f32; // INFINITY stays INFINITY
+    if g.ttl <= 0.0 {
+        return false;
+    }
     let beta = beta_of(st.l_over_m, g.size_um);
     let r = (g.x - st.x).hypot(g.y - st.y).max(1e-6);
     let mut t_dyn = (r.powi(3) / st.gm).sqrt();
@@ -276,6 +295,10 @@ impl DustField {
         if self.grains.len() + n > DUST_MAX_GRAINS || mass <= 0.0 {
             return;
         }
+        // `dir` is set only for comet tails. Cap them lower than the rest.
+        if dir.is_some() && self.grains.len() + n > DUST_COMET_FIELD_CAP {
+            return;
+        }
         let mut sizes = [0.0f64; DUST_EMIT_GRAINS];
         let mut weights = [0.0f64; DUST_EMIT_GRAINS];
         let mut wsum = 0.0f64;
@@ -338,6 +361,11 @@ impl DustField {
                 vy: p.3 + dvy,
                 mass: mass * weight / wsum,
                 size_um: size,
+                ttl: if dir.is_some() {
+                    (COMET_DUST_LIFE_TU * (0.5 + rng.next_f64())) as f32
+                } else {
+                    NONCOMET_DUST_LIFE_TU as f32
+                },
             });
         }
         self.version = self.version.wrapping_add(1);
@@ -458,6 +486,7 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
                     vy: b.vy[pri] + vy,
                     mass: total * size_weight(size) / wsum,
                     size_um: size,
+                    ttl: f32::INFINITY,
                 });
             }
         }
@@ -471,11 +500,47 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
     b.rng = rng;
 }
 
-/// Advance every field. Runs every `DUST_STEP_INTERVAL` physics steps.
-pub fn evolve(b: &mut Bodies, dt: f64) {
-    if b.dust_fields.is_empty() || !b.stats.steps.is_multiple_of(DUST_STEP_INTERVAL) {
+/// Diagnostics for `NBODY_TIMING`: nanoseconds spent in `evolve` since the
+/// last reset (the reader swaps it to 0), and the total grain count after the
+/// most recent step. Relaxed atomics, so the cost is negligible.
+pub static DUST_STAT_NS: AtomicU64 = AtomicU64::new(0);
+pub static DUST_STAT_GRAINS: AtomicU64 = AtomicU64::new(0);
+
+/// Keep at most `MAX_COMETS` comets. Surplus comets are marked dead and
+/// removed by `compact`. Named (preset) comets are kept first, then the ones
+/// closest to their host, which are the active, visible ones.
+fn enforce_comet_limit(b: &mut Bodies) {
+    let mut comets: Vec<(usize, bool, f64)> = (0..b.len())
+        .filter(|&i| !b.dead[i] && b.origin[i] == BodyOrigin::Comet)
+        .map(|i| (i, b.name[i].is_some(), host_distance(b, i)))
+        .collect();
+    if comets.len() <= MAX_COMETS {
         return;
     }
+    comets.sort_by(|a, c| c.1.cmp(&a.1).then(a.2.total_cmp(&c.2)));
+    let (x, y) = (b.x[comets[MAX_COMETS].0], b.y[comets[MAX_COMETS].0]);
+    let removed = comets.len() - MAX_COMETS;
+    for &(i, _, _) in &comets[MAX_COMETS..] {
+        b.dead[i] = true;
+    }
+    b.log(
+        EventKind::Comet,
+        format!("{removed} comet(s) removed: limit is {MAX_COMETS}"),
+        x,
+        y,
+    );
+}
+
+/// Advance every field. Runs every `DUST_STEP_INTERVAL` physics steps.
+pub fn evolve(b: &mut Bodies, dt: f64) {
+    if !b.stats.steps.is_multiple_of(DUST_STEP_INTERVAL) {
+        return;
+    }
+    enforce_comet_limit(b);
+    if b.dust_fields.is_empty() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
     let mut fields = std::mem::take(&mut b.dust_fields);
     let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
     let dt_field = dt * DUST_STEP_INTERVAL as f64;
@@ -485,6 +550,9 @@ pub fn evolve(b: &mut Bodies, dt: f64) {
     }
     b.rng = rng;
     b.dust_fields = fields;
+    DUST_STAT_NS.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let total: u64 = b.dust_fields.iter().map(|f| f.grains.len() as u64).sum();
+    DUST_STAT_GRAINS.store(total, AtomicOrdering::Relaxed);
 }
 
 /// Collisional evolution of the belt bodies about the field's primary.

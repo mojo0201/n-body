@@ -1,7 +1,23 @@
-//! Class names and short tags for planets, stars and brown dwarfs.
+//! Classification and human-readable naming for every body in the simulation.
+//!
+//! Two naming layers are provided:
+//!   * `class_name` — a coarse physical label ("rocky", "red giant", ...).
+//!   * `body_class` — same, but promotes a spawned planet that orbits another
+//!     spawned planet to "moon".
+//!
+//! Heavy callers (UI tables, tooltips) hit these functions every frame, so the
+//! static-string variants return `Cow<'static, str>` to avoid heap allocation.
+
+use std::borrow::Cow;
+use std::fmt::Write;
 
 use super::*;
 
+// ---------------------------------------------------------------------------
+// Mass -> class mappings (pure, allocation-free).
+// ---------------------------------------------------------------------------
+
+/// Bulk-composition class for a planet, from its mass in Earth masses.
 pub fn planet_class(m: f64) -> &'static str {
     if m < CLASS_ROCKY_MAX {
         "rocky"
@@ -16,6 +32,7 @@ pub fn planet_class(m: f64) -> &'static str {
     }
 }
 
+/// Main-sequence spectral class (M..B) from mass, expressed in solar masses.
 pub fn star_class(m: f64) -> char {
     let s = m / M_SUN_ME;
     if s < CLASS_STAR_M_MAX {
@@ -33,6 +50,10 @@ pub fn star_class(m: f64) -> char {
     }
 }
 
+/// Spectral class for a brown dwarf from its *mass* (in Jupiter masses).
+///
+/// Note this is the mass-based approximation; use `bd_class_for_temp` when a
+/// surface temperature is already available.
 pub fn bd_class(m: f64) -> char {
     let mj = m / JUPITER_MASS;
     if mj >= 55.0 {
@@ -46,6 +67,8 @@ pub fn bd_class(m: f64) -> char {
     }
 }
 
+/// Promotes a small body in the dwarf-planet mass window to `DwarfPlanet`,
+/// otherwise leaves it as `Planet`.
 pub fn classify_small_body(m: f64) -> BodyKind {
     if (BELT_DWARF_M_MIN..=DWARF_M_MAX).contains(&m) {
         BodyKind::DwarfPlanet
@@ -54,84 +77,138 @@ pub fn classify_small_body(m: f64) -> BodyKind {
     }
 }
 
-pub fn class_name(b: &Bodies, i: usize) -> String {
-    match b.kind[i] {
-        BodyKind::BlackHole => "black hole".to_string(),
-        BodyKind::NeutronStar => "neutron star".to_string(),
-        BodyKind::WhiteDwarf => "white dwarf".to_string(),
+// ---------------------------------------------------------------------------
+// Bodies -> human-readable class labels.
+// ---------------------------------------------------------------------------
+
+/// Coarse physical classification of a body, ignoring hierarchy.
+///
+/// Static labels are returned as borrowed `Cow`s so that the common callers
+/// (table rendering, `Display` impls) don't allocate. Only the star and
+/// brown-dwarf branches build a string with `format!`.
+pub fn class_name(b: &Bodies, i: usize) -> Cow<'static, str> {
+    // Hoist the discriminant; the `Spawned` arm needs it again.
+    let kind = b.kind[i];
+    match kind {
+        BodyKind::BlackHole => "black hole".into(),
+        BodyKind::NeutronStar => "neutron star".into(),
+        BodyKind::WhiteDwarf => "white dwarf".into(),
         BodyKind::BrownDwarf => format!(
             "{}-type brown dwarf",
             bd_class_for_temp(bd_state(b.m[i], b.age_gyr[i]).temperature)
-        ),
+        )
+        .into(),
         BodyKind::Star => match phase_of(b, i) {
-            Some(StellarPhase::RedGiant) => "red giant".to_string(),
-            Some(StellarPhase::RedSupergiant) => "red supergiant".to_string(),
-            _ => format!("{}-type star", star_class(b.m[i])),
+            Some(StellarPhase::RedGiant) => "red giant".into(),
+            Some(StellarPhase::RedSupergiant) => "red supergiant".into(),
+            _ => format!("{}-type star", star_class(b.m[i])).into(),
         },
         BodyKind::Planet | BodyKind::DwarfPlanet => match b.origin[i] {
-            BodyOrigin::AsteroidBelt => "asteroid".to_string(),
-            BodyOrigin::KuiperCold => "cold classical KBO".to_string(),
-            BodyOrigin::KuiperHot => "hot classical KBO".to_string(),
-            BodyOrigin::KuiperResonant => "resonant KBO".to_string(),
-            BodyOrigin::KuiperScattered => "scattered KBO".to_string(),
-            BodyOrigin::Trojan => "Trojan".to_string(),
-            BodyOrigin::Hilda => "Hilda".to_string(),
-            BodyOrigin::ImpactDebris => "fragment".to_string(),
-            BodyOrigin::TidalDebris => "tidal fragment".to_string(),
-            BodyOrigin::BackgroundDebris => "debris".to_string(),
-            BodyOrigin::Comet => "comet".to_string(),
-            BodyOrigin::Interstellar => "interstellar object".to_string(),
-            BodyOrigin::RoguePlanet => "rogue planet".to_string(),
+            BodyOrigin::AsteroidBelt => "asteroid".into(),
+            BodyOrigin::KuiperCold => "cold classical KBO".into(),
+            BodyOrigin::KuiperHot => "hot classical KBO".into(),
+            BodyOrigin::KuiperResonant => "resonant KBO".into(),
+            BodyOrigin::KuiperScattered => "scattered KBO".into(),
+            BodyOrigin::Trojan => "Trojan".into(),
+            BodyOrigin::Hilda => "Hilda".into(),
+            BodyOrigin::ImpactDebris => "fragment".into(),
+            BodyOrigin::TidalDebris => "tidal fragment".into(),
+            BodyOrigin::BackgroundDebris => "debris".into(),
+            BodyOrigin::Comet => "comet".into(),
+            BodyOrigin::Interstellar => "interstellar object".into(),
+            BodyOrigin::RoguePlanet => "rogue planet".into(),
             BodyOrigin::Spawned => {
-                if b.kind[i] == BodyKind::Planet {
-                    planet_class(b.m[i]).to_string()
+                if kind == BodyKind::Planet {
+                    planet_class(b.m[i]).into()
                 } else {
-                    "dwarf planet".to_string()
+                    "dwarf planet".into()
                 }
             }
         },
     }
 }
 
-pub fn body_class(b: &Bodies, i: usize) -> String {
+/// `class_name`, but upgrades a spawned planet orbiting another spawned
+/// planet to the label "moon".
+pub fn body_class(b: &Bodies, i: usize) -> Cow<'static, str> {
     body_class_with_parent(b, i, find_parent(b, i))
 }
 
-/// Same as `body_class`, but reuses an already-computed parent so callers
-/// that need it for other columns don't call `find_parent` twice.
-pub fn body_class_with_parent(b: &Bodies, i: usize, parent: Option<usize>) -> String {
-    if matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet)
+/// Same as `body_class`, but accepts a pre-computed parent index so callers
+/// that need the parent for other columns don't call `find_parent` twice.
+pub fn body_class_with_parent(b: &Bodies, i: usize, parent: Option<usize>) -> Cow<'static, str> {
+    let kind_i = b.kind[i];
+    if matches!(kind_i, BodyKind::Planet | BodyKind::DwarfPlanet)
         && b.origin[i] == BodyOrigin::Spawned
     {
         if let Some(p) = parent {
-            if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet)
+            // Read each field once; `matches!` + the origin check would
+            // otherwise re-bounds-check.
+            let kind_p = b.kind[p];
+            if matches!(kind_p, BodyKind::Planet | BodyKind::DwarfPlanet)
                 && b.origin[p] == BodyOrigin::Spawned
             {
-                return "moon".to_string();
+                return "moon".into();
             }
         }
     }
     class_name(b, i)
 }
 
-pub fn mass_str(m: f64) -> String {
+// ---------------------------------------------------------------------------
+// Mass / tag formatting.
+// ---------------------------------------------------------------------------
+
+/// Appends the mass-with-unit string into `out`.
+///
+/// Split from `mass_str` so `tag` can build its final string in one buffer
+/// instead of allocating a temporary per mass.
+fn write_mass(out: &mut String, m: f64) {
     if m >= 1e4 {
-        format!("{:.2} M☉", m / M_SUN_ME)
+        let _ = write!(out, "{:.2} M☉", m / M_SUN_ME);
     } else if m < 10.0 {
-        format!("{:.2} M⊕", m)
+        let _ = write!(out, "{:.2} M⊕", m);
     } else {
-        format!("{:.0} M⊕", m)
+        let _ = write!(out, "{:.0} M⊕", m);
     }
 }
 
+/// Standalone mass formatter. Equivalent to the old implementation, but
+/// writes into a pre-sized buffer and avoids an extra allocation.
+pub fn mass_str(m: f64) -> String {
+    // Worst case "1234.56 M☉" ≈ 12 bytes; 24 is comfortable.
+    let mut s = String::with_capacity(24);
+    write_mass(&mut s, m);
+    s
+}
+
+/// One-line display tag for a body: either "Name (mass)" or, for unnamed
+/// bodies, "#id class (mass)".
+///
+/// Builds the result in a single pre-sized `String`; the old version
+/// allocated once for `mass_str` and again for the join.
 pub fn tag(b: &Bodies, i: usize) -> String {
+    let mut s = String::with_capacity(48);
     match &b.name[i] {
-        Some(n) => format!("{} ({})", n, mass_str(b.m[i])),
-        None => format!("#{} {} ({})", b.id[i], class_name(b, i), mass_str(b.m[i])),
+        Some(n) => {
+            s.push_str(n);
+            s.push_str(" (");
+            write_mass(&mut s, b.m[i]);
+            s.push(')');
+        }
+        None => {
+            let _ = write!(s, "#{} {} (", b.id[i], class_name(b, i));
+            write_mass(&mut s, b.m[i]);
+            s.push(')');
+        }
     }
+    s
 }
 
-/// Spectral class of a brown dwarf from its surface temperature.
+/// Brown-dwarf spectral class from surface temperature (K).
+///
+/// Thresholds match the standard M/L/T/Y sequence; keep them in sync with
+/// `bd_class` (which uses mass thresholds from the same temperature mapping).
 pub fn bd_class_for_temp(t: f64) -> char {
     if t >= 2300.0 {
         'M'

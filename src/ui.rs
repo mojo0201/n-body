@@ -434,22 +434,22 @@ pub struct UiState {
 }
 
 /// Parse seed text as base62. Return `fallback` when the text is not valid.
-pub fn commit_seed_text(text: &str, fallback: u32) -> u32 {
+pub fn commit_seed_text(text: &str, fallback: u128) -> u128 {
     ph::seed_from_base62(text.trim()).unwrap_or(fallback)
 }
 
 impl UiState {
     /// Show `seed` in the seed input box.
-    pub fn set_pending_seed(&mut self, seed: u32) {
+    pub fn set_pending_seed(&mut self, seed: u128) {
         self.pending_seed_text = ph::seed_to_base62(seed);
     }
 
     /// Seed value of the input box, or `fallback` if the text is invalid.
-    pub fn pending_seed(&self, fallback: u32) -> u32 {
+    pub fn pending_seed(&self, fallback: u128) -> u128 {
         commit_seed_text(&self.pending_seed_text, fallback)
     }
 
-    pub fn new(body_count: usize, seed: u32) -> Self {
+    pub fn new(body_count: usize, seed: u128) -> Self {
         let old = Instant::now() - Duration::from_secs(10);
         Self {
             units_si: true,
@@ -493,7 +493,7 @@ pub struct ViewInfo {
     pub cam: [f64; 2],
     pub viewport_px: [f32; 2],
     pub ppp: f32,
-    pub seed: u32,
+    pub seed: u128,
     /// Bodies per system (the "bodies" slider target). For Solar this is
     /// always 9; for Random it's the user's `pending_count` at spawn time.
     pub body_count: usize,
@@ -549,7 +549,7 @@ pub struct Actions {
     pub spawn_rogue: bool,
     pub speed: Option<f64>,
     pub body_count: Option<usize>,
-    pub seed: Option<u32>,
+    pub seed: Option<u128>,
     pub orbits: Option<bool>,
     pub debris_orbits: Option<bool>,
     pub zoom_mul: Option<f32>,
@@ -1965,9 +1965,9 @@ fn refresh_rows(st: &mut UiState, b: &Bodies) {
                 id: b.id[i],
                 label,
                 class: if n <= 3000 {
-                    ph::body_class_with_parent(b, i, parents[i])
+                    ph::body_class_with_parent(b, i, parents[i]).into_owned()
                 } else {
-                    ph::class_name(b, i)
+                    ph::class_name(b, i).into_owned()
                 },
                 m: b.m[i],
                 r: b.r[i],

@@ -57,14 +57,26 @@ pub(in crate::physics) fn ring_theta(n: usize, k: usize, u: f64) -> f64 {
 /// State (x, y, vx, vy) of a system of `mass` on an orbit of semi-major
 /// axis `a` about the ring centre. The central term is `mass * s`, the
 /// value that makes e = 0 reproduce the circular ring speed.
-pub(in crate::physics) fn ring_slot(mass: f64, s: f64, a: f64, e: f64, nu: f64, omega: f64) -> (f64, f64, f64, f64) {
+pub(in crate::physics) fn ring_slot(
+    mass: f64,
+    s: f64,
+    a: f64,
+    e: f64,
+    nu: f64,
+    omega: f64,
+) -> (f64, f64, f64, f64) {
     kepler_state(G * mass * s, a, e, nu, omega)
 }
 
 /// Position and velocity of every system on the ring. The semi-major axis
 /// scatters by +-15 %, the eccentricity is Rayleigh(0.05), and the system
 /// sits at its jittered polar angle. One system gets zero state.
-pub(in crate::physics) fn ring_slots(n: usize, seed: u32, ring: f64, masses: &[f64]) -> Vec<(f64, f64, f64, f64)> {
+pub(in crate::physics) fn ring_slots(
+    n: usize,
+    seed: u128,
+    ring: f64,
+    masses: &[f64],
+) -> Vec<(f64, f64, f64, f64)> {
     if n <= 1 {
         return vec![(0.0, 0.0, 0.0, 0.0); n];
     }
@@ -112,7 +124,11 @@ pub(in crate::physics) fn system_reach_gm(b: &Bodies) -> f64 {
 /// M(<R) = M R^2 / (R^2 + a^2), isotropic velocities with
 /// sigma_1D^2 = G M / (6 sqrt(r^2 + a^2)) (virial equilibrium).
 /// The scale radius `a` grows until the separation constraint holds.
-pub(in crate::physics) fn cluster_slots(seed: u32, reaches: &[f64], masses: &[f64]) -> Vec<(f64, f64, f64, f64)> {
+pub(in crate::physics) fn cluster_slots(
+    seed: u128,
+    reaches: &[f64],
+    masses: &[f64],
+) -> Vec<(f64, f64, f64, f64)> {
     let n = reaches.len();
     if n <= 1 {
         return vec![(0.0, 0.0, 0.0, 0.0); n];
@@ -171,7 +187,7 @@ pub(in crate::physics) fn cluster_slots(seed: u32, reaches: &[f64], masses: &[f6
 pub fn spawn_random_systems(
     b: &mut Bodies,
     body_count: usize,
-    seed: u32,
+    seed: u128,
     n_systems: usize,
 ) -> Vec<SystemInfo> {
     spawn_random_systems_impl(b, body_count, seed, n_systems).0
@@ -181,7 +197,7 @@ pub fn spawn_random_systems(
 pub(in crate::physics) fn spawn_random_systems_impl(
     b: &mut Bodies,
     body_count: usize,
-    seed: u32,
+    seed: u128,
     n_systems: usize,
 ) -> (Vec<SystemInfo>, Vec<(usize, usize)>) {
     let n = n_systems.clamp(1, MAX_SOLAR_SYSTEMS);
@@ -196,7 +212,7 @@ pub(in crate::physics) fn spawn_random_systems_impl(
 
     // Per-system seed. Multiply by an odd constant so consecutive k give
     // well-separated draws even from the same master seed.
-    let sys_seed = |k: usize| seed.wrapping_add((k as u32).wrapping_mul(0x9E37_79B9));
+    let sys_seed = |k: usize| seed.wrapping_add((k as u128).wrapping_mul(0x9E37_79B9));
 
     // Spawn into scratch `Bodies`: `spawn_system_with_info` recentres the
     // COM to the origin, and we translate it to its slot later.

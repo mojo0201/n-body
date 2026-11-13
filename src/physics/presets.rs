@@ -1,7 +1,22 @@
-//! Data-driven system presets, belt specs and the Solar System spawn.
+//! Data-driven system presets, belt specs, and Solar System spawning.
+//!
+//! Three layers live in this file:
+//!
+//! 1. **Presets** (`SystemPreset` and friends): serde-deserialized JSON
+//!    describing a single system — star, companions, planets, moons, belts.
+//! 2. **Belt specs** (`BeltSpec`, `InnerBelt`, `OuterBelt`, `OuterPopulation`):
+//!    the *runtime* description of a small-body population. Presets map into
+//!    specs, and so does the procedural `belt_spec_for` path used by the
+//!    non-preset spawn code.
+//! 3. **Spawners**: functions that turn a preset into `Bodies` — either a
+//!    single system, or a cluster of Solar System copies arranged on a ring.
 
 use super::*;
 
+/// Coarse classification of a system's small-body architecture. Picked by
+/// `belt_spec_for` from the star, its age/metallicity, and the planets'
+/// arrangement; lets other code (UI labels, statistics) reason about "what
+/// kind of system is this" without re-deriving it from the individual belts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BeltArchetype {
     SolarType,
@@ -16,13 +31,27 @@ pub enum BeltArchetype {
     Evolved,
 }
 
+/// Runtime description of every small-body population in a system.
+///
+/// Two mass budgets are carried separately because they are drawn from
+/// different physical populations and are spawned by different code paths:
+///
+/// * `total_mass` is the *inner* budget — main-belt asteroids, Hildas,
+///   Trojans. Lumped together because the spawner treats them as "rocky,
+///   short-period small bodies".
+/// * `outer_mass` is the *outer* (Kuiper-like) budget, split across the
+///   `OuterPopulation`s in `outer`.
+///
+/// Keeping them separate avoids a whole class of "belt mass went to the
+/// wrong reservoir" bugs that appear when a single mass is divided between
+/// inner and outer populations.
 #[derive(Clone, Debug)]
 pub struct BeltSpec {
     pub archetype: BeltArchetype,
-    /// Total belt mass in Earth masses.
+    /// Inner/trojan/Hilda mass budget, in Earth masses.
     pub total_mass: f64,
-    /// Mass budget of the outer (Kuiper-like) populations in Earth masses.
-    /// `total_mass` is the inner / asteroid / Trojan / Hilda budget.
+    /// Outer/Kuiper mass budget, in Earth masses. Distinct from `total_mass`;
+    /// see the type-level comment.
     pub outer_mass: f64,
     pub inner: Option<InnerBelt>,
     pub outer: Option<OuterBelt>,
@@ -30,12 +59,18 @@ pub struct BeltSpec {
     pub gaps: Vec<Gap>,
 }
 
+/// A single asteroid-belt-like annulus: a radial span, a share of the
+/// system's inner-belt mass, and a broken-power-law size distribution.
 #[derive(Clone, Debug)]
 pub struct InnerBelt {
     pub a_lo_au: f64,
     pub a_hi_au: f64,
+    /// Fraction of the parent belt's `total_mass` that this belt receives.
     pub mass_frac: f64,
+    /// Rayleigh scale of orbital eccentricities. 0.10 is the classic
+    /// main-belt value; higher values produce a more dynamically hot belt.
     pub e_sigma: f64,
+    /// Log-log slope of the cumulative mass function.
     pub plaw: f64,
     pub m_min: f64,
     pub m_max: f64,
@@ -46,28 +81,41 @@ pub struct OuterBelt {
     pub populations: Vec<OuterPopulation>,
 }
 
+/// One dynamical class of outer-belt body (cold classical, hot classical,
+/// resonant, scattered). Populations overlap radially; they are separated
+/// by their eccentricity distribution and, for scattered bodies, by a
+/// pericentre prescription.
 #[derive(Clone, Debug)]
 pub struct OuterPopulation {
     pub kind: BodyOrigin,
     pub a_lo_au: f64,
     pub a_hi_au: f64,
+    /// Fraction of the parent outer-belt mass assigned to this population.
+    /// The `mass_frac` values across an `OuterBelt` sum to ~0.9 by design —
+    /// the remainder is the "grains/dust" tail (see `spawn_belts`).
     pub mass_frac: f64,
     pub e_sigma: f64,
-    /// Pericentre in AU. When set, eccentricity is chosen to put the
-    /// pericentre near this distance (scattered objects).
+    /// When `Some(a_giant)`, eccentricities are drawn so the pericentre
+    /// lands near `a_giant`. Used to model scattered objects, whose orbits
+    /// were raised by close encounters with that giant.
     pub q_frac: Option<f64>,
     pub plaw: f64,
     pub m_min: f64,
     pub m_max: f64,
 }
 
+/// A Trojan cloud at a giant planet's L4/L5 point.
 #[derive(Clone, Debug)]
 pub struct Trojan {
+    /// Semi-major axis of the parent giant, in AU.
     pub giant_a_au: f64,
+    /// Fraction of Trojans placed at the leading (L4) point. The rest go to
+    /// L5. Real clouds are slightly asymmetric; 0.5 is the neutral choice.
     pub leading_frac: f64,
     pub mass_frac: f64,
 }
 
+/// A Kirkwood-style gap in the belt, e.g. the 3:1 resonance with Jupiter.
 #[derive(Clone, Debug)]
 pub struct Gap {
     pub a_au: f64,
@@ -86,6 +134,10 @@ impl BeltSpec {
             gaps: Vec::new(),
         }
     }
+
+    /// True when no belt would actually spawn anything. The thresholds sit
+    /// above the minimum particle mass so that rounding noise can't cause
+    /// a "belt exists but contains zero bodies" ghost state.
     pub fn is_empty(&self) -> bool {
         self.total_mass < 1e-6
             && self.outer_mass < 1e-6
@@ -94,8 +146,18 @@ impl BeltSpec {
     }
 }
 
-/// Choose the belt architecture of a system from its star, age,
-/// metallicity and planets. `planets` holds `(index, mass_earth, a_au)`.
+/// Pick the belt architecture of a procedurally generated system.
+///
+/// The decision tree below is deliberately shallow: the branches correspond
+/// to observational categories (hot-Jupiter systems, compact chains, young
+/// debris disks, Solar analogues, quiet old systems), not to any detailed
+/// dynamical simulation. Each branch also scales the drawn belt masses by a
+/// category-specific factor, so a hot-Jupiter system is not merely "a Solar
+/// System with the giant moved inward" but a genuinely belt-poor system.
+///
+/// `planets` is `(index, mass_earth, a_au)`. Only the mass and orbital
+/// radius are used here; the index is carried for symmetry with other
+/// planetary summarisers and costs nothing.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn belt_spec_for(
     _b: &Bodies,
@@ -110,18 +172,50 @@ pub(super) fn belt_spec_for(
 ) -> BeltSpec {
     let m_sun = m_star / M_SUN_ME;
 
+    // First gate: does this star even have a detectable debris belt?
+    // Drawn before any geometry to keep the RNG stream independent of the
+    // planet-arrangement statistics below.
     let p_belt = debris_belt_occurrence_fraction(m_sun, age_gyr);
     if rng.next_f64() > p_belt {
         return BeltSpec::empty();
     }
 
-    let giants: Vec<&(usize, f64, f64)> = planets.iter().filter(|&&(_, m, _)| m > 50.0).collect();
-    let has_hj = giants.iter().any(|&&(_, _, a)| a < 0.1);
-    let n_compact = planets
-        .iter()
-        .filter(|&&(_, m, a)| m <= 30.0 && a < 1.0)
-        .count();
+    // One pass over `planets` to collect every summary the branches below
+    // need. Doing this once keeps the decision tree linear in the number of
+    // planets; earlier revisions re-scanned for each branch.
+    let mut giants: Vec<(f64, f64)> = Vec::new(); // (mass_earth, a_au)
+    let mut has_hj = false;
+    let mut a_giant_inner = f64::INFINITY;
+    let mut a_giant_outer = 0.0f64;
+    let mut n_compact = 0usize;
+    let mut a_compact = 0.0f64;
+    for p in planets {
+        let (_, m, a) = *p;
+        if m > 50.0 {
+            giants.push((m, a));
+            if a < 0.1 {
+                has_hj = true;
+            }
+            if a < a_giant_inner {
+                a_giant_inner = a;
+            }
+            if a > a_giant_outer {
+                a_giant_outer = a;
+            }
+        }
+        if m <= 30.0 {
+            if a > a_compact {
+                a_compact = a;
+            }
+            if a < 1.0 {
+                n_compact += 1;
+            }
+        }
+    }
 
+    // Every archetype starts from a baseline "Solar-like" belt mass. The
+    // branches below scale that up or down to reflect how much the
+    // architecture depletes small bodies.
     let mut spec = BeltSpec {
         archetype: BeltArchetype::NoBelt,
         total_mass: belt_mass_earth(m_sun, feh, age_gyr, rng),
@@ -132,6 +226,8 @@ pub(super) fn belt_spec_for(
         gaps: Vec::new(),
     };
 
+    // Helper for the branches that model their belt as a single cold
+    // classical population. Keeps those branches short.
     let single_outer = |a_lo: f64, a_hi: f64, e_sigma: f64, m_min: f64, m_max: f64| {
         Some(OuterBelt {
             populations: vec![OuterPopulation {
@@ -149,12 +245,12 @@ pub(super) fn belt_spec_for(
     };
 
     if has_hj {
+        // Hot Jupiters: giant migrated inward, scattering/clearing whatever
+        // belt material was inside its present orbit. Both budgets shrink
+        // by 10x, and the surviving outer belt is a narrow annulus just
+        // beyond the giant.
         spec.archetype = BeltArchetype::HotJupiter;
-        let a_giant = giants
-            .iter()
-            .map(|&&(_, _, a)| a)
-            .fold(f64::INFINITY, f64::min);
-        let start = (a_giant * 3.0).max(10.0).max(a_lo_au);
+        let start = (a_giant_inner * 3.0).max(10.0).max(a_lo_au);
         let end = (start * 5.0).min(a_hi_au);
         if end > start {
             spec.outer = single_outer(start, end, 0.05, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
@@ -162,6 +258,9 @@ pub(super) fn belt_spec_for(
         spec.total_mass *= 0.1;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
     } else if n_compact >= 4 {
+        // Compact chains: four or more small planets inside 1 AU, i.e. the
+        // TRAPPIST-1 / Kepler-90 regime. Same belt depletion factor as hot
+        // Jupiters; the belt sits just outside the snow line.
         spec.archetype = BeltArchetype::CompactChain;
         let start = (snow_line_au * 5.0).max(a_lo_au);
         let end = (start * 3.0).min(a_hi_au);
@@ -171,6 +270,11 @@ pub(super) fn belt_spec_for(
         spec.total_mass *= 0.1;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
     } else if giants.is_empty() && m_sun > 1.2 && age_gyr < 0.5 {
+        // Young, massive, giant-free systems host the bright debris disks
+        // ALMA/Herschel see (Beta Pic analogues, HL Tau at a smaller
+        // scale). Two orders of magnitude above baseline, with an
+        // unusually low eccentricity — the observed dust is dynamically
+        // cold.
         spec.archetype = BeltArchetype::YoungDebrisDisk;
         let (start, end) = (a_lo_au.max(80.0), a_hi_au.min(120.0));
         if end > start {
@@ -179,20 +283,16 @@ pub(super) fn belt_spec_for(
         spec.total_mass *= 100.0;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 100.0;
     } else if !giants.is_empty() {
+        // Solar analogue: giants present, no hot Jupiter. The canonical
+        // four-population Kuiper belt plus a main asteroid belt, Trojans
+        // at every giant beyond 0.3 AU, and Kirkwood gaps at the giants'
+        // mean-motion resonances.
         spec.archetype = BeltArchetype::SolarType;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng);
 
-        let a_giant_inner = giants
-            .iter()
-            .map(|&&(_, _, a)| a)
-            .fold(f64::INFINITY, f64::min);
-        let a_giant_outer = giants.iter().map(|&&(_, _, a)| a).fold(0.0, f64::max);
-        let a_compact = planets
-            .iter()
-            .filter(|&&(_, m, _)| m <= 30.0)
-            .map(|&(_, _, a)| a)
-            .fold(0.0, f64::max);
-
+        // Main belt sits between the outermost compact planet and the
+        // innermost giant, but never inside the snow line or outside the
+        // caller's requested radial window.
         let ast_lo = (a_compact * 1.2).max(snow_line_au * 0.7).max(a_lo_au);
         let ast_hi = (a_giant_inner * 0.6).min(a_hi_au);
         if ast_hi > ast_lo {
@@ -207,6 +307,10 @@ pub(super) fn belt_spec_for(
             });
         }
 
+        // Kuiper belt starts just outside the outermost giant but at
+        // least 10 snow lines out. The four populations are the standard
+        // dynamical split; their mass_frac sum to 0.9, the missing 0.1
+        // is the dust tail that `spawn_belts` adds to every outer belt.
         let kui_lo = (a_giant_outer * 1.5).max(snow_line_au * 10.0).max(a_lo_au);
         let kui_hi = (snow_line_au * 40.0).min(a_hi_au);
         if kui_hi > kui_lo {
@@ -224,6 +328,8 @@ pub(super) fn belt_spec_for(
             };
             spec.outer = Some(OuterBelt {
                 populations: vec![
+                    // Cold classicals: tight eccentricities, inner 40% of
+                    // the belt.
                     pop(
                         BodyOrigin::KuiperCold,
                         kui_lo,
@@ -232,8 +338,11 @@ pub(super) fn belt_spec_for(
                         0.03,
                         None,
                     ),
+                    // Hot classicals: wider eccentricities, full span.
                     pop(BodyOrigin::KuiperHot, kui_lo, kui_hi, 0.30, 0.15, None),
+                    // Resonant objects (Plutinos etc.).
                     pop(BodyOrigin::KuiperResonant, kui_lo, kui_hi, 0.10, 0.10, None),
+                    // Scattered: pericentre tied to the outer giant.
                     pop(
                         BodyOrigin::KuiperScattered,
                         kui_lo,
@@ -246,7 +355,10 @@ pub(super) fn belt_spec_for(
             });
         }
 
-        for &&(_, gm, ga) in &giants {
+        // Trojans and gaps scale with the giants: a giant too close to the
+        // star has no stable L4/L5, and too small a giant can't hold a
+        // Trojan cloud.
+        for &(gm, ga) in &giants {
             if gm > 50.0 && ga > 0.3 {
                 spec.trojans.push(Trojan {
                     giant_a_au: ga,
@@ -272,6 +384,12 @@ pub(super) fn belt_spec_for(
     spec
 }
 
+/// Belt around an evolved remnant (white dwarf, neutron star, black hole).
+///
+/// A low-mass remnant plus a 30 % die roll yields a small scattered belt
+/// inside 40 AU — the observed signature of a tidally disrupted planet or
+/// asteroid that fell onto the remnant. Everything else gets no belt, which
+/// is consistent with the majority of observed evolved systems.
 pub(super) fn belt_spec_for_evolved(
     m_remnant_sun: f64,
     _age_gyr: f64,
@@ -305,11 +423,17 @@ pub(super) fn belt_spec_for_evolved(
     }
 }
 
-/// A planetary system read from JSON (see `assets/presets/solar_system.json`).
+/// Multiplies the initial dust density. Default 1 (see `SystemPreset`).
 pub(super) fn default_dust_boost() -> f64 {
     1.0
 }
 
+/// A planetary system read from JSON (see `assets/presets/solar_system.json`).
+///
+/// Presets are *declarative*: they name masses, orbits and flags, not
+/// positions or velocities. `spawn_from_preset_seeded` resolves them into
+/// concrete state via Kepler solves. The only non-declarative field is
+/// `dust_boost`, a display knob that scales the spawned dust cloud.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct SystemPreset {
     pub name: String,
@@ -321,14 +445,21 @@ pub struct SystemPreset {
     pub companions: Vec<CompanionPreset>,
     pub planets: Vec<PlanetPreset>,
     /// Small-body belts (asteroids, Kuiper populations, Trojans, gaps).
+    /// Absent means "no belts at all", which `spawn_belts` skips.
     #[serde(default)]
     pub belts: Option<BeltPreset>,
 }
 
+/// Companion phase is uniform in *time*, so the mean anomaly is uniformly
+/// distributed in [0, 1). 0.5 is the apocentre, which tends to look
+/// "interesting" in the initial frame — companions visibly separated from
+/// their primary rather than superimposed on it.
 pub(super) fn default_phase() -> f64 {
     0.5
 }
 
+/// A secondary star (or compact object) in a preset. Its `a_au` is the
+/// companion's semi-major axis about the primary, in the primary's frame.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct CompanionPreset {
     pub name: String,
@@ -344,6 +475,9 @@ pub struct CompanionPreset {
     pub phase: f64,
 }
 
+/// Belt definition inside a preset. The `mass_frac` fields inside `inner`
+/// and each outer population are *relative* to `total_mass_earth`; the
+/// spawner normalises them.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct BeltPreset {
     pub total_mass_earth: f64,
@@ -360,6 +494,10 @@ pub struct BeltPreset {
     pub gaps: Vec<GapPreset>,
 }
 
+/// Preset-side asteroid-belt description. Only the radial span and mass
+/// share are user-controlled; the eccentricity scale, slope and size bounds
+/// are filled in by `BeltPreset::to_spec` with main-belt-typical values so
+/// that hand-edited JSON stays short.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct InnerBeltPreset {
     pub a_lo_au: f64,
@@ -372,6 +510,10 @@ pub struct OuterBeltPreset {
     pub populations: Vec<PopulationPreset>,
 }
 
+/// Preset-side description of one outer-belt population. `kind` is matched
+/// against a fixed string table in `BeltPreset::to_spec`; unknown kinds
+/// silently fall back to `cold_classical` so a typo doesn't abort the whole
+/// preset library load.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PopulationPreset {
     pub kind: String,
@@ -380,15 +522,26 @@ pub struct PopulationPreset {
     pub mass_frac: f64,
     #[serde(default = "default_e_sigma")]
     pub e_sigma: f64,
-    /// Pericentre in AU for scattered objects.
+    /// Pericentre in AU for scattered objects. When set, eccentricity is
+    /// drawn so pericentre lands near this distance.
     #[serde(default)]
     pub q_frac: Option<f64>,
 }
 
+/// Default eccentricity scale for populations that don't specify one.
+/// Matches the main-belt value used by `InnerBelt`'s Solar-analogue branch.
 pub(super) fn default_e_sigma() -> f64 {
     0.10
 }
 
+/// Resolve a preset's `kind` string (or its absence) to a `BodyKind`.
+///
+/// The mass fallback is the important bit: a preset that says nothing about
+/// kind still needs to be correctly classified. Anything at or above the
+/// hydrogen-burning limit (`STAR_M_MIN`) is a star; below it, a brown dwarf.
+/// Explicit compact-object kinds take precedence over the mass guess, so a
+/// 1.2 M_sun white dwarf stays a white dwarf rather than being "corrected"
+/// into a star.
 pub(super) fn parse_body_kind(s: Option<&str>, mass: f64) -> BodyKind {
     match s {
         Some("white_dwarf") => BodyKind::WhiteDwarf,
@@ -406,6 +559,15 @@ pub(super) fn parse_body_kind(s: Option<&str>, mass: f64) -> BodyKind {
     }
 }
 
+/// Insert a companion into `b` such that the existing bodies and the new
+/// companion orbit their common centre of mass, with the COM at rest.
+///
+/// The existing bodies are rescaled by their COM-frame position: the
+/// primary shifts by `-f_in * r` and the companion lands at `+f_out * r`,
+/// where `f_in = m_companion / (M + m_companion)` and `f_out = M / (M +
+/// m_companion)`. This reproduces the two-body solution exactly and keeps
+/// any pre-existing planets glued to the primary's new position, since
+/// their offsets relative to the primary are unchanged.
 pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: f64) {
     let n = b.len();
     let (mut mt, mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
@@ -446,6 +608,15 @@ pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: 
     b.set_mass(idx, c.mass_earth);
 }
 
+/// Push a planet that orbits the *barycentre* of the stellar hosts rather
+/// than any single star. Used for P-type (circumbinary) planets, whose
+/// `a_au` is well outside the binary separation so the binary can be
+/// treated as a point mass.
+///
+/// Unlike `place_companion`, the existing bodies are not shifted: this is
+/// called when adding a *planet*, and the hosts' mutual orbit is already
+/// established. The two-body state is computed about the host COM in its
+/// current (possibly moving) frame.
 pub(super) fn push_circumbinary(
     b: &mut Bodies,
     a_au: f64,
@@ -493,6 +664,15 @@ pub struct GapPreset {
 }
 
 impl BeltPreset {
+    /// Resolve a preset-side belt into the runtime `BeltSpec`.
+    ///
+    /// Preset JSON is deliberately sparse: it exposes radial spans and mass
+    /// shares, and this method fills in the physical parameters (eccentricity
+    /// scales, slopes, size bounds) with the same defaults the procedural
+    /// Solar-analogue branch uses. This keeps hand-written presets short
+    /// without losing fidelity for the common case; a preset that needs
+    /// unusual physics can still reach the runtime `BeltSpec` directly via
+    /// `belt_spec_for`.
     pub fn to_spec(&self) -> BeltSpec {
         let inner = self.inner.as_ref().map(|i| InnerBelt {
             a_lo_au: i.a_lo_au,
@@ -508,6 +688,9 @@ impl BeltPreset {
                 .populations
                 .iter()
                 .map(|p| {
+                    // Unknown kinds fall back to cold classicals rather
+                    // than erroring: a typo in one population shouldn't
+                    // kill the entire preset library load.
                     let kind = match p.kind.as_str() {
                         "cold_classical" => BodyOrigin::KuiperCold,
                         "hot_classical" => BodyOrigin::KuiperHot,
@@ -556,6 +739,8 @@ impl BeltPreset {
     }
 }
 
+/// The primary of a preset system. `kind` is optional so simple presets
+/// (a plain Sun-like star) can just specify mass, age and metallicity.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct StarPreset {
     #[serde(default)]
@@ -571,6 +756,8 @@ pub struct StarPreset {
     pub kind: Option<String>,
 }
 
+/// A planet in a preset. Orbits are expressed relative to the primary (or,
+/// for P-type planets, the binary barycentre).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PlanetPreset {
     pub name: String,
@@ -588,7 +775,8 @@ pub struct PlanetPreset {
     pub origin: Option<String>,
     /// Mean anomaly at spawn in [0, 1). When absent (the common case),
     /// a random phase is drawn as before. Set to `0.0` to start at
-    /// perihelion, `0.5` at aphelion.
+    /// perihelion, `0.5` at aphelion. Setting `Some(..)` consumes no RNG,
+    /// so a pinned comet does not shift the phase stream for later bodies.
     #[serde(default)]
     pub phase: Option<f64>,
     /// Moons of this planet. Each moon's `a_au` is measured from the
@@ -597,6 +785,9 @@ pub struct PlanetPreset {
     pub moons: Vec<MoonPreset>,
 }
 
+/// A moon of a preset planet. The eccentricity defaults to 0 because most
+/// Solar System moons are near-circular and a nonzero default would
+/// surprise anyone editing the JSON by hand.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct MoonPreset {
     pub name: String,
@@ -611,14 +802,31 @@ pub struct MoonPreset {
     pub is_dwarf: bool,
 }
 
-/// The Solar System, embedded from `assets/presets/solar_system.json` at build time.
+/// The Solar System, embedded from `assets/presets/solar_system.json` at
+/// build time.
+///
+/// The parse result is cached on first use because every call site — the
+/// single-system spawner, the cluster spawner, the UI reload path — hits
+/// this function, and `serde_json::from_str` is a few milliseconds per
+/// invocation on the embedded blob. The returned value is an owned clone,
+/// matching the original owned-return contract so call sites are unchanged.
 pub fn solar_system_preset() -> SystemPreset {
-    serde_json::from_str(include_str!("../../assets/presets/solar_system.json"))
-        .expect("embedded solar_system.json is malformed")
+    static CACHE: OnceLock<SystemPreset> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            serde_json::from_str(include_str!("../../assets/presets/solar_system.json"))
+                .expect("embedded solar_system.json is malformed")
+        })
+        .clone()
 }
 
 /// The preset library: (slug, parsed preset) pairs, in display order.
-/// Cached after the first call.
+///
+/// Cached after the first call. Each entry is a distinct physical system:
+/// exoplanet archetypes, compact objects, binary stars, debris disks, and
+/// the Solar System itself. Parsing all ~40 embedded JSONs costs milliseconds,
+/// so paying it once at startup is strictly preferable to paying it per
+/// UI keystroke.
 pub fn load_presets() -> &'static [(String, SystemPreset)] {
     static LIB: OnceLock<Vec<(String, SystemPreset)>> = OnceLock::new();
     LIB.get_or_init(|| {
@@ -756,6 +964,9 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
             ),
         ];
 
+        // Every preset is guaranteed to parse: the JSON is embedded at
+        // build time, so a parse error here is a build regression, not a
+        // runtime condition. The panic message names the offending slug.
         sources
             .iter()
             .map(|(name, json)| {
@@ -767,8 +978,10 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
     })
 }
 
-/// Look up a preset by slug. Returns an owned clone, so the caller can spawn
-/// it while it holds a mutable borrow of `Bodies`.
+/// Look up a preset by slug. Returns an owned clone, so the caller can
+/// mutate `Bodies` while the returned preset is still alive (the preset
+/// library itself is behind an immutable `&'static` and would otherwise
+/// create borrow conflicts at spawn sites).
 pub fn load_preset_by_slug(slug: &str) -> Option<SystemPreset> {
     load_presets()
         .iter()
@@ -780,7 +993,9 @@ pub fn load_preset_by_slug(slug: &str) -> Option<SystemPreset> {
 pub(super) const PRESET_BELT_BUDGET: usize = 200;
 
 /// Seed of the planet phases of the single-system Solar System preset.
-pub(super) const SOLAR_PHASE_SEED: u32 = 0xC0DE;
+/// Kept distinct from the runtime RNG seed so a "Reload" with the default
+/// seed reproduces the canonical Solar System layout.
+pub(super) const SOLAR_PHASE_SEED: u128 = 0xC0DE;
 
 /// Spawn a preset system with its star at the origin (centre of mass at rest).
 pub fn spawn_from_preset(b: &mut Bodies, preset: &SystemPreset) {
@@ -788,24 +1003,47 @@ pub fn spawn_from_preset(b: &mut Bodies, preset: &SystemPreset) {
 }
 
 /// Spawn a preset with its own phase seed (fresh phases each time).
-pub fn spawn_preset_with_seed(b: &mut Bodies, preset: &SystemPreset, phase_seed: u32) {
+pub fn spawn_preset_with_seed(b: &mut Bodies, preset: &SystemPreset, phase_seed: u128) {
     spawn_from_preset_seeded(b, preset, phase_seed);
 }
 
-/// Like `spawn_from_preset`, with the seed that picks each planet's phase.
-/// Returns one warning for each preset flag that the masses contradict.
-pub(super) fn spawn_from_preset_seeded(
+/// Build star, companions, planets, moons and belts into `b`, **without**
+/// the expensive finalisation step (`recenter_com`, `compute_accel`,
+/// `rebase_energy`, `refresh_parent_cache`, `dust::init_fields`).
+///
+/// The split exists so `spawn_solar_systems_impl` can build N temporary
+/// systems cheaply: it needs each system's body list to compute its reach
+/// and mass, but it would throw away any finalisation done on the temporary
+/// `Bodies`. Doing finalisation once on the combined system turns an
+/// O(N · n²) spawn into O(N · n + (N·n)²).
+///
+/// Every caller of this function must subsequently call the finalisation
+/// step exactly once on the returned `Bodies`.
+///
+/// Returns one warning per preset flag that the masses contradict.
+pub(super) fn spawn_from_preset_bodies(
     b: &mut Bodies,
     preset: &SystemPreset,
-    phase_seed: u32,
+    phase_seed: u128,
 ) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
     let n_stars = 1 + preset.companions.len();
     let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
-    *b = Bodies::with_capacity(n_stars + preset.planets.len() + n_moons);
+    // Reserve enough capacity for the belt spawn too. Belt budgets are
+    // ~200 bodies per preset system; without this the inner `push` loop
+    // triggers a reallocation cascade across every SoA column for every
+    // belt body, which dominates spawn time for cluster spawns.
+    let belt_capacity = preset
+        .belts
+        .as_ref()
+        .map(|bp| bp.belt_budget.unwrap_or(PRESET_BELT_BUDGET))
+        .unwrap_or(0);
+    *b = Bodies::with_capacity(n_stars + preset.planets.len() + n_moons + belt_capacity);
     b.rng = XorShift::new(phase_seed);
     b.metallicity = preset.star.metallicity;
 
+    // Primary star sits at the origin. Companions and planets are placed
+    // relative to it, and the COM is recentred in the finalisation step.
     let star_kind = parse_body_kind(preset.star.kind.as_deref(), preset.star.mass_earth);
     let star = b.push(0.0, 0.0, 0.0, 0.0, preset.star.mass_earth, star_kind);
     b.name[star] = preset.star.name.clone();
@@ -816,6 +1054,10 @@ pub(super) fn spawn_from_preset_seeded(
         place_companion(b, comp, preset.star.age_gyr);
     }
 
+    // Planets farther than this from the primary are treated as
+    // circumbinary and orbit the host barycentre instead. `HW_MARGIN_P`
+    // is the standard P-type stability margin for a binary, so the choice
+    // of reference frame matches the physical stability boundary.
     let p_type_cutoff = preset
         .companions
         .first()
@@ -825,8 +1067,9 @@ pub(super) fn spawn_from_preset_seeded(
 
     for p in &preset.planets {
         // `phase: Some(..)` pins the mean anomaly without consuming an
-        // RNG draw, so a preset can start a comet exactly at perihelion
-        // without shifting the stream for any following body.
+        // RNG draw. This matters when a preset wants e.g. a comet exactly
+        // at perihelion without shifting the phase stream for any body
+        // after it (which would perturb reproducibility of other bodies).
         let angle = if let Some(ph) = p.phase {
             ph * std::f64::consts::TAU
         } else {
@@ -847,8 +1090,8 @@ pub(super) fn spawn_from_preset_seeded(
             _ => BodyOrigin::Spawned,
         };
         b.origin[idx] = origin;
-        // The body's class comes from where it sits relative to the
-        // star's snow line, except comets which are always Icy.
+        // Class comes from the body's position relative to the snow line,
+        // except comets which are always Icy regardless of where they sit.
         b.class[idx] = class_for(origin, p.a_au, snow_line);
         let cls = b.class[idx];
         let rho = p
@@ -864,8 +1107,10 @@ pub(super) fn spawn_from_preset_seeded(
             if moon.is_dwarf {
                 apply_dwarf_flag(b, mi, &mut warnings);
             }
-            // Moons inherit the parent planet's class, so the Moon is
-            // Rocky but Ganymede is Icy.
+            // Moons inherit the parent planet's class, so Earth's Moon is
+            // Rocky but Ganymede is Icy. This matches the physical trend
+            // where a moon's composition is set by its formation location
+            // in the circumplanetary disk, not by heliocentric distance.
             b.class[mi] = b.class[idx];
             let mcls = b.class[mi];
             b.bulk_density[mi] = moon
@@ -879,26 +1124,51 @@ pub(super) fn spawn_from_preset_seeded(
         let spec = belt_preset.to_spec();
         let belt_budget = belt_preset.belt_budget.unwrap_or(PRESET_BELT_BUDGET);
         let centre = (b.x[star], b.y[star], b.vx[star], b.vy[star], b.m[star]);
+        // Swap the RNG out and back so belt draws do not perturb the
+        // planet-draw sequence. Reproducibility of planet phases across
+        // belt-presence changes is a hard requirement for preset tests.
         let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
         spawn_belts(b, centre, &spec, snow_line, belt_budget, &mut rng);
         b.rng = rng;
     }
 
+    warnings
+}
+
+/// Like `spawn_from_preset`, with the seed that picks each planet's phase.
+/// Returns one warning for each preset flag that the masses contradict.
+pub(super) fn spawn_from_preset_seeded(
+    b: &mut Bodies,
+    preset: &SystemPreset,
+    phase_seed: u128,
+) -> Vec<String> {
+    let warnings = spawn_from_preset_bodies(b, preset, phase_seed);
     recenter_com(b);
     compute_accel(b);
     rebase_energy(b);
     b.refresh_parent_cache();
     dust::init_fields(b, None);
-    for f in b.dust_fields.iter_mut() {
-        for g in f.grains.iter_mut() {
-            g.mass *= preset.dust_boost;
+    // `dust_boost` defaults to 1.0; the common case is a no-op multiply
+    // across every grain, so skip the traversal entirely when the boost is
+    // the identity. Bit-for-bit identical to the unconditional version.
+    if preset.dust_boost != 1.0 {
+        for f in b.dust_fields.iter_mut() {
+            for g in f.grains.iter_mut() {
+                g.mass *= preset.dust_boost;
+            }
         }
     }
     warnings
 }
 
 /// Copy every body of `src` into `dst`, shifted by `(cx, cy)`. Returns the
-/// index range the copies now occupy. Evolution state comes along.
+/// index range the copies now occupy. Evolution state (age, mass loss,
+/// spin, tidal locks, merger counters) comes along so a cluster member
+/// keeps its evolutionary history.
+///
+/// Velocities are *not* adjusted here: the caller adds its own systemic
+/// velocity offset afterwards, because the offset depends on the slot the
+/// system lands in rather than on the source system.
 pub(super) fn append_system(dst: &mut Bodies, src: &Bodies, cx: f64, cy: f64) -> (usize, usize) {
     let start = dst.len();
     for i in 0..src.len() {
@@ -926,6 +1196,11 @@ pub(super) fn append_system(dst: &mut Bodies, src: &Bodies, cx: f64, cy: f64) ->
 }
 
 /// Push a planet on an orbit about `sun`, which may sit anywhere and move.
+///
+/// The relative state is computed in the sun's current frame; the caller's
+/// existing motion of `sun` is added on top. This means a planet spawned
+/// around a moving star gets the correct inertial velocity without any
+/// special case for "moving star" vs. "stationary star".
 pub(super) fn push_orbit(
     b: &mut Bodies,
     sun: usize,
@@ -976,7 +1251,7 @@ pub fn spawn_solar_system(b: &mut Bodies) {
 /// Single Solar System with a caller-chosen phase seed, so "Reload (R)"
 /// actually gives fresh planet phases (the previous implementation
 /// always used `SOLAR_PHASE_SEED`).
-pub fn spawn_solar_system_seeded(b: &mut Bodies, seed: u32) {
+pub fn spawn_solar_system_seeded(b: &mut Bodies, seed: u128) {
     let preset = solar_system_preset();
     spawn_from_preset_seeded(b, &preset, seed);
 }
@@ -993,22 +1268,54 @@ pub fn spawn_solar_systems(b: &mut Bodies, count: usize) {
 }
 
 /// `spawn_solar_systems`, and the ring radius and index range of every system.
+///
+/// Performance note: each temporary system is built via
+/// `spawn_from_preset_bodies` (no finalisation), because the temporary
+/// `Bodies` are only inspected for reach and mass and are then copied into
+/// the output. Finalising N temporaries would cost N full dust inits and N
+/// O(n²) acceleration passes that are immediately discarded; the combined
+/// system is finalised exactly once at the end instead.
 pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Vec<(usize, usize)>) {
     let n = count.clamp(1, MAX_SOLAR_SYSTEMS);
     let preset = solar_system_preset();
-    *b = Bodies::with_capacity((1 + preset.planets.len()) * n + 16);
+
+    // Capacity must cover the full body count (star + planets + moons +
+    // belt bodies) per system; otherwise `append_system` reallocates every
+    // SoA column once per system, which is a measurable fraction of spawn
+    // time for n=256.
+    let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
+    let belt_capacity = preset
+        .belts
+        .as_ref()
+        .map(|bp| bp.belt_budget.unwrap_or(PRESET_BELT_BUDGET))
+        .unwrap_or(0);
+    let per_system = 1 + preset.planets.len() + n_moons + belt_capacity;
+    *b = Bodies::with_capacity(per_system * n + 16);
     b.metallicity = preset.star.metallicity;
+
+    // Build each system as bodies only. `spawn_from_preset_bodies` replaces
+    // `*temp` wholesale, so the placeholder capacity is irrelevant.
     let mut temps: Vec<Bodies> = Vec::with_capacity(n);
     for k in 0..n {
-        // Each system has its own planet phases.
-        let seed = SOLAR_PHASE_SEED.wrapping_add((k as u32).wrapping_mul(0x9E37_79B9));
-        let mut temp = Bodies::with_capacity(1 + preset.planets.len());
-        spawn_from_preset_seeded(&mut temp, &preset, seed);
+        // Each system has its own planet phases. The multiplier is an
+        // odd prime so the sequence of phase seeds has no short cycle
+        // relative to typical `n` values.
+        let seed = SOLAR_PHASE_SEED.wrapping_add((k as u128).wrapping_mul(0x9E37_79B9));
+        let mut temp = Bodies::with_capacity(0);
+        spawn_from_preset_bodies(&mut temp, &preset, seed);
         temps.push(temp);
     }
+
+    // Cluster layout needs each system's physical reach and total mass, so
+    // compute those before deciding slot positions. Both are cheap
+    // reductions over the temporary systems.
     let reaches: Vec<f64> = temps.iter().map(system_reach_gm).collect();
     let masses: Vec<f64> = temps.iter().map(|t| t.m.iter().sum::<f64>()).collect();
     let slots = cluster_slots(SOLAR_PHASE_SEED, &reaches, &masses);
+
+    // Copy each system into the output at its slot, then add the slot's
+    // systemic velocity. Copy and velocity offset are separate so the
+    // copy logic stays position-only (see `append_system`).
     let mut ranges = Vec::with_capacity(n);
     for (k, temp) in temps.iter().enumerate() {
         let (x, y, vx, vy) = slots[k];
@@ -1019,7 +1326,10 @@ pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Ve
         }
         ranges.push((start, end));
     }
-    // Runtime RNG must not stay at the default seed.
+
+    // The runtime RNG must not stay at the default seed; mixing in a
+    // distinctive constant ensures cluster runs aren't accidentally
+    // correlated with the phase seed used to lay out the systems.
     b.rng = XorShift::new(SOLAR_PHASE_SEED ^ 0xDEAD_BEEF);
     recenter_com(b);
     compute_accel(b);
@@ -1040,9 +1350,13 @@ pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Ve
     (radius, ranges)
 }
 
-/// Set the kind of a preset body flagged `is_dwarf` from its mass. A flag
-/// that disagrees with the mass is overridden; the warning goes to the
-/// event log and to `warnings`.
+/// Set the kind of a preset body flagged `is_dwarf` from its mass.
+///
+/// The mass is authoritative: a preset that flags an object as a dwarf but
+/// gives it a planetary mass (or vice versa) gets a corrected kind plus a
+/// logged warning. Silently honouring the flag would let bad presets inject
+/// physically impossible bodies into the simulation, and silently honouring
+/// the mass without logging would make debugging preset edits painful.
 fn apply_dwarf_flag(b: &mut Bodies, i: usize, warnings: &mut Vec<String>) {
     let kind = classify_small_body(b.m[i]);
     b.kind[i] = kind;

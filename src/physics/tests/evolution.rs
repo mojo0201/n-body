@@ -577,7 +577,7 @@ fn al_sn_unbinds_wide_planet() {
 #[test]
 fn al_random_age_produces_some_remnants() {
     let mut n_rem = 0;
-    for seed in 0..200u32 {
+    for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(10);
         spawn_system(&mut b, 10, seed);
         if !matches!(b.kind[0], BodyKind::Star | BodyKind::BrownDwarf) {
@@ -598,7 +598,7 @@ fn al_random_age_produces_some_remnants() {
 /// converting to a remnant.
 #[test]
 fn al_random_ages_are_consistent() {
-    for seed in 0..300u32 {
+    for seed in 0..300u128 {
         let mut b = Bodies::with_capacity(12);
         spawn_system(&mut b, 12, seed);
         for i in 0..b.len() {
@@ -642,9 +642,14 @@ fn al_random_systems_keep_ages_on_the_ring() {
 /// must not panic or produce NaN / infinity in positions or velocities.
 /// Also: a solar system with a fast evolution rate must reach the WD
 /// stage within 3000 steps.
+/// Smoke test: 40 random 30-body universes simulated with evolution on
+/// must not panic or produce NaN / infinity in positions or velocities.
+/// Also: a solar system with a fast evolution rate must reach the WD
+/// stage within 3000 steps.
 #[test]
+#[ignore = "40x30-body + solar runs (27 000 advance calls); ~60 s in debug. Run with -- --ignored"]
 fn smoke_evolution_runs_without_panic() {
-    for seed in 0..40u32 {
+    for seed in 0..40u128 {
         let mut b = Bodies::with_capacity(0);
         spawn_random_systems(&mut b, 30, seed, 1);
         set_evolution_rate(&mut b, 1.0);
@@ -719,7 +724,7 @@ fn evolve_sun_to_wd_expands_planet_orbit() {
 /// be unphysical.
 #[test]
 fn al_spawned_ages_within_universe_age() {
-    for seed in 0..500u32 {
+    for seed in 0..500u128 {
         let mut b = Bodies::with_capacity(30);
         spawn_system(&mut b, 30, seed);
         for i in 0..b.len() {

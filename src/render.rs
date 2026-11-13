@@ -154,12 +154,17 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
             // out) fades to a dull blue-gray, matching the tarlike
             // surface of a real comet nucleus.
             if b.origin[i] == BodyOrigin::Comet {
+                // Smooth blend: dark, tar-like nucleus far out, bright
+                // point (coma core) when active. No hard switch.
                 let d_au = physics::host_distance(b, i) / physics::au_in_gm();
-                if d_au < 5.0 {
-                    return [0.70, 0.92, 1.00];
-                } else {
-                    return [0.35, 0.40, 0.50];
-                }
+                let t = (((4.0 - d_au) / 2.5).clamp(0.0, 1.0)) as f32;
+                let t = t * t * (3.0 - 2.0 * t);
+                let (dark, lit) = ([0.30f32, 0.31, 0.34], [0.95f32, 0.97, 1.00]);
+                return [
+                    dark[0] + (lit[0] - dark[0]) * t,
+                    dark[1] + (lit[1] - dark[1]) * t,
+                    dark[2] + (lit[2] - dark[2]) * t,
+                ];
             }
             // Interstellar objects get a violet tint, distinct from
             // both comets (cyan-white) and debris (grey), so an ISO
@@ -307,7 +312,9 @@ pub struct Renderer {
     trail_capacity: u64,
     trail_vert_count: u32,
 
-    // Comet tails and comas. World-space vertices (like trails), line-list.
+    // Comet tails and comas. World-space vertices (like trails). Soft
+    // triangles with additive blending, so overlaps add up like light.
+    comet_pipeline: wgpu::RenderPipeline,
     comet_tail_buf: wgpu::Buffer,
     comet_tail_capacity: u64,
     comet_tail_vert_count: u32,
@@ -474,7 +481,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_orbit",
-                buffers: &[orbit_layout],
+                buffers: &[orbit_layout.clone()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -639,6 +646,36 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+
+        // ---- Comet pipeline: orbit vertex format, triangles, additive ----
+        let comet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("comet-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_orbit",
+                buffers: &[orbit_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_orbit",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(additive),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
         // 64k grains to start (1 MiB), grown on demand.
         let dust_capacity = 65_536 * std::mem::size_of::<DustVertex>() as u64;
         let dust_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -698,6 +735,7 @@ impl Renderer {
             trail_buf,
             trail_capacity,
             trail_vert_count: 0,
+            comet_pipeline,
             comet_tail_buf,
             comet_tail_capacity,
             comet_tail_vert_count: 0,
@@ -1023,7 +1061,7 @@ impl Renderer {
             pass.draw(0..self.trail_vert_count, 0..1);
         }
         if self.comet_tail_vert_count > 0 {
-            pass.set_pipeline(&self.orbit_pipeline);
+            pass.set_pipeline(&self.comet_pipeline);
             pass.set_bind_group(0, &self.orbit_camera_bg, &[]);
             pass.set_vertex_buffer(0, self.comet_tail_buf.slice(..));
             pass.draw(0..self.comet_tail_vert_count, 0..1);
