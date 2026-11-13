@@ -260,7 +260,7 @@ fn step_skips_invalid_primary() {
 /// a disabled drag term, or the wrong `c` in `accel`. All three would
 /// leave `a` constant or growing.
 #[test]
-fn pr_drag_shrinks_orbit() {
+fn dust_pr_drag_shrinks_orbit() {
     let (b, mut f) = sun_field(50.0, 150.0);
     let beta = beta_of(1.0, 50.0);
     let a0 = a_eff(&f.grains[0], beta);

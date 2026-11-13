@@ -329,7 +329,7 @@ fn psr_b1257_host_is_a_neutron_star() {
 }
 
 #[test]
-fn wd_1145_host_is_a_white_dwarf() {
+fn preset_wd_1145_host_is_a_white_dwarf() {
     let mut b = Bodies::with_capacity(0);
     spawn_from_preset(&mut b, &load_preset_by_slug("wd_1145_plus_017").unwrap());
     assert_eq!(b.kind[0], BodyKind::WhiteDwarf);
@@ -359,7 +359,7 @@ fn cygnus_x1_host_is_a_black_hole() {
 }
 
 #[test]
-fn hd_80606_b_has_extreme_eccentricity() {
+fn preset_hd_80606_b_has_extreme_eccentricity() {
     let mut b = Bodies::with_capacity(0);
     spawn_from_preset(&mut b, &load_preset_by_slug("hd_80606").unwrap());
     let planet = (0..b.len())
