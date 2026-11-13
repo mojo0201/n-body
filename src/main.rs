@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
+use nbody_rust::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
 use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
 use nbody_rust::Preset;
@@ -428,6 +428,147 @@ impl TrailState {
     }
 }
 
+/// Build comet tail and coma vertices for every active comet.
+///
+/// A comet is "active" when it is Icy, has a luminous host, and is
+/// inside that host's snow line. Its brightness scales roughly as
+/// the incident flux (1 / r²), clipped to [0, 1]. The tail is a cone
+/// of lines pointing **anti-sunward** (from host to comet), tapering
+/// from bright at the nucleus to transparent at the tip. The coma is
+/// a small sunburst of radiating lines around the nucleus.
+///
+/// Returns line-list vertices in **world** coordinates (same
+/// convention as trails and orbits — the orbit pipeline subtracts
+/// `camera.pos` itself). Empty when there are no comets in the
+/// system, so a plain Solar System without comet JSON costs nothing.
+fn build_comet_tails(b: &Bodies, _cam: [f64; 2]) -> Vec<OrbitVertex> {
+    let mut out = Vec::new();
+    // Bail out cheaply on systems with no comets.
+    if !b.origin.iter().any(|&o| o == BodyOrigin::Comet) {
+        return out;
+    }
+    let hosts: Vec<usize> = (0..b.len())
+        .filter(|&i| {
+            matches!(
+                b.kind[i],
+                BodyKind::Star
+                    | BodyKind::BrownDwarf
+                    | BodyKind::WhiteDwarf
+                    | BodyKind::NeutronStar
+                    | BodyKind::BlackHole
+            )
+        })
+        .collect();
+    if hosts.is_empty() {
+        return out;
+    }
+    let au = physics::au_in_gm();
+    for i in 0..b.len() {
+        if b.origin[i] != BodyOrigin::Comet || b.class[i] != BodyClass::Icy {
+            continue;
+        }
+        // Nearest host.
+        let mut r_min = f64::INFINITY;
+        let mut h = hosts[0];
+        for &k in &hosts {
+            let d = (b.x[i] - b.x[k]).hypot(b.y[i] - b.y[k]);
+            if d < r_min {
+                r_min = d;
+                h = k;
+            }
+        }
+        let r_au = r_min / au;
+        let lum = physics::luminosity_of(b, h).max(0.0);
+        if lum <= 0.0 {
+            continue;
+        }
+        let snow_au = 2.7 * lum.sqrt();
+        if r_au >= snow_au || r_au < 1e-3 {
+            continue;
+        }
+        // Activity: incident flux, clipped to [0, 1]. At 1 AU the tail
+        // is already fully developed; inside 1 AU it can't grow longer
+        // (clamped) but the comet stays bright.
+        let activity = (1.0 / (r_au * r_au)).min(1.0);
+        if activity <= 0.01 {
+            continue;
+        }
+        // Anti-sunward unit vector.
+        let dx = b.x[i] - b.x[h];
+        let dy = b.y[i] - b.y[h];
+        let r = dx.hypot(dy).max(1e-9);
+        let (ux, uy) = (dx / r, dy / r);
+        // Tail length: 0.06 AU at full activity is a realistic moderately
+        // bright comet (Hale-Bopp reached ~1 AU, most visible comets
+        // 0.05-0.3 AU). 0.06 AU no longer dominates the inner-system view.
+        let tail_len_gm = 0.06 * au * activity;
+        // Tail spread: real tails are narrow streams (aspect 20:1+), not
+        // wide fans. 0.018 rad gives ~55:1 at full length — a stream.
+        // An ion tail is extremely straight and narrow.
+        const TAIL_LINES: usize = 3;
+        const TAIL_STEPS: usize = 3;
+        const TAIL_SPREAD: f64 = 0.008;
+        let (r_c, g_c, b_c) = (190u8, 220u8, 255u8);
+        // Coma: small fuzzy halo around the nucleus. 1.2 % of the tail
+        // = 0.0007 AU = 105,000 km at full activity — realistic for a
+        // bright active comet (real comas are 10^4-10^6 km radius).
+        let coma_r_gm = 0.012 * tail_len_gm;
+        // Start the tail rays at the coma's anti-sunward edge, NOT the
+        // nucleus. Without this, all N tail rays + the coma rays converge
+        // at one point, saturate, and read as a circular white blob.
+        let x_start = b.x[i] + ux * coma_r_gm;
+        let y_start = b.y[i] + uy * coma_r_gm;
+        for k in 0..TAIL_LINES {
+            let t = k as f64 / (TAIL_LINES - 1) as f64 - 0.5;
+            let ang = t * TAIL_SPREAD;
+            let (ca, sa) = ang.cos().sin_cos();
+            let tx = ux * ca - uy * sa;
+            let ty = ux * sa + uy * ca;
+            for s in 0..TAIL_STEPS {
+                let f0 = s as f64 / TAIL_STEPS as f64;
+                let f1 = (s + 1) as f64 / TAIL_STEPS as f64;
+                let x0 = x_start + tx * tail_len_gm * f0;
+                let y0 = y_start + ty * tail_len_gm * f0;
+                let x1 = x_start + tx * tail_len_gm * f1;
+                let y1 = y_start + ty * tail_len_gm * f1;
+                let a0 = ((1.0 - f0) * activity * 120.0) as u8;
+                let a1 = ((1.0 - f1) * activity * 120.0) as u8;
+                out.push(OrbitVertex {
+                    pos: [x0 as f32, y0 as f32],
+                    color: [r_c, g_c, b_c, a0],
+                });
+                out.push(OrbitVertex {
+                    pos: [x1 as f32, y1 as f32],
+                    color: [r_c, g_c, b_c, a1],
+                });
+            }
+        }
+        // Coma: 8 faint rays (was 24 bright ones). A soft glow, not a
+        // sunburst. At system scale this is sub-pixel; only when zoomed
+        // right in does it show structure.
+        if coma_r_gm > 1e-6 {
+            const COMA_RAYS: usize = 8;
+            for k in 0..COMA_RAYS {
+                let ang = k as f64 / COMA_RAYS as f64 * std::f64::consts::TAU;
+                let (ca, sa) = ang.cos().sin_cos();
+                let x0 = b.x[i];
+                let y0 = b.y[i];
+                let x1 = b.x[i] + ca * coma_r_gm;
+                let y1 = b.y[i] + sa * coma_r_gm;
+                out.push(OrbitVertex {
+                    pos: [x0 as f32, y0 as f32],
+                    color: [220, 240, 255, 80],
+                });
+                out.push(OrbitVertex {
+                    pos: [x1 as f32, y1 as f32],
+                    color: [220, 240, 255, 0],
+                });
+            }
+        }
+    }
+    out
+}
+
 struct SimState {
     paused: bool,
     speed: f64,
@@ -780,6 +921,18 @@ impl SimState {
         if act.step_once {
             physics::advance(b, physics::DT);
         }
+        if act.spawn_iso {
+            if physics::spawn_interstellar_object(b).is_some() {
+                self.orbit_buf_valid = false;
+                self.scene_dirty = true;
+            }
+        }
+        if act.spawn_rogue {
+            if physics::spawn_rogue_planet(b).is_some() {
+                self.orbit_buf_valid = false;
+                self.scene_dirty = true;
+            }
+        }
         if let Some(s) = act.speed {
             self.speed = s.clamp(0.01, 100.0);
         }
@@ -1104,6 +1257,20 @@ impl ApplicationHandler for App {
                             let b = self.shared.lock_for_render();
                             self.sim.cycle_selection(&b, -1);
                         }
+                        "i" => {
+                            let mut b = self.shared.lock_for_render();
+                            if physics::spawn_interstellar_object(&mut b).is_some() {
+                                self.sim.orbit_buf_valid = false;
+                                self.sim.scene_dirty = true;
+                            }
+                        }
+                        "t" => {
+                            let mut b = self.shared.lock_for_render();
+                            if physics::spawn_rogue_planet(&mut b).is_some() {
+                                self.sim.orbit_buf_valid = false;
+                                self.sim.scene_dirty = true;
+                            }
+                        }
                         "." => {
                             let mut b = self.shared.lock_for_render();
                             physics::advance(&mut b, physics::DT);
@@ -1209,6 +1376,7 @@ impl ApplicationHandler for App {
                 let n_bodies;
                 let mut new_title: Option<String> = None;
                 let trail_snapshot: Vec<TrailSample>;
+                let comet_tail_verts: Vec<OrbitVertex>;
                 // Orbit vertices arrive from the physics thread. Hoisted
                 // out of the lock block so `set_orbit_vertices` (a pure
                 // GPU upload) runs after the lock drops.
@@ -1345,6 +1513,7 @@ impl ApplicationHandler for App {
                     gfx.renderer
                         .build_instances(&b, self.sim.zoom, self.sim.cam, vp);
                     let _ = std::mem::take(&mut self.sim.scene_dirty);
+                    comet_tail_verts = build_comet_tails(&b, self.sim.cam);
                     flashes_active = !b.flashes.is_empty();
                     n_bodies = b.len();
                 }
@@ -1358,7 +1527,8 @@ impl ApplicationHandler for App {
                 gfx.renderer
                     .update_camera(&gfx.queue, self.sim.cam, self.sim.zoom, vp);
                 gfx.renderer.upload_instances(&gfx.device, &gfx.queue);
-
+                gfx.renderer
+                    .set_comet_tail_vertices(&gfx.device, &gfx.queue, &comet_tail_verts);
                 if self.sim.trail.cfg.enabled {
                     self.sim.trail.update(&trail_snapshot);
                     let verts = self.sim.trail.build_vertices();

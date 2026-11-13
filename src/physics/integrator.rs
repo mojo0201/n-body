@@ -255,6 +255,7 @@ pub fn advance(b: &mut Bodies, dt: f64) {
     dust::evolve(b, dt);
     coalesce_debris(b);
     tidal_breakup(b);
+    comet_sublimate(b, dt);
     cull_escaped(b);
     settle_energy(b);
     b.stats.steps += 1;

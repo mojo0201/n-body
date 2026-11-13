@@ -539,6 +539,14 @@ pub struct Actions {
     pub reset: bool,
     pub toggle_pause: bool,
     pub step_once: bool,
+    /// Spawn one interstellar object inbound from `0.9 × CULL_DIST`.
+    /// Not part of any automatic spawn path, so it never affects RNG
+    /// state for other tests.
+    pub spawn_iso: bool,
+    /// Spawn one rogue planet inbound from `0.9 × CULL_DIST` (gas-giant
+    /// mass). Exempt from the `CULL_DIST` cull, so it persists through
+    /// the outer system until `HARD_CULL_DIST`.
+    pub spawn_rogue: bool,
     pub speed: Option<f64>,
     pub body_count: Option<usize>,
     pub seed: Option<u32>,
@@ -969,6 +977,20 @@ fn section_simulation(
                 }
                 if ui.button("Step").on_hover_text("one step (.)").clicked() {
                     act.step_once = true;
+                }
+                if ui
+                    .button("Spawn ISO")
+                    .on_hover_text("spawn an interstellar object inbound (I)")
+                    .clicked()
+                {
+                    act.spawn_iso = true;
+                }
+                if ui
+                    .button("Spawn rogue")
+                    .on_hover_text("spawn a gas-giant rogue planet inbound (Shift+I)")
+                    .clicked()
+                {
+                    act.spawn_rogue = true;
                 }
             });
             // Speed slider is logarithmic: the useful range spans 0.01× to
@@ -1441,6 +1463,9 @@ fn event_color(k: EventKind) -> Color32 {
         EventKind::Escape => Color32::from_gray(150),
         EventKind::User => Color32::from_rgb(130, 220, 150),
         EventKind::Evolve => Color32::from_rgb(255, 220, 130),
+        EventKind::Comet => Color32::from_rgb(150, 220, 255),
+        EventKind::Interstellar => Color32::from_rgb(220, 170, 255),
+        EventKind::Eject => Color32::from_rgb(255, 140, 90),
     }
 }
 
@@ -2224,6 +2249,8 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                     ("B", "body list"),
                     ("`", "show / hide the control panel"),
                     ("Delete", "delete the selected body"),
+                    ("I", "spawn an interstellar object inbound"),
+                    ("T", "spawn a gas-giant rogue planet inbound"),
                     ("Esc", "deselect"),
                     ("? or H", "this help"),
                 ] {

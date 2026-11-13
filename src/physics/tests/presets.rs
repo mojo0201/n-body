@@ -543,3 +543,22 @@ fn moon_of_dwarf_not_labelled_dwarf() {
     assert_eq!(body_class(&b, moon), "moon");
     assert_eq!(body_class(&b, dwarf), "dwarf planet");
 }
+
+#[test]
+fn solar_system_has_both_comets() {
+    let mut b = Bodies::with_capacity(0);
+    spawn_solar_system(&mut b);
+    let comets: Vec<usize> = (0..b.len())
+        .filter(|&i| b.origin[i] == BodyOrigin::Comet)
+        .collect();
+    assert_eq!(comets.len(), 2, "Solar System must contain 67P and Halley");
+    let names: Vec<&str> = comets
+        .iter()
+        .filter_map(|&i| b.name[i].as_deref())
+        .collect();
+    assert!(names.contains(&"67P/Churyumov-Gerasimenko"), "missing 67P");
+    assert!(names.contains(&"1P/Halley"), "missing Halley");
+    for &i in &comets {
+        assert_eq!(b.class[i], BodyClass::Icy, "comets are icy");
+    }
+}

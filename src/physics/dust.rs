@@ -243,9 +243,14 @@ impl DustField {
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Add `DUST_EMIT_GRAINS` tracers carrying `mass`, released at a point
-    /// with the given velocity plus an isotropic kick of sigma `kick`.
-    fn emit(&mut self, p: (f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) {
+    fn emit_dir(
+        &mut self,
+        p: (f64, f64, f64, f64),
+        mass: f64,
+        kick: f64,
+        dir: Option<(f64, f64)>,
+        rng: &mut XorShift,
+    ) {
         let n = DUST_EMIT_GRAINS;
         if self.grains.len() + n > DUST_MAX_GRAINS || mass <= 0.0 {
             return;
@@ -253,11 +258,37 @@ impl DustField {
         let sizes: Vec<f64> = (0..n).map(|_| draw_size(rng)).collect();
         let wsum: f64 = sizes.iter().map(|&s| size_weight(s)).sum();
         for &size in &sizes {
+            let (dvx, dvy) = if let Some((ux, uy)) = dir {
+                // 1. Angle of the comet's current velocity
+                let speed = p.2.hypot(p.3).max(1e-9);
+                let (vx_hat, vy_hat) = (p.2 / speed, p.3 / speed);
+
+                // 2. Blend the anti-sunward direction with the backward velocity
+                // to tilt the cone behind the comet.
+                let sweep = 0.4; // 0.0 = straight out, 1.0 = fully swept back
+                let base_x = ux - vx_hat * sweep;
+                let base_y = uy - vy_hat * sweep;
+                let base_len = base_x.hypot(base_y).max(1e-9);
+                let (bx, by) = (base_x / base_len, base_y / base_len);
+
+                // 3. Add the random cone spread
+                let spread = 0.15;
+                let ang = (rng.next_f64() - 0.5) * spread;
+                let (sa, ca) = ang.sin_cos();
+                let tx = bx * ca - by * sa;
+                let ty = bx * sa + by * ca;
+
+                let v_kick = kick * (0.05 + 0.25 * rng.next_f64());
+                (tx * v_kick, ty * v_kick)
+            } else {
+                // Isotropic (collisions)
+                (sample_normal(rng, 0.0, kick), sample_normal(rng, 0.0, kick))
+            };
             self.grains.push(Grain {
                 x: p.0,
                 y: p.1,
-                vx: p.2 + sample_normal(rng, 0.0, kick),
-                vy: p.3 + sample_normal(rng, 0.0, kick),
+                vx: p.2 + dvx,
+                vy: p.3 + dvy,
                 mass: mass * size_weight(size) / wsum,
                 size_um: size,
             });
@@ -265,18 +296,20 @@ impl DustField {
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Camera-relative points for the renderer.
-    pub fn collect_points(&self, cam: [f64; 2], out: &mut Vec<DustPoint>) {
-        out.extend(self.grains.iter().map(|g| DustPoint {
-            pos: [(g.x - cam[0]) as f32, (g.y - cam[1]) as f32],
-            weight: g.mass as f32,
-        }));
+    fn emit(&mut self, p: (f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) {
+        self.emit_dir(p, mass, kick, None, rng);
     }
 }
-
-/// Dust from a collision at world position `(x, y)` moving with `(vx, vy)`.
-/// Goes to the first field whose cull radius holds the point.
-pub fn deposit(b: &mut Bodies, x: f64, y: f64, vx: f64, vy: f64, mass: f64) {
+pub fn deposit(
+    b: &mut Bodies,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    mass: f64,
+    dir: Option<(f64, f64)>,
+    kick_scale: f64,
+) {
     let mut fields = std::mem::take(&mut b.dust_fields);
     let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
     for f in fields.iter_mut() {
@@ -287,14 +320,14 @@ pub fn deposit(b: &mut Bodies, x: f64, y: f64, vx: f64, vy: f64, mass: f64) {
         let r = (x - b.x[p]).hypot(y - b.y[p]);
         if r < f.extent_gm {
             let vc = (G * b.m[p] / r.max(1e-6)).sqrt();
-            f.emit((x, y, vx, vy), mass, DUST_EJECT_FRAC * vc, &mut rng);
+            let kick = DUST_EJECT_FRAC * vc * kick_scale;
+            f.emit_dir((x, y, vx, vy), mass, kick, dir, &mut rng);
             break;
         }
     }
     b.rng = rng;
     b.dust_fields = fields;
 }
-
 /// (a, e, periapsis angle) of body `i` about `p`, or `None` if unbound.
 fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64)> {
     let (dx, dy) = (b.x[i] - b.x[p], b.y[i] - b.y[p]);

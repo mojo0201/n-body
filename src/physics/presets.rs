@@ -583,6 +583,14 @@ pub struct PlanetPreset {
     /// True for IAU dwarf planets (Ceres, Pluto, ...).
     #[serde(default)]
     pub is_dwarf: bool,
+    /// Body origin: `"comet"` makes it a comet. Absent → `Spawned`.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Mean anomaly at spawn in [0, 1). When absent (the common case),
+    /// a random phase is drawn as before. Set to `0.0` to start at
+    /// perihelion, `0.5` at aphelion.
+    #[serde(default)]
+    pub phase: Option<f64>,
     /// Moons of this planet. Each moon's `a_au` is measured from the
     /// planet, not the star.
     #[serde(default)]
@@ -629,7 +637,7 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
             ),
             (
                 "hot_jupiter",
-                include_str!("../../assets/presets/hot_jupiter.json"),
+                include_str!("../../assets/presets/51_pegasi_b.json"),
             ),
             (
                 "wasp_12b",
@@ -739,7 +747,14 @@ pub(super) fn spawn_from_preset_seeded(
     let snow_line = 2.7 * luminosity_of(b, star).max(1e-6).sqrt();
 
     for p in &preset.planets {
-        let angle = b.rng.next_f64() * std::f64::consts::TAU;
+        // `phase: Some(..)` pins the mean anomaly without consuming an
+        // RNG draw, so a preset can start a comet exactly at perihelion
+        // without shifting the stream for any following body.
+        let angle = if let Some(ph) = p.phase {
+            ph * std::f64::consts::TAU
+        } else {
+            b.rng.next_f64() * std::f64::consts::TAU
+        };
         let idx = if p.a_au > p_type_cutoff {
             push_circumbinary(b, p.a_au, p.e, p.m_earth, angle)
         } else {
@@ -749,10 +764,15 @@ pub(super) fn spawn_from_preset_seeded(
         if p.is_dwarf {
             apply_dwarf_flag(b, idx, &mut warnings);
         }
-        // The planet's class comes from where it sits relative to the
-        // star's snow line. Preset `density_gcc` still wins when given,
-        // so the Moon, Io, Ganymede etc. keep their real radii.
-        b.class[idx] = class_for(BodyOrigin::Spawned, p.a_au, snow_line);
+        let origin = match p.origin.as_deref() {
+            Some("comet") => BodyOrigin::Comet,
+            Some("rogue") => BodyOrigin::RoguePlanet,
+            _ => BodyOrigin::Spawned,
+        };
+        b.origin[idx] = origin;
+        // The body's class comes from where it sits relative to the
+        // star's snow line, except comets which are always Icy.
+        b.class[idx] = class_for(origin, p.a_au, snow_line);
         let cls = b.class[idx];
         let rho = p
             .density_gcc

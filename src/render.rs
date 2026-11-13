@@ -158,6 +158,31 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
         BodyKind::NeutronStar => [1.0, 0.95, 0.85],
         BodyKind::BlackHole => [1.0, 0.35, 0.35],
         BodyKind::Planet | BodyKind::DwarfPlanet => {
+            // Comets get their own colour regardless of the class
+            // machinery below. Active (close to the host) is pale
+            // cyan-white, matching C₂ / dust emission. Dormant (far
+            // out) fades to a dull blue-gray, matching the tarlike
+            // surface of a real comet nucleus.
+            if b.origin[i] == BodyOrigin::Comet {
+                let d_au = physics::host_distance(b, i) / physics::au_in_gm();
+                if d_au < 5.0 {
+                    return [0.70, 0.92, 1.00];
+                } else {
+                    return [0.35, 0.40, 0.50];
+                }
+            }
+            // Interstellar objects get a violet tint, distinct from
+            // both comets (cyan-white) and debris (grey), so an ISO
+            // visually reads as "not from around here".
+            if b.origin[i] == BodyOrigin::Interstellar {
+                return [0.85, 0.65, 1.00];
+            }
+            // Rogues get red-orange (hot, dark, radiogenic) — distinct
+            // from both comets (cyan) and ISOs (violet). Readily
+            // identifiable at a glance.
+            if b.origin[i] == BodyOrigin::RoguePlanet {
+                return [0.90, 0.42, 0.25];
+            }
             // A spawned body past 50 M⊕ is a gas giant — keep the tan
             // look instead of the pale-blue Icy class colour.
             if b.m[i] >= 50.0 && b.origin[i] == BodyOrigin::Spawned {
@@ -216,7 +241,12 @@ impl BodyInstance {
             BodyKind::NeutronStar => 1.5,
             BodyKind::BlackHole => 4.0,
             BodyKind::Planet => {
-                if rubble {
+                if origin == BodyOrigin::Comet {
+                    // A real nucleus is < 10 km across — sub-pixel at any
+                    // zoom that also shows the tail. Keep it at 0.7 px so
+                    // it reads as a bright point source, not an asteroid.
+                    0.7
+                } else if rubble {
                     1.0
                 } else {
                     1.6
@@ -286,6 +316,11 @@ pub struct Renderer {
     trail_buf: wgpu::Buffer,
     trail_capacity: u64,
     trail_vert_count: u32,
+
+    // Comet tails and comas. World-space vertices (like trails), line-list.
+    comet_tail_buf: wgpu::Buffer,
+    comet_tail_capacity: u64,
+    comet_tail_vert_count: u32,
 
     // Flashes.
     flash_pipeline: wgpu::RenderPipeline,
@@ -645,6 +680,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let comet_tail_capacity = 1024 * 16;
+        let comet_tail_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("comet-tail"),
+            size: comet_tail_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let flash_capacity = 1024 * 64;
         let flash_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("flash"),
@@ -666,6 +708,9 @@ impl Renderer {
             trail_buf,
             trail_capacity,
             trail_vert_count: 0,
+            comet_tail_buf,
+            comet_tail_capacity,
+            comet_tail_vert_count: 0,
             flash_pipeline,
             flash_buf,
             flash_capacity,
@@ -938,6 +983,32 @@ impl Renderer {
         self.trail_vert_count = verts.len() as u32;
     }
 
+    /// Upload comet tail and coma vertices. World-space coordinates, same
+    /// vertex format and pipeline as orbits/trails, so alpha blends the
+    /// same way.
+    pub fn set_comet_tail_vertices(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        verts: &[OrbitVertex],
+    ) {
+        if verts.is_empty() {
+            self.comet_tail_vert_count = 0;
+            return;
+        }
+        let byte_len = std::mem::size_of_val(verts) as u64;
+        if byte_len > self.comet_tail_capacity {
+            self.comet_tail_capacity = byte_len.next_power_of_two();
+            self.comet_tail_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("comet-tail"),
+                size: self.comet_tail_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.comet_tail_buf, 0, bytemuck::cast_slice(verts));
+        self.comet_tail_vert_count = verts.len() as u32;
+    }
     /// Number of vertices in the trail buffer (`main.rs` uses it to detect
     /// "trails were just turned off").
     pub fn trail_count(&self) -> u32 {
@@ -960,6 +1031,12 @@ impl Renderer {
             pass.set_bind_group(0, &self.orbit_camera_bg, &[]);
             pass.set_vertex_buffer(0, self.trail_buf.slice(..));
             pass.draw(0..self.trail_vert_count, 0..1);
+        }
+        if self.comet_tail_vert_count > 0 {
+            pass.set_pipeline(&self.orbit_pipeline);
+            pass.set_bind_group(0, &self.orbit_camera_bg, &[]);
+            pass.set_vertex_buffer(0, self.comet_tail_buf.slice(..));
+            pass.draw(0..self.comet_tail_vert_count, 0..1);
         }
         if self.orbit_vert_count > 0 {
             pass.set_pipeline(&self.orbit_pipeline);

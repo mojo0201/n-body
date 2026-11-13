@@ -769,3 +769,99 @@ fn s_spawn_moon_rejects_star() {
     let mut rng = XorShift::new(1);
     assert!(spawn_moon(&mut b, 0, &mut rng).is_none());
 }
+
+/// An interstellar object crossing `CULL_DIST` outbound must be
+/// removed and logged with `EventKind::Interstellar` (not `Escape`),
+/// so the UI can distinguish it from a routine planet ejection.
+#[test]
+fn p_escape_cull_logs_interstellar_departure() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let d = CULL_DIST * 2.0;
+    let v_esc = (2.0 * G * M_SUN_ME / d).sqrt();
+    let i = b.push(d, 0.0, 2.0 * v_esc, 0.0, 1e-8, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::Interstellar;
+    cull_escaped(&mut b);
+    assert_eq!(b.len(), 1, "ISO must be culled");
+    assert!(
+        b.events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Interstellar) && e.text.contains("left")),
+        "ISO departure must be logged with Interstellar kind"
+    );
+    // A regular escapee still logs as Escape.
+    let mut b2 = Bodies::with_capacity(2);
+    b2.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let j = b2.push(d, 0.0, 2.0 * v_esc, 0.0, 1.0, BodyKind::Planet);
+    b2.origin[j] = BodyOrigin::Spawned;
+    cull_escaped(&mut b2);
+    assert!(
+        b2.events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Escape) && e.text.contains("escaped")),
+        "regular planet departure must still log with Escape kind"
+    );
+}
+
+/// A rogue inside the CULL..HARD_CULL band must not be culled. This
+/// is the "CULL_DIST exception" the feature adds.
+#[test]
+fn p_escape_cull_keeps_rogue_inside_hard_cull() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let d = CULL_DIST * 2.0;
+    let v_esc = (2.0 * G * M_SUN_ME / d).sqrt();
+    let i = b.push(d, 0.0, 2.0 * v_esc, 0.0, 300.0, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::RoguePlanet;
+    cull_escaped(&mut b);
+    assert_eq!(b.len(), 2, "rogue must survive inside HARD_CULL_DIST");
+    assert_eq!(b.origin[i], BodyOrigin::RoguePlanet);
+}
+
+/// A rogue past HARD_CULL_DIST must be culled, regardless of origin.
+#[test]
+fn p_escape_cull_removes_rogue_past_hard_cull() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let d = HARD_CULL_DIST * 1.5;
+    let v_esc = (2.0 * G * M_SUN_ME / d).sqrt();
+    let i = b.push(d, 0.0, 2.0 * v_esc, 0.0, 300.0, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::RoguePlanet;
+    cull_escaped(&mut b);
+    assert_eq!(b.len(), 1, "rogue past HARD_CULL_DIST must be culled");
+    assert!(b.events.iter().any(|e| matches!(e.kind, EventKind::Escape)));
+}
+
+/// A heavy ejected planet (>= ROGUE_MIN_MASS) crossing CULL_DIST
+/// outbound is *promoted* to a rogue, not culled.
+#[test]
+fn p_escape_cull_promotes_heavy_ejectee() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let d = CULL_DIST * 2.0;
+    let v_esc = (2.0 * G * M_SUN_ME / d).sqrt();
+    let i = b.push(d, 0.0, 2.0 * v_esc, 0.0, 300.0, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::Spawned;
+    cull_escaped(&mut b);
+    assert_eq!(b.len(), 2, "heavy ejectee must be promoted, not culled");
+    assert_eq!(b.origin[i], BodyOrigin::RoguePlanet);
+    assert!(
+        b.events.iter().any(|e| matches!(e.kind, EventKind::Eject)),
+        "promotion must log an Eject event"
+    );
+}
+
+/// A light ejected body (< ROGUE_MIN_MASS) crossing CULL_DIST is
+/// culled — the pre-feature behaviour, unchanged. Regression guard.
+#[test]
+fn p_escape_cull_culls_light_ejectee() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let d = CULL_DIST * 2.0;
+    let v_esc = (2.0 * G * M_SUN_ME / d).sqrt();
+    let i = b.push(d, 0.0, 2.0 * v_esc, 0.0, 1.0, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::Spawned;
+    cull_escaped(&mut b);
+    assert_eq!(b.len(), 1, "light ejectee must still be culled");
+    assert!(b.events.iter().any(|e| matches!(e.kind, EventKind::Escape)));
+}

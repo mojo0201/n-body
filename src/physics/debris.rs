@@ -352,6 +352,112 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     true
 }
 
+/// Sublimate ice from comet bodies near their host star.
+///
+/// A comet (`BodyOrigin::Comet`) is active only when it is inside its
+/// host's snow line AND has `BodyClass::Icy` — an icy body outside the
+/// snow line is dormant, and a rocky body is inert regardless of
+/// distance. Near perihelion the comet loses mass to sublimation;
+/// that mass goes to the nearest dust field. Below `COMET_DEAD_MASS`
+/// the comet is removed — it has exhausted its volatiles.
+///
+/// Rate model: `dm = rate × m × dt` with `rate ∝ flux = L / r²`. At
+/// 1 AU from a Sun-like star the loss is `COMET_SUBLIMATE_FLUX_COEFF`
+/// per time unit, capped at `COMET_MAX_FRAC_PER_STEP × m` per step.
+///
+/// No RNG is drawn, so the RNG stream is unchanged from before this
+/// feature and every downstream test that hashes on belt-body
+/// positions is unaffected.
+pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
+    // Fast path: no comets → no work. `advance` calls this on every
+    // step, so the early return matters for large simulations.
+    if !b.origin.iter().any(|&o| o == BodyOrigin::Comet) {
+        return;
+    }
+    let n = b.len();
+    let hosts = host_list(b);
+    if hosts.is_empty() {
+        return;
+    }
+    let t_now = b.time;
+
+    // Deferred operations, so the borrow checker stays happy across the
+    // `dust::deposit` calls.
+    let mut mass_updates: Vec<(usize, f64)> = Vec::new();
+    let mut to_deposit: Vec<(f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut to_kill: Vec<usize> = Vec::new();
+
+    for i in 0..n {
+        if b.dead[i] || b.origin[i] != BodyOrigin::Comet {
+            continue;
+        }
+        if b.class[i] != BodyClass::Icy {
+            continue;
+        }
+        if t_now < b.imm[i] {
+            continue;
+        }
+        // Nearest host.
+        let mut r_min = f64::INFINITY;
+        let mut h = hosts[0];
+        for &k in &hosts {
+            let d = (b.x[i] - b.x[k]).hypot(b.y[i] - b.y[k]);
+            if d < r_min {
+                r_min = d;
+                h = k;
+            }
+        }
+        let r_au = r_min / au_in_gm();
+        let lum = luminosity_of(b, h).max(0.0);
+        if lum <= 0.0 {
+            continue;
+        }
+        let snow_line_au = 2.7 * lum.sqrt();
+        if r_au >= snow_line_au {
+            continue;
+        }
+        let flux = lum / (r_au * r_au).max(1e-9);
+        let rate = COMET_SUBLIMATE_FLUX_COEFF * flux;
+        let dm = (rate * b.m[i] * dt).min(COMET_MAX_FRAC_PER_STEP * b.m[i]);
+        if dm <= 0.0 {
+            continue;
+        }
+        let (x, y, vx, vy) = (b.x[i], b.y[i], b.vx[i], b.vy[i]);
+        let dx = b.x[i] - b.x[h];
+        let dy = b.y[i] - b.y[h];
+        let r = dx.hypot(dy).max(1e-9);
+        let (ux, uy) = (dx / r, dy / r); // anti-sunward
+        to_deposit.push((x, y, vx, vy, dm, ux, uy));
+        let new_m = b.m[i] - dm;
+        if new_m < COMET_DEAD_MASS {
+            to_kill.push(i);
+        } else {
+            mass_updates.push((i, new_m));
+        }
+    }
+
+    for (i, m) in mass_updates {
+        b.set_mass(i, m);
+    }
+    for (x, y, vx, vy, dm, ux, uy) in to_deposit {
+        // 0.02 reduces the ejection velocity to ~0.09 km/s (90 m/s).
+        // This allows the dust to retain the comet's orbital momentum,
+        // causing the tail to curve behind the comet rather than shoot
+        // out in a straight line.
+        dust::deposit(b, x, y, vx, vy, dm, Some((ux, uy)), 0.02);
+    }
+    let any_killed = !to_kill.is_empty();
+    for i in to_kill {
+        let text = format!("{} exhausted its volatiles", tag(b, i));
+        let (x, y) = (b.x[i], b.y[i]);
+        b.dead[i] = true;
+        b.log(EventKind::Comet, text, x, y);
+    }
+    if any_killed {
+        b.compact();
+    }
+}
+
 pub(super) fn cull_escaped(b: &mut Bodies) {
     let n = b.len();
     if n == 0 {
@@ -366,6 +472,7 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
     let cd2 = CULL_DIST * CULL_DIST;
     let hcd2 = HARD_CULL_DIST * HARD_CULL_DIST;
     let mut gone: Vec<usize> = Vec::new();
+    let mut promoted: Vec<usize> = Vec::new();
     for i in 0..n {
         if b.dead[i] || !matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
             continue;
@@ -375,22 +482,78 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
             continue;
         }
         let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
-        if d2 > hcd2
-            || (v2 > (2.0 * G * prim_m) / d2.sqrt() && b.x[i] * b.vx[i] + b.y[i] * b.vy[i] > 0.0)
-        {
+        // Hard-cull everything past the outer boundary. This applies
+        // regardless of origin, motion, or mass — it's the final
+        // safety net against unbounded accumulation.
+        if d2 > hcd2 {
             gone.push(i);
+            continue;
+        }
+        // Past CULL_DIST but inside HARD_CULL_DIST: cull unbound
+        // outbound bodies unless they are rogues (which we track the
+        // full distance), or heavy enough to *become* rogues.
+        let unbound_out =
+            v2 > (2.0 * G * prim_m) / d2.sqrt() && b.x[i] * b.vx[i] + b.y[i] * b.vy[i] > 0.0;
+        if !unbound_out {
+            continue;
+        }
+        match b.origin[i] {
+            BodyOrigin::RoguePlanet => {
+                // A rogue is tracked all the way to HARD_CULL_DIST so
+                // the user can watch it cross the outer system.
+            }
+            BodyOrigin::Interstellar => {
+                // ISOs cull at CULL_DIST — same threshold as Feature 7
+                // established. A real interstellar object is
+                // unobservable within a few tens of AU; tracking it to
+                // 6,680 AU would show nothing new. The `gone` loop's
+                // match below keeps its `EventKind::Interstellar` log
+                // kind, so the "left the system outbound" message is
+                // preserved.
+                gone.push(i);
+            }
+            _ => {
+                if b.m[i] >= ROGUE_MIN_MASS {
+                    // Heavy ejectee → promote to rogue, keep tracking.
+                    promoted.push(i);
+                } else {
+                    // Small ejectee → cull as before.
+                    gone.push(i);
+                }
+            }
         }
     }
-    if gone.is_empty() {
+    if gone.is_empty() && promoted.is_empty() {
         return;
     }
     mark_energy(b);
+    // Promotion comes first so its log entry precedes any subsequent
+    // cull (a body can't be both promoted and culled in one pass —
+    // promoted bodies are inside HARD_CULL_DIST).
+    for i in promoted {
+        b.origin[i] = BodyOrigin::RoguePlanet;
+        let (x, y) = (b.x[i], b.y[i]);
+        let text = format!("{} ejected into interstellar space", tag(b, i));
+        b.log(EventKind::Eject, text, x, y);
+    }
     for i in gone {
-        let text = format!("{} escaped the system", tag(b, i));
+        let (kind, text) = match b.origin[i] {
+            BodyOrigin::Interstellar => (
+                EventKind::Interstellar,
+                format!("{} left the system outbound", tag(b, i)),
+            ),
+            BodyOrigin::RoguePlanet => {
+                (EventKind::Escape, format!("{} left the system", tag(b, i)))
+            }
+            _ => (
+                EventKind::Escape,
+                format!("{} escaped the system", tag(b, i)),
+            ),
+        };
         let (x, y) = (b.x[i], b.y[i]);
         b.dead[i] = true;
         b.stats.escaped += 1;
-        b.log(EventKind::Escape, text, x, y);
+        b.log(kind, text, x, y);
     }
     b.compact();
 }

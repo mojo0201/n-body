@@ -462,8 +462,12 @@ pub(super) fn room(b: &Bodies, pending: usize) -> usize {
 }
 
 pub(super) fn combine_origin(keep: BodyOrigin, kill: BodyOrigin) -> BodyOrigin {
-    // Two debris bodies stay debris; two belt bodies stay in the belt.
-    if (keep.is_rubble() && kill.is_rubble()) || (keep.is_belt() && kill.is_belt()) {
+    // Two debris bodies stay debris; two belt bodies stay in the belt;
+    // two comets stay a comet. Anything mixed becomes a regular body.
+    if (keep.is_rubble() && kill.is_rubble())
+        || (keep.is_belt() && kill.is_belt())
+        || (keep.is_comet() && kill.is_comet())
+    {
         keep
     } else {
         BodyOrigin::Spawned
@@ -683,7 +687,16 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     // Dust source term: a bonus population, see `DUST_YIELD_FRAC`.
     let (dust_x, dust_y) = (b.x[rem], b.y[rem]);
     let (dust_vx, dust_vy) = (b.vx[rem], b.vy[rem]);
-    dust::deposit(b, dust_x, dust_y, dust_vx, dust_vy, md * DUST_YIELD_FRAC);
+    dust::deposit(
+        b,
+        dust_x,
+        dust_y,
+        dust_vx,
+        dust_vy,
+        md * DUST_YIELD_FRAC,
+        None,
+        1.0,
+    );
     let r_rem = b.contact_r(rem);
     let v_esc = (2.0 * G * m_rem / r_rem.max(1e-6)).sqrt();
     let disk_share = (m_disk / md).clamp(0.0, 1.0);

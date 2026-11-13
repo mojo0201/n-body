@@ -57,6 +57,82 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
     Some(moon)
 }
 
+/// Spawn an interstellar object inbound from `0.9 × CULL_DIST`.
+///
+/// The ISO is a small body (1e-9 to 1e-6 M⊕ ≈ 6 km to 65 km radius,
+/// the range that includes 1I/ʻOumuamua and 2I/Borisov) aimed at an
+/// impact parameter of 0.5–50 AU from the primary (log-uniform, so
+/// wide passes are more common than deep sun-grazers). It arrives with
+/// a speed 10 % above the primary's escape velocity at its start
+/// radius, so it is unbound — the trajectory is hyperbolic and the
+/// object will leave.
+///
+/// Logs `EventKind::Interstellar` "entered the system inbound" at the
+/// spawn position; `cull_escaped` logs "left the system outbound" when
+/// it eventually crosses `CULL_DIST` on the way out.
+///
+/// Returns `None` if `b` has no primary host (nothing to aim at) or
+/// `MAX_BODIES` is reached.
+///
+/// User-triggered — from a UI button or the `I` hotkey — so it draws
+/// from `b.rng` freely. Every subsequent user-triggered action sees a
+/// shifted stream, but `advance` never calls this, so no automatic
+/// test's RNG stream is affected.
+pub fn spawn_interstellar_object(b: &mut Bodies) -> Option<usize> {
+    let prim = primary_index(b)?;
+    if b.len() + 1 > MAX_BODIES {
+        return None;
+    }
+    let m_prim = b.m[prim];
+
+    // Start at 0.9 × CULL_DIST, at a random direction from the primary.
+    let r0 = 0.9 * CULL_DIST;
+    let theta = b.rng.next_f64() * std::f64::consts::TAU;
+    let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
+
+    // Aim at a point offset from the primary by `b_impact` in a random
+    // direction. Log-uniform 0.5 to 50 AU. The closest approach of the
+    // straight-line trajectory to the primary is approximately
+    // `b_impact` because b_impact << r0.
+    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
+    let b_impact = b_impact_au * au_in_gm();
+    let aim_theta = b.rng.next_f64() * std::f64::consts::TAU;
+    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
+    let (dx, dy) = (ax - sx, ay - sy);
+    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+    let (ux, uy) = (dx / d, dy / d);
+
+    // 10 % above the primary's escape speed at `r0`: bound orbit has
+    // E = 0, so E = 0.105 × v_esc² > 0 — unbound, leaves the system.
+    let v_esc = (2.0 * G * m_prim / r0).sqrt();
+    let v = 1.1 * v_esc;
+
+    // Mass: log-uniform 1e-9 to 1e-6 M⊕ (≈ 6 km to 65 km radius).
+    let m = 1e-9 * 10f64.powf(3.0 * b.rng.next_f64());
+    // Class: most ISOs are carbonaceous or silicaceous.
+    let class = match b.rng.next_f64() {
+        u if u < 0.50 => BodyClass::C,
+        u if u < 0.85 => BodyClass::S,
+        u if u < 0.95 => BodyClass::M,
+        _ => BodyClass::Icy,
+    };
+
+    let i = b.push(sx, sy, ux * v, uy * v, m, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::Interstellar;
+    b.class[i] = class;
+    b.bulk_density[i] = draw_density(&mut b.rng, class);
+    b.r[i] = b.radius_now(i);
+    b.name[i] = Some(format!("ISO-{}", b.id[i]));
+
+    let text = format!(
+        "{} entered the system inbound ({:.1} AU closest approach)",
+        tag(b, i),
+        b_impact_au
+    );
+    b.log(EventKind::Interstellar, text, sx, sy);
+    Some(i)
+}
+
 /// Add a 25-particle planetary ring between 1.4 and 2.6 planet radii.
 pub fn add_ring(b: &mut Bodies, i: usize, n: usize, rng: &mut XorShift) -> Vec<usize> {
     let mut out = Vec::new();
@@ -321,7 +397,8 @@ pub(in crate::physics) fn class_for(origin: BodyOrigin, a_au: f64, snow_line_au:
         | BodyOrigin::KuiperHot
         | BodyOrigin::KuiperResonant
         | BodyOrigin::KuiperScattered
-        | BodyOrigin::Trojan => BodyClass::Icy,
+        | BodyOrigin::Trojan
+        | BodyOrigin::Comet => BodyClass::Icy,
         BodyOrigin::Hilda => BodyClass::C,
         BodyOrigin::ImpactDebris
         | BodyOrigin::TidalDebris
@@ -333,6 +410,12 @@ pub(in crate::physics) fn class_for(origin: BodyOrigin, a_au: f64, snow_line_au:
                 BodyClass::Icy
             }
         }
+        // Not reached in practice — `spawn_interstellar_object` and
+        // `spawn_rogue_planet` draw a class directly so different
+        // visitors can be different compositions. Listed here only so
+        // this match stays exhaustive.
+        BodyOrigin::Interstellar => BodyClass::Rocky,
+        BodyOrigin::RoguePlanet => BodyClass::Icy,
     }
 }
 
@@ -586,4 +669,74 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u32) -> S
     rebase_energy(b);
     dust::init_fields(b, None);
     SystemInfo { binary }
+}
+
+/// Spawn a rogue planet inbound from `0.9 × CULL_DIST`.
+///
+/// Like `spawn_interstellar_object`, but at gas-giant mass (0.1 to 10
+/// M_Jup) — the range of free-floating planets detected by microlensing
+/// surveys. Same trajectory setup: starts inbound at `0.9 × CULL_DIST`,
+/// arrives 10 % above escape velocity, and passes the primary at an
+/// impact parameter of 0.5–50 AU (log-uniform).
+///
+/// Logs `EventKind::Interstellar` "entered the system inbound" (the
+/// arrival is the same event kind as an ISO arrival). The departure
+/// eventually logs `EventKind::Escape` at `HARD_CULL_DIST` (10× farther
+/// than an ISO — rogues are tracked longer because they're heavy enough
+/// to matter to outer-system dynamics).
+///
+/// Returns `None` if `b` has no primary host, or `MAX_BODIES` is reached.
+///
+/// User-triggered — from a UI button or hotkey — so it draws from
+/// `b.rng` freely. Not called from `advance`.
+pub fn spawn_rogue_planet(b: &mut Bodies) -> Option<usize> {
+    let prim = primary_index(b)?;
+    if b.len() + 1 > MAX_BODIES {
+        return None;
+    }
+    let m_prim = b.m[prim];
+
+    // Same geometry as `spawn_interstellar_object`: inbound from
+    // 0.9 × CULL_DIST, aimed at a random impact parameter. 6 RNG draws
+    // per call (theta, impact distance, impact angle, mass, class,
+    // density) — identical structure to the ISO spawner.
+    let r0 = 0.9 * CULL_DIST;
+    let theta = b.rng.next_f64() * std::f64::consts::TAU;
+    let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
+
+    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
+    let b_impact = b_impact_au * au_in_gm();
+    let aim_theta = b.rng.next_f64() * std::f64::consts::TAU;
+    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
+    let (dx, dy) = (ax - sx, ay - sy);
+    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+    let (ux, uy) = (dx / d, dy / d);
+
+    let v_esc = (2.0 * G * m_prim / r0).sqrt();
+    let v = 1.1 * v_esc;
+
+    // Mass: 0.1 to 10 M_Jup (log-uniform). Matches the free-floating
+    // planet mass range from microlensing (Sumi 2011, Mróz 2017).
+    let m = 0.1 * JUPITER_MASS * 100f64.powf(b.rng.next_f64());
+    // Rogue planets are overwhelmingly gas giants — almost always
+    // Icy class. Slight chance of a stripped super-Earth (Rocky).
+    let class = match b.rng.next_f64() {
+        u if u < 0.90 => BodyClass::Icy,
+        _ => BodyClass::Rocky,
+    };
+
+    let i = b.push(sx, sy, ux * v, uy * v, m, BodyKind::Planet);
+    b.origin[i] = BodyOrigin::RoguePlanet;
+    b.class[i] = class;
+    b.bulk_density[i] = 0.6 + 1.1 * b.rng.next_f64();
+    b.r[i] = b.radius_now(i);
+    b.name[i] = Some(format!("Rogue-{}", b.id[i]));
+
+    let text = format!(
+        "{} entered the system inbound ({:.1} AU closest approach)",
+        tag(b, i),
+        b_impact_au
+    );
+    b.log(EventKind::Interstellar, text, sx, sy);
+    Some(i)
 }

@@ -56,7 +56,12 @@ pub(super) struct Barycentre {
 /// If host `h` has a bound companion and body `i` is more than
 /// `CIRCUMBINARY_FACTOR` separations from their barycentre, return that
 /// barycentre.
-pub(super) fn circumbinary_frame(b: &Bodies, hosts: &[usize], h: usize, i: usize) -> Option<Barycentre> {
+pub(super) fn circumbinary_frame(
+    b: &Bodies,
+    hosts: &[usize],
+    h: usize,
+    i: usize,
+) -> Option<Barycentre> {
     let q = binary_partner_in(b, hosts, h)?;
     let sep = (b.x[q] - b.x[h]).hypot(b.y[q] - b.y[h]);
     let m = b.m[h] + b.m[q];
@@ -201,6 +206,12 @@ pub(super) fn find_parent_cached(b: &Bodies, i: usize, ctx: &ParentContext) -> O
     if b.origin[i].is_belt() {
         return None;
     }
+    if matches!(
+        b.origin[i],
+        BodyOrigin::Interstellar | BodyOrigin::RoguePlanet
+    ) {
+        return None;
+    }
     let mut host: Option<usize> = None;
     let mut best = f64::NEG_INFINITY;
     for &k in &ctx.hosts {
@@ -255,6 +266,17 @@ pub fn find_parent(b: &Bodies, i: usize) -> Option<usize> {
         return None;
     }
     if b.origin[i].is_belt() {
+        return None;
+    }
+    // Unbound visitors have no parent — they're on hyperbolic
+    // trajectories that pass through the system. Reporting the primary
+    // as a "parent" would make the UI show them as orbiting the star,
+    // which is misleading. `host_distance` falls back to the origin
+    // distance, which is the same value for a centred primary.
+    if matches!(
+        b.origin[i],
+        BodyOrigin::Interstellar | BodyOrigin::RoguePlanet
+    ) {
         return None;
     }
     let mut host: Option<usize> = None;

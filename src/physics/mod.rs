@@ -480,6 +480,12 @@ pub const TIDAL_MASS_RATIO: f64 = 20.0;
 
 pub const GIANT_MASS: f64 = 50.0;
 
+/// Minimum mass for an ejected body to be promoted to a rogue planet
+/// (rather than culled at `CULL_DIST` like escaped debris). Equal to
+/// `GIANT_MASS` — microlensing surveys detect free-floating planets
+/// in the gas-giant mass range, not smaller.
+pub const ROGUE_MIN_MASS: f64 = GIANT_MASS;
+
 pub const DISRUPT_KICK: f64 = 0.2;
 
 pub const DISRUPT_STEP: f64 = 2.6;
@@ -511,12 +517,18 @@ pub const DUST_YIELD_FRAC: f64 = 0.02;
 /// 1 AU in about 10 yr at 100.
 pub const PR_DRAG_BOOST: f64 = 100.0;
 
-/// Initial dust mass as a fraction of each belt or rubble body's mass.
 pub const DUST_TO_BELT_MASS: f64 = 0.3;
 
-/// The dust field is advanced every this many physics steps (with a
-/// matching `dt`): the drift per step is far below one cell.
 pub const DUST_STEP_INTERVAL: u64 = 16;
+
+pub const COMET_SUBLIMATE_FLUX_COEFF: f64 = 1e-3;
+
+/// Cap on the fraction of a comet's mass that can sublimate in one
+/// step, so a comet near the star doesn't disappear in a single tick.
+pub const COMET_MAX_FRAC_PER_STEP: f64 = 1e-4;
+
+/// A comet below this mass (M⊕) is treated as exhausted and removed.
+pub const COMET_DEAD_MASS: f64 = 1e-13;
 
 pub const HASH_THRESHOLD: usize = 64;
 
@@ -573,6 +585,18 @@ pub enum BodyOrigin {
     ImpactDebris,
     TidalDebris,
     BackgroundDebris,
+    /// A comet on a bound orbit (Halley, 67P, ...). Sublimates ice
+    /// when inside its host's snow line, feeding the dust field.
+    Comet,
+    /// An unbound body passing through the system. Spawned by the user
+    /// at the cull radius inbound; `cull_escaped` removes it on the way
+    /// out and logs "left the system" rather than "escaped".
+    Interstellar,
+    /// A planet-mass unbound body. Either authored into a preset, or
+    /// promoted from a heavy (`m >= ROGUE_MIN_MASS`) ejected planet.
+    /// Exempt from the `CULL_DIST` cull so it stays visible through the
+    /// outer system; culled at `HARD_CULL_DIST` like everything else.
+    RoguePlanet,
 }
 
 impl BodyOrigin {
@@ -593,6 +617,9 @@ impl BodyOrigin {
             self,
             BodyOrigin::ImpactDebris | BodyOrigin::TidalDebris | BodyOrigin::BackgroundDebris
         )
+    }
+    pub fn is_comet(self) -> bool {
+        self == BodyOrigin::Comet
     }
 }
 
@@ -695,6 +722,18 @@ pub enum EventKind {
     Escape,
     User,
     Evolve,
+    /// A comet was born, exhausted its volatiles, or was otherwise
+    /// destroyed by sublimation.
+    Comet,
+    /// An interstellar object entered or left the system. Kept distinct
+    /// from `Escape` so the log can colour the (rare, dramatic) events
+    /// differently from routine planet ejections.
+    Interstellar,
+    /// A heavy planet crossed `CULL_DIST` outbound and was promoted to
+    /// a rogue. The body isn't removed yet — it remains visible until
+    /// `HARD_CULL_DIST`. Logged separately from `Escape` so the user
+    /// can find the ejection event even after the body is gone.
+    Eject,
 }
 
 pub struct Event {

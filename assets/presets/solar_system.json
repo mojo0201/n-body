@@ -353,6 +353,24 @@
             "m_earth": 0.00278,
             "density_gcc": 2.52,
             "is_dwarf": true
+        },
+        {
+            "name": "67P/Churyumov-Gerasimenko",
+            "a_au": 3.463,
+            "e": 0.641,
+            "m_earth": 1.67e-12,
+            "density_gcc": 0.53,
+            "origin": "comet",
+            "phase": 0.0
+        },
+        {
+            "name": "1P/Halley",
+            "a_au": 17.834,
+            "e": 0.967,
+            "m_earth": 3.68e-11,
+            "density_gcc": 0.6,
+            "origin": "comet",
+            "phase": 0.0
         }
     ],
     "belts": {

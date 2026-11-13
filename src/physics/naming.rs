@@ -79,6 +79,9 @@ pub fn class_name(b: &Bodies, i: usize) -> String {
             BodyOrigin::ImpactDebris => "fragment".to_string(),
             BodyOrigin::TidalDebris => "tidal fragment".to_string(),
             BodyOrigin::BackgroundDebris => "debris".to_string(),
+            BodyOrigin::Comet => "comet".to_string(),
+            BodyOrigin::Interstellar => "interstellar object".to_string(),
+            BodyOrigin::RoguePlanet => "rogue planet".to_string(),
             BodyOrigin::Spawned => {
                 if b.kind[i] == BodyKind::Planet {
                     planet_class(b.m[i]).to_string()

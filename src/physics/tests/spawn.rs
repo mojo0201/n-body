@@ -266,7 +266,7 @@ fn aa_random_systems_ring_and_count() {
 fn solar_preset_loads_at_present_age() {
     let preset = solar_system_preset();
     assert_eq!(preset.name, "Solar System");
-    assert_eq!(preset.planets.len(), 19);
+    assert_eq!(preset.planets.len(), 21);
     let mut b = Bodies::with_capacity(0);
     spawn_solar_system(&mut b);
     // Belt bodies now join the 9 (Sun + 8 planets). The exact count
@@ -931,4 +931,83 @@ fn hierarchical_stars_respect_stability_limit() {
             );
         }
     }
+}
+
+#[test]
+fn spawn_interstellar_object_is_inbound_and_logged() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let n = spawn_interstellar_object(&mut b).expect("ISO should spawn");
+    assert_eq!(b.origin[n], BodyOrigin::Interstellar);
+    // Starts near 0.9 × CULL_DIST from the primary.
+    let r0 = (b.x[n] * b.x[n] + b.y[n] * b.y[n]).sqrt();
+    assert!(
+        (r0 - 0.9 * CULL_DIST).abs() < 1e-6 * CULL_DIST,
+        "ISO start radius {} vs 0.9 × CULL_DIST",
+        r0
+    );
+    // Inbound: velocity dotted with the outward radial vector is negative.
+    let (dx, dy) = (b.x[n] - b.x[0], b.y[n] - b.y[0]);
+    let (vx, vy) = (b.vx[n] - b.vx[0], b.vy[n] - b.vy[0]);
+    assert!(
+        dx * vx + dy * vy < 0.0,
+        "ISO must be inbound: r·v = {}",
+        dx * vx + dy * vy
+    );
+    // Unbound relative to the primary: specific orbital energy > 0.
+    let v2 = vx * vx + vy * vy;
+    let r = (dx * dx + dy * dy).sqrt();
+    let e_spec = 0.5 * v2 - G * b.m[0] / r;
+    assert!(e_spec > 0.0, "ISO must be unbound: E = {}", e_spec);
+    // Logged as "entered".
+    assert!(
+        b.events
+            .iter()
+            .any(|e| { matches!(e.kind, EventKind::Interstellar) && e.text.contains("entered") }),
+        "ISO entry must be logged (no Interstellar event found)"
+    );
+}
+
+#[test]
+fn spawn_rogue_planet_is_heavy_and_inbound() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let n = spawn_rogue_planet(&mut b).expect("rogue should spawn");
+    assert_eq!(b.origin[n], BodyOrigin::RoguePlanet);
+    assert!(
+        b.m[n] >= ROGUE_MIN_MASS,
+        "rogue mass {} below threshold {}",
+        b.m[n],
+        ROGUE_MIN_MASS
+    );
+    assert!(
+        b.m[n] <= 10.0 * JUPITER_MASS,
+        "rogue mass {} above upper bound",
+        b.m[n]
+    );
+    let r0 = (b.x[n] * b.x[n] + b.y[n] * b.y[n]).sqrt();
+    assert!(
+        (r0 - 0.9 * CULL_DIST).abs() < 1e-6 * CULL_DIST,
+        "rogue start radius {} vs 0.9 × CULL_DIST",
+        r0
+    );
+    let (dx, dy) = (b.x[n] - b.x[0], b.y[n] - b.y[0]);
+    let (vx, vy) = (b.vx[n] - b.vx[0], b.vy[n] - b.vy[0]);
+    assert!(dx * vx + dy * vy < 0.0, "rogue must be inbound");
+    let v2 = vx * vx + vy * vy;
+    let r = (dx * dx + dy * dy).sqrt();
+    assert!(0.5 * v2 - G * b.m[0] / r > 0.0, "rogue must be unbound");
+}
+
+#[test]
+fn rogue_planet_is_not_a_moon() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let n = spawn_rogue_planet(&mut b).expect("rogue should spawn");
+    b.refresh_parent_cache();
+    assert_eq!(
+        find_parent(&b, n),
+        None,
+        "rogue must not report a parent — it's unbound"
+    );
 }
