@@ -16,7 +16,7 @@ pub(in crate::physics) const BELT_TRACER_SCALE: f64 = 500.0;
 
 /// Smallest mass a single tracer may carry (M⊕). Below this, the
 /// "tracer" is sub-Ceres and not worth simulating.
-pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-13;
+pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-4;
 
 /// Largest mass a single tracer may carry (M⊕). Prevents a heavy belt
 /// from producing body-scale collisions that dominate the dynamics.
