@@ -45,7 +45,10 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
         m_moon,
         BodyKind::Planet,
     );
-    b.bulk_density[moon] = draw_density(rng, false);
+    // The moon inherits the parent planet's class: the Moon is Rocky,
+    // Ganymede is Icy. Same rule everywhere moons are added.
+    b.class[moon] = b.class[i];
+    b.bulk_density[moon] = draw_density(rng, b.class[moon]);
     b.r[moon] = b.radius_now(moon);
     b.parent_cache_valid = false;
     let (x, y) = (b.x[moon], b.y[moon]);
@@ -82,7 +85,9 @@ pub fn add_ring(b: &mut Bodies, i: usize, n: usize, rng: &mut XorShift) -> Vec<u
             BodyKind::Planet,
         );
         b.origin[k] = BodyOrigin::ImpactDebris;
-        b.bulk_density[k] = draw_density(rng, false);
+        // Rings are icy — Saturn's is > 95 % water ice by mass.
+        b.class[k] = BodyClass::Icy;
+        b.bulk_density[k] = draw_density(rng, b.class[k]);
         b.r[k] = b.radius_now(k);
         b.parent_cache_valid = false;
         out.push(k);
@@ -143,7 +148,13 @@ pub(super) fn draw_masses_to_total(
     v
 }
 
-pub(super) fn spacing_range(n: usize, a_min: f64, a_max: f64, base_lo: f64, base_hi: f64) -> (f64, f64) {
+pub(super) fn spacing_range(
+    n: usize,
+    a_min: f64,
+    a_max: f64,
+    base_lo: f64,
+    base_hi: f64,
+) -> (f64, f64) {
     if n <= 1 {
         return (base_lo, base_hi);
     }
@@ -231,12 +242,16 @@ pub(super) fn spawn_planet(
     rng: &mut XorShift,
 ) -> usize {
     let i = push_kepler_about(b, centre, a_gm, e, m, rng, kind);
-    b.bulk_density[i] = if m >= GIANT_DENSITY_M_MIN {
-        // Gas giants: 0.6 (Saturn) to 1.7 (Neptune) g/cm³, at any distance.
-        0.6 + 1.1 * rng.next_f64()
+    if m >= GIANT_DENSITY_M_MIN {
+        // Gas giants are Icy for colour purposes; `render.rs` checks
+        // mass and origin to give them the tan gas-giant look.
+        b.class[i] = BodyClass::Icy;
+        b.bulk_density[i] = 0.6 + 1.1 * rng.next_f64();
     } else {
-        draw_density(rng, (a_gm / au_in_gm()) < snow_line_au)
-    };
+        let a_au = a_gm / au_in_gm();
+        b.class[i] = class_for(BodyOrigin::Spawned, a_au, snow_line_au);
+        b.bulk_density[i] = draw_density(rng, b.class[i]);
+    }
     b.r[i] = b.radius_now(i);
     i
 }
@@ -244,12 +259,51 @@ pub(super) fn spawn_planet(
 /// Planets at or above this mass (Earth masses) get gas-giant densities.
 pub(super) const GIANT_DENSITY_M_MIN: f64 = 50.0;
 
-/// Bulk density in g/cm³: rocky inside the snow line, icy outside.
-pub(super) fn draw_density(rng: &mut XorShift, inside_snow: bool) -> f64 {
-    if inside_snow {
-        2.5 + 3.0 * rng.next_f64()
-    } else {
-        0.5 + 2.0 * rng.next_f64()
+/// Pick a taxonomic class for a new body. Deterministic — takes no RNG,
+/// so the RNG stream (and therefore every belt-body position, velocity
+/// and the whole simulation) is unchanged from before this feature.
+///
+/// Real asteroid belts show S-type in the inner main belt and C-type in
+/// the outer; Kuiper and Trojan bodies are ice-dominated. Using the
+/// body's own orbital distance is more physically faithful than a random
+/// draw anyway.
+pub(in crate::physics) fn class_for(origin: BodyOrigin, a_au: f64, snow_line_au: f64) -> BodyClass {
+    match origin {
+        BodyOrigin::AsteroidBelt => {
+            if a_au < 2.5 {
+                BodyClass::S
+            } else {
+                BodyClass::C
+            }
+        }
+        BodyOrigin::KuiperCold
+        | BodyOrigin::KuiperHot
+        | BodyOrigin::KuiperResonant
+        | BodyOrigin::KuiperScattered
+        | BodyOrigin::Trojan => BodyClass::Icy,
+        BodyOrigin::Hilda => BodyClass::C,
+        BodyOrigin::ImpactDebris
+        | BodyOrigin::TidalDebris
+        | BodyOrigin::BackgroundDebris
+        | BodyOrigin::Spawned => {
+            if a_au < snow_line_au {
+                BodyClass::Rocky
+            } else {
+                BodyClass::Icy
+            }
+        }
+    }
+}
+
+/// Bulk density in g/cm³ for a body of the given class.
+pub(super) fn draw_density(rng: &mut XorShift, class: BodyClass) -> f64 {
+    match class {
+        BodyClass::C => 1.2 + 0.8 * rng.next_f64(),
+        BodyClass::S => 2.4 + 1.0 * rng.next_f64(),
+        BodyClass::M => 5.0 + 3.0 * rng.next_f64(),
+        BodyClass::V => 2.9 + 0.5 * rng.next_f64(),
+        BodyClass::Icy => 0.5 + 2.0 * rng.next_f64(),
+        BodyClass::Rocky => 2.5 + 3.0 * rng.next_f64(),
     }
 }
 

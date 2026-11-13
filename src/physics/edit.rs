@@ -43,6 +43,9 @@ pub fn set_kind(b: &mut Bodies, i: usize, kind: BodyKind) {
     };
     b.kind[i] = kind;
     b.origin[i] = BodyOrigin::Spawned;
+    // `set_kind` takes no RNG; reset to a fixed class so the result is
+    // deterministic.
+    b.class[i] = BodyClass::Rocky;
     b.bulk_density[i] = default_bulk_density(kind, new_m);
     b.m_init[i] = new_m;
     b.age_gyr[i] = default_age_gyr(kind);

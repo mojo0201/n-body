@@ -596,6 +596,24 @@ impl BodyOrigin {
     }
 }
 
+/// Taxonomic class of a small body. Drives colour in `render.rs` and the
+/// bulk density at spawn time. Stars and remnants ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyClass {
+    /// Carbonaceous — dark, ~75 % of asteroids.
+    C,
+    /// Silicaceous — stony, ~17 % of asteroids.
+    S,
+    /// Metallic — iron-nickel.
+    M,
+    /// Basaltic / volcanic — Vesta family.
+    V,
+    /// Water-ice dominated (Kuiper, Trojan, icy moons).
+    Icy,
+    /// Silicate rock (inner planets, Moon, Ceres).
+    Rocky,
+}
+
 fn is_host_kind(k: BodyKind) -> bool {
     matches!(
         k,
@@ -733,6 +751,9 @@ pub struct Bodies {
     pub origin: Vec<BodyOrigin>,
     /// Bulk density in g/cm³ (planets and dwarf planets).
     pub bulk_density: Vec<f64>,
+    /// Taxonomic class. Drives colour in `render.rs` and the bulk
+    /// density at spawn time. Meaningless for stars and remnants.
+    pub class: Vec<BodyClass>,
     pub rung: Vec<u8>,
     pub dtl: Vec<f64>,
     pub spin: Vec<f64>,
@@ -779,6 +800,7 @@ impl Bodies {
             imm: Vec::with_capacity(n),
             origin: Vec::with_capacity(n),
             bulk_density: Vec::with_capacity(n),
+            class: Vec::with_capacity(n),
             rung: Vec::with_capacity(n),
             dtl: Vec::with_capacity(n),
             spin: Vec::with_capacity(n),
@@ -846,6 +868,7 @@ impl Bodies {
         self.imm.push(0.0);
         self.origin.push(BodyOrigin::Spawned);
         self.bulk_density.push(rho_default);
+        self.class.push(BodyClass::Rocky);
         self.rung.push(MAX_RUNG);
         self.dtl.push(f64::INFINITY);
         self.spin.push(0.0);
@@ -934,6 +957,7 @@ impl Bodies {
                 self.imm[write] = self.imm[read];
                 self.origin[write] = self.origin[read];
                 self.bulk_density[write] = self.bulk_density[read];
+                self.class[write] = self.class[read];
                 self.rung[write] = self.rung[read];
                 self.dtl[write] = self.dtl[read];
                 self.spin[write] = self.spin[read];
@@ -964,6 +988,7 @@ impl Bodies {
         self.imm.truncate(write);
         self.origin.truncate(write);
         self.bulk_density.truncate(write);
+        self.class.truncate(write);
         self.rung.truncate(write);
         self.dtl.truncate(write);
         self.spin.truncate(write);

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::physics::{self, Bodies, BodyKind, BodyOrigin};
+use crate::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
 
 /// Fields the dust centre uniform can hold. Must match `DustFields` in the WGSL.
 pub const MAX_DUST_FIELDS: usize = 128;
@@ -158,25 +158,24 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
         BodyKind::NeutronStar => [1.0, 0.95, 0.85],
         BodyKind::BlackHole => [1.0, 0.35, 0.35],
         BodyKind::Planet | BodyKind::DwarfPlanet => {
-            match b.origin[i] {
-                BodyOrigin::AsteroidBelt => return [0.45, 0.42, 0.40],
-                BodyOrigin::KuiperCold => return [0.55, 0.60, 0.75],
-                BodyOrigin::KuiperHot => return [0.65, 0.55, 0.70],
-                BodyOrigin::KuiperResonant => return [0.55, 0.65, 0.55],
-                BodyOrigin::KuiperScattered => return [0.40, 0.35, 0.55],
-                BodyOrigin::Trojan => return [0.75, 0.70, 0.45],
-                BodyOrigin::Hilda => return [0.55, 0.65, 0.50],
-                BodyOrigin::ImpactDebris
-                | BodyOrigin::TidalDebris
-                | BodyOrigin::BackgroundDebris => return [0.55, 0.55, 0.58],
-                BodyOrigin::Spawned => {}
+            // A spawned body past 50 M⊕ is a gas giant — keep the tan
+            // look instead of the pale-blue Icy class colour.
+            if b.m[i] >= 50.0 && b.origin[i] == BodyOrigin::Spawned {
+                return [0.85, 0.75, 0.60];
             }
-            if b.kind[i] == BodyKind::DwarfPlanet {
-                return [0.55, 0.45, 0.35];
+            match b.class[i] {
+                BodyClass::C => [0.30, 0.28, 0.26],   // carbonaceous: dark gray
+                BodyClass::S => [0.55, 0.50, 0.42],   // silicaceous: tan-gray
+                BodyClass::M => [0.60, 0.60, 0.62],   // metallic: silvery
+                BodyClass::V => [0.55, 0.45, 0.35],   // basaltic: brown
+                BodyClass::Icy => [0.68, 0.78, 0.88], // ice: pale blue-white
+                BodyClass::Rocky => {
+                    // Inner planets keep the existing distance tint.
+                    let d = physics::host_distance(b, i) as f32;
+                    let t = (d / 800.0).clamp(0.0, 1.0);
+                    [0.4 + 0.4 * t, 0.6, 1.0 - 0.5 * t]
+                }
             }
-            let d = physics::host_distance(b, i) as f32;
-            let t = (d / 800.0).clamp(0.0, 1.0);
-            [0.4 + 0.4 * t, 0.6, 1.0 - 0.5 * t]
         }
     }
 }

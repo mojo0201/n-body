@@ -2,7 +2,12 @@
 
 use super::*;
 
-pub(in crate::physics) fn spawn_architecture(b: &mut Bodies, prim: usize, remaining: usize, rng: &mut XorShift) {
+pub(in crate::physics) fn spawn_architecture(
+    b: &mut Bodies,
+    prim: usize,
+    remaining: usize,
+    rng: &mut XorShift,
+) {
     match b.kind[prim] {
         BodyKind::Star | BodyKind::BrownDwarf => {
             let au = au_in_gm();
@@ -77,7 +82,12 @@ pub(in crate::physics) fn fit_range(lo: f64, hi: f64, a_lo: f64, a_hi: f64) -> (
     }
 }
 
-pub(in crate::physics) fn spawn_ms_frame(b: &mut Bodies, fr: &Frame, remaining: usize, rng: &mut XorShift) {
+pub(in crate::physics) fn spawn_ms_frame(
+    b: &mut Bodies,
+    fr: &Frame,
+    remaining: usize,
+    rng: &mut XorShift,
+) {
     let au = au_in_gm();
     let m_sun = fr.m_class_sun;
     let inner_au = fr.inner_au;
@@ -312,7 +322,9 @@ pub(in crate::physics) fn spawn_ms_frame(b: &mut Bodies, fr: &Frame, remaining: 
                 m_moon,
                 BodyKind::Planet,
             );
-            b.bulk_density[moon_idx] = draw_density(rng, false); // icy
+            // Moons inherit the giant's class, so they stay Icy.
+            b.class[moon_idx] = b.class[giant_idx];
+            b.bulk_density[moon_idx] = draw_density(rng, b.class[moon_idx]);
             b.r[moon_idx] = b.radius_now(moon_idx);
             moons_spawned += 1;
         }
@@ -346,7 +358,12 @@ pub(in crate::physics) fn spawn_ms_frame(b: &mut Bodies, fr: &Frame, remaining: 
 
 /// A white dwarf, neutron star or black hole: sometimes a scattered belt of
 /// leftover bodies, and background debris for the rest of the budget.
-pub(in crate::physics) fn spawn_evolved_system(b: &mut Bodies, prim: usize, remaining: usize, rng: &mut XorShift) {
+pub(in crate::physics) fn spawn_evolved_system(
+    b: &mut Bodies,
+    prim: usize,
+    remaining: usize,
+    rng: &mut XorShift,
+) {
     let m_sun = b.m[prim] / M_SUN_ME;
     let spec = belt_spec_for_evolved(m_sun, b.age_gyr[prim], rng);
     let centre = (b.x[prim], b.y[prim], b.vx[prim], b.vy[prim], b.m[prim]);

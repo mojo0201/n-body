@@ -749,9 +749,14 @@ pub(super) fn spawn_from_preset_seeded(
         if p.is_dwarf {
             apply_dwarf_flag(b, idx, &mut warnings);
         }
+        // The planet's class comes from where it sits relative to the
+        // star's snow line. Preset `density_gcc` still wins when given,
+        // so the Moon, Io, Ganymede etc. keep their real radii.
+        b.class[idx] = class_for(BodyOrigin::Spawned, p.a_au, snow_line);
+        let cls = b.class[idx];
         let rho = p
             .density_gcc
-            .unwrap_or_else(|| draw_density(&mut b.rng, p.a_au < snow_line));
+            .unwrap_or_else(|| draw_density(&mut b.rng, cls));
         b.bulk_density[idx] = rho;
         b.r[idx] = b.radius_now(idx);
 
@@ -762,9 +767,13 @@ pub(super) fn spawn_from_preset_seeded(
             if moon.is_dwarf {
                 apply_dwarf_flag(b, mi, &mut warnings);
             }
+            // Moons inherit the parent planet's class, so the Moon is
+            // Rocky but Ganymede is Icy.
+            b.class[mi] = b.class[idx];
+            let mcls = b.class[mi];
             b.bulk_density[mi] = moon
                 .density_gcc
-                .unwrap_or_else(|| draw_density(&mut b.rng, false));
+                .unwrap_or_else(|| draw_density(&mut b.rng, mcls));
             b.r[mi] = b.radius_now(mi);
         }
     }
@@ -806,6 +815,7 @@ pub(super) fn append_system(dst: &mut Bodies, src: &Bodies, cx: f64, cy: f64) ->
         );
         dst.origin[idx] = src.origin[i];
         dst.bulk_density[idx] = src.bulk_density[i];
+        dst.class[idx] = src.class[i];
         dst.age_gyr[idx] = src.age_gyr[i];
         dst.m_init[idx] = src.m_init[i];
         dst.spin[idx] = src.spin[i];

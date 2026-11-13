@@ -189,7 +189,9 @@ pub(in crate::physics) fn spawn_belt_body(
     let kind = classify_small_body(m);
     let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
     b.origin[i] = origin;
-    b.bulk_density[i] = draw_density(rng, (a_gm / au_in_gm()) < snow_line_au);
+    let a_au = a_gm / au_in_gm();
+    b.class[i] = class_for(origin, a_au, snow_line_au);
+    b.bulk_density[i] = draw_density(rng, b.class[i]);
     b.r[i] = b.radius_now(i);
     i
 }
@@ -265,7 +267,9 @@ pub(in crate::physics) fn spawn_trojan(
     let kind = classify_small_body(m);
     let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
     b.origin[i] = BodyOrigin::Trojan;
-    b.bulk_density[i] = draw_density(rng, true);
+    // Trojan clouds are icy planetesimals trapped at L4/L5.
+    b.class[i] = BodyClass::Icy;
+    b.bulk_density[i] = draw_density(rng, b.class[i]);
     b.r[i] = b.radius_now(i);
     i
 }
