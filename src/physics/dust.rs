@@ -24,7 +24,7 @@ pub const DUST_GRAINS_PER_BODY: usize = 60;
 /// Hard cap per field.
 pub const DUST_MAX_GRAINS: usize = 500_000;
 /// Tracers emitted by one collision.
-pub const DUST_EMIT_GRAINS: usize = 40;
+pub const DUST_EMIT_GRAINS: usize = 80;
 /// Ejection speed of collision dust, as a fraction of local circular speed.
 pub const DUST_EJECT_FRAC: f64 = 0.15;
 /// Grain size range in micrometres (log-uniform). The blow-out size for the
@@ -327,7 +327,7 @@ impl DustField {
                 let (bx, by) = (base_x / base_len, base_y / base_len);
 
                 // 3. Random cone spread makes the tail fan out.
-                let spread = 0.4;
+                let spread = 0.8;
                 let ang = sample_normal(rng, 0.0, spread * 0.5);
                 let (sa, ca) = ang.sin_cos();
                 let tx = bx * ca - by * sa;

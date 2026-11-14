@@ -53,16 +53,20 @@ pub struct CameraUniform {
     _pad1: [f32; 2],
 }
 
-/// One body as an instanced quad. Offsets: pos 0, radius 8, color 16;
-/// stride 32 (`vec3` needs 16-byte alignment, hence the pads).
+/// One body as an instanced quad. Offsets: pos 0, radius 8, lit 12,
+/// color 16, light_angle 28; stride 32 (`vec3` needs 16-byte alignment).
+///
+/// `lit` is 1 for a body that a star lights (planets) and 0 for a body that
+/// shines or is not shaded. `light_angle` is the direction from the body to
+/// its star, in world axes, in radians.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct BodyInstance {
     pub pos: [f32; 2],
     pub radius: f32,
-    _pad0: f32,
+    pub lit: f32,
     pub color: [f32; 3],
-    _pad1: f32,
+    pub light_angle: f32,
 }
 
 /// One endpoint of an orbit or trail segment (`Unorm8x4` colour), stride 12.
@@ -107,9 +111,76 @@ pub struct OrbitReq {
     pub viewport: [f32; 2],
 }
 
+/// One glow halo around a luminous body. `pos` is camera-relative (same
+/// convention as `BodyInstance`), `radius` is the outer edge of the halo
+/// (not the body radius), `intensity` scales the peak alpha, and `color`
+/// is the body's blackbody tint.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GlowInstance {
+    pub pos: [f32; 2],
+    pub radius: f32,
+    pub intensity: f32,
+    pub color: [f32; 3],
+    pub _pad: f32,
+}
+
+/// One black hole. `pos` is camera-relative. `radius` is the event horizon.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct BlackHoleInstance {
+    pub pos: [f32; 2],
+    pub radius: f32,
+    pub _pad: f32,
+}
+
+/// Radius of the black shadow in horizon radii: 3·sqrt(3)/2. A distant
+/// observer sees this disc, not the horizon itself, because light bends.
+/// The shader traces rays and uses the same number (`BH_B_CRIT`).
+const BH_SHADOW_IN_RS: f64 = 2.598_076;
+
+/// Glow strength factor from luminosity `l` in L☉. A log scale: 1 at the
+/// Sun, about 0.6 at 0.01 L☉, about 1.4 at 100 L☉. Clamped so a very dim
+/// body keeps a faint halo and a very bright one does not wash out.
+fn glow_luminosity_factor(l: f64) -> f64 {
+    if !l.is_finite() || l <= 0.0 {
+        return 0.25;
+    }
+    (1.0 + 0.2 * l.log10()).clamp(0.25, 1.8)
+}
+
 // ---------------------------------------------------------------------------
 // Colors
 // ---------------------------------------------------------------------------
+
+/// Approximate sRGB color of a blackbody at `t_kelvin`, normalized to
+/// [0, 1]. Tanner Helland's fit, accurate to a few percent over 1000 K
+/// .. 40,000 K. Outside that range the endpoints are clamped — deeper
+/// red than 1000 K can't be expressed in sRGB, and above 40,000 K the
+/// eye can't distinguish further blue-shift.
+fn blackbody_to_rgb(t_kelvin: f64) -> [f32; 3] {
+    let t = (t_kelvin / 100.0).clamp(10.0, 400.0);
+    let (r, g, b) = if t <= 66.0 {
+        let r = 255.0;
+        let g = 99.4708025861 * t.ln() - 161.1195681661;
+        let b = if t <= 19.0 {
+            0.0
+        } else {
+            138.5177312231 * (t - 10.0).ln() - 305.0447927307
+        };
+        (r, g, b)
+    } else {
+        let r = 329.698727446 * (t - 60.0).powf(-0.1332047592);
+        let g = 288.1221695283 * (t - 60.0).powf(-0.0755148492);
+        let b = 255.0;
+        (r, g, b)
+    };
+    [
+        (r.clamp(0.0, 255.0) / 255.0) as f32,
+        (g.clamp(0.0, 255.0) / 255.0) as f32,
+        (b.clamp(0.0, 255.0) / 255.0) as f32,
+    ]
+}
 
 /// Color for a body, by kind + subclass. Stars use spectral class (giants are
 /// red), brown dwarfs their temperature class, remnants fixed colours.
@@ -125,23 +196,35 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
                     _ => {}
                 }
             }
-            match physics::star_class(b.m[i]) {
-                'M' => [1.0, 0.62, 0.45],
-                'K' => [1.0, 0.78, 0.55],
-                'G' => [1.0, 0.95, 0.75],
-                'F' => [1.0, 1.0, 0.92],
-                'A' => [0.85, 0.9, 1.0],
-                _ => [0.65, 0.75, 1.0],
+
+            let t = physics::temperature_of(b, i);
+            if t.is_finite() && t > 0.0 {
+                blackbody_to_rgb(t)
+            } else {
+                // Fallback for degenerate cases (temperature not
+                // available for this body).
+                match physics::star_class(b.m[i]) {
+                    'M' => [1.0, 0.62, 0.45],
+                    'K' => [1.0, 0.78, 0.55],
+                    'G' => [1.0, 0.95, 0.75],
+                    'F' => [1.0, 1.0, 0.92],
+                    'A' => [0.85, 0.9, 1.0],
+                    _ => [0.65, 0.75, 1.0],
+                }
             }
         }
         BodyKind::BrownDwarf => {
             let t = physics::bd_state(b.m[i], b.age_gyr[i]).temperature;
-            match physics::bd_class_for_temp(t) {
-                'M' => [0.85, 0.35, 0.15],
-                'L' => [0.75, 0.25, 0.10],
-                'T' => [0.55, 0.15, 0.08],
-                'Y' => [0.35, 0.10, 0.05],
-                _ => [0.6, 0.2, 0.1],
+            if t.is_finite() && t > 0.0 {
+                blackbody_to_rgb(t)
+            } else {
+                match physics::bd_class_for_temp(t) {
+                    'M' => [0.85, 0.35, 0.15],
+                    'L' => [0.75, 0.25, 0.10],
+                    'T' => [0.55, 0.15, 0.08],
+                    'Y' => [0.35, 0.10, 0.05],
+                    _ => [0.6, 0.2, 0.1],
+                }
             }
         }
         BodyKind::WhiteDwarf => [0.90, 0.92, 1.0],
@@ -222,9 +305,9 @@ impl BodyInstance {
             return Self {
                 pos: [1e12, 1e12],
                 radius: 0.0,
-                _pad0: 0.0,
+                lit: 0.0,
                 color: [0.0; 3],
-                _pad1: 0.0,
+                light_angle: 0.0,
             };
         }
         let z = zoom.max(1e-6);
@@ -260,10 +343,21 @@ impl BodyInstance {
         Self {
             pos: [x as f32, y as f32],
             radius: disp_r,
-            _pad0: 0.0,
+            lit: 0.0,
             color,
-            _pad1: 0.0,
+            light_angle: 0.0,
         }
+    }
+
+    /// Shade this body as a sphere lit by a star at `angle` radians (world
+    /// axes, pointing from the body to the star). Planets use this.
+    #[inline]
+    pub fn with_light(mut self, angle: f64) -> Self {
+        if angle.is_finite() {
+            self.lit = 1.0;
+            self.light_angle = angle as f32;
+        }
+        self
     }
 }
 
@@ -300,6 +394,10 @@ pub struct Renderer {
     instance_capacity: u64,
     body_count: u32,
     instance_scratch: Vec<BodyInstance>,
+    // Per-frame light sources (x, y, luminosity in L☉) and per-body
+    // luminosity. Kept between frames to avoid new allocations.
+    light_scratch: Vec<(f64, f64, f64)>,
+    lum_scratch: Vec<f64>,
 
     // Orbit lines.
     orbit_pipeline: wgpu::RenderPipeline,
@@ -318,6 +416,12 @@ pub struct Renderer {
     comet_tail_buf: wgpu::Buffer,
     comet_tail_capacity: u64,
     comet_tail_vert_count: u32,
+
+    glow_pipeline: wgpu::RenderPipeline,
+    glow_buf: wgpu::Buffer,
+    glow_capacity: u64,
+    glow_count: u32,
+    glow_scratch: Vec<GlowInstance>,
 
     // Flashes.
     flash_pipeline: wgpu::RenderPipeline,
@@ -350,6 +454,13 @@ pub struct Renderer {
     dust_last_upload: Instant,
     /// Camera-relative centre per slot, uploaded every frame.
     dust_centres: Vec<[f32; 4]>,
+
+    // Black holes (event horizon + accretion disk).
+    blackhole_pipeline: wgpu::RenderPipeline,
+    blackhole_buf: wgpu::Buffer,
+    blackhole_capacity: u64,
+    blackhole_count: u32,
+    blackhole_scratch: Vec<BlackHoleInstance>,
 }
 
 impl Renderer {
@@ -396,11 +507,23 @@ impl Renderer {
         };
         let camera_bg = mk_bg("camera-bg", &camera_buf);
         let orbit_camera_bg = mk_bg("orbit-camera-bg", &orbit_camera_buf);
+        let _pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline-layout"),
+            bind_group_layouts: &[&camera_layout],
+            push_constant_ranges: &[],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
             bind_group_layouts: &[&camera_layout],
             push_constant_ranges: &[],
         });
+
+        let msaa_state = wgpu::MultisampleState {
+            count: 4,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        };
 
         let blend_target = |format| {
             Some(wgpu::ColorTargetState {
@@ -427,9 +550,20 @@ impl Renderer {
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
-                    // Offset 16, not 12: `_pad0` keeps `color` 16-aligned.
+                    // Offset 16, not 12: `lit` fills the gap and keeps
+                    // `color` 16-aligned.
                     offset: 16,
                     shader_location: 2,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 12,
+                    shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 28,
+                    shader_location: 4,
                 },
             ],
         };
@@ -453,7 +587,7 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: msaa_state,
             multiview: None,
             cache: None,
         });
@@ -495,11 +629,10 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: msaa_state,
             multiview: None,
             cache: None,
         });
-
         // ---- Flash pipeline ----
         let flash_instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<FlashInstance>() as u64,
@@ -542,7 +675,7 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: msaa_state,
             multiview: None,
             cache: None,
         });
@@ -642,11 +775,10 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: msaa_state,
             multiview: None,
             cache: None,
         });
-
         // ---- Comet pipeline: orbit vertex format, triangles, additive ----
         let comet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("comet-pipeline"),
@@ -672,10 +804,112 @@ impl Renderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: msaa_state,
             multiview: None,
             cache: None,
         });
+
+        // ---- Glow pipeline: additive soft quads behind bodies ----
+        let glow_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GlowInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 8,
+                    shader_location: 1,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 12,
+                    shader_location: 2,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 16,
+                    shader_location: 3,
+                },
+            ],
+        };
+        let glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glow-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_glow",
+                buffers: &[glow_instance_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_glow",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(additive),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: msaa_state,
+            multiview: None,
+            cache: None,
+        });
+
+        let blackhole_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<BlackHoleInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 8,
+                    shader_location: 1,
+                },
+            ],
+        };
+        let blackhole_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blackhole-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_blackhole",
+                buffers: &[blackhole_instance_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_blackhole",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: msaa_state,
+            multiview: None,
+            cache: None,
+        });
+
         // 64k grains to start (1 MiB), grown on demand.
         let dust_capacity = 65_536 * std::mem::size_of::<DustVertex>() as u64;
         let dust_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -721,6 +955,22 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Glow is one instance per luminous body, so a few hundred slots
+        // is plenty at every realistic n. Grown on demand if exceeded.
+        let glow_capacity = 256;
+        let glow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glow"),
+            size: glow_capacity * std::mem::size_of::<GlowInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let blackhole_capacity = 64;
+        let blackhole_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blackhole"),
+            size: blackhole_capacity * std::mem::size_of::<BlackHoleInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             body_pipeline,
@@ -728,6 +978,8 @@ impl Renderer {
             instance_capacity,
             body_count: 0,
             instance_scratch: Vec::new(),
+            light_scratch: Vec::new(),
+            lum_scratch: Vec::new(),
             orbit_pipeline,
             orbit_buf,
             orbit_capacity,
@@ -739,6 +991,16 @@ impl Renderer {
             comet_tail_buf,
             comet_tail_capacity,
             comet_tail_vert_count: 0,
+            glow_pipeline,
+            glow_buf,
+            glow_capacity,
+            glow_count: 0,
+            glow_scratch: Vec::new(),
+            blackhole_pipeline,
+            blackhole_buf,
+            blackhole_capacity,
+            blackhole_count: 0,
+            blackhole_scratch: Vec::new(),
             flash_pipeline,
             flash_buf,
             flash_capacity,
@@ -782,29 +1044,91 @@ impl Renderer {
         queue.write_buffer(&self.orbit_camera_buf, 0, bytemuck::bytes_of(&world));
     }
 
-    /// Fill the CPU-side scratch buffers from `b`. Reads `Bodies`, so the
-    /// caller holds the lock; does not touch the GPU (see `upload_instances`).
-    /// `vp` is the viewport in pixels, used to skip off-screen dust fields.
-    pub fn build_instances(&mut self, b: &Bodies, zoom: f32, cam: [f64; 2], vp: [f32; 2]) {
-        // ---- Bodies ----
+    pub fn build_instances(
+        &mut self,
+        b: &Bodies,
+        zoom: f32,
+        cam: [f64; 2],
+        vp: [f32; 2],
+        override_body: Option<(usize, [f64; 2])>,
+    ) {
+        // ---- Luminosity and light sources ----
+        // One pass computes each luminous body's luminosity (used for the
+        // glow strength below) and lists the bodies that light planets.
         let n = b.len();
+        self.lum_scratch.clear();
+        self.lum_scratch.resize(n, 0.0);
+        self.light_scratch.clear();
+        for i in 0..n {
+            if !matches!(
+                b.kind[i],
+                BodyKind::Star
+                    | BodyKind::BrownDwarf
+                    | BodyKind::WhiteDwarf
+                    | BodyKind::NeutronStar
+            ) {
+                continue;
+            }
+            let l = physics::luminosity_of(b, i);
+            if !(l.is_finite() && l > 0.0) {
+                continue;
+            }
+            self.lum_scratch[i] = l;
+            let (lx, ly) = match override_body {
+                Some((idx, [x, y])) if idx == i => (x, y),
+                _ => (b.x[i], b.y[i]),
+            };
+            self.light_scratch.push((lx, ly, l));
+        }
+        // Shading a planet costs one loop over the light sources. In a
+        // dense cluster that would be too slow, so planets stay flat there.
+        let shade_planets = self.light_scratch.len() as u64 * n as u64 <= 4_000_000;
+
+        // ---- Bodies ----
         self.instance_scratch.clear();
         if self.instance_scratch.capacity() < n {
             self.instance_scratch
                 .reserve(n - self.instance_scratch.capacity());
         }
         for i in 0..n {
-            self.instance_scratch.push(BodyInstance::new(
+            if b.kind[i] == BodyKind::BlackHole {
+                continue; // Handled by the dedicated pipeline
+            }
+            let (bx, by) = match override_body {
+                Some((idx, [x, y])) if idx == i => (x, y),
+                _ => (b.x[i], b.y[i]),
+            };
+            let mut inst = BodyInstance::new(
                 b.kind[i],
                 b.origin[i],
                 body_color(b, i),
-                b.x[i] - cam[0],
-                b.y[i] - cam[1],
+                bx - cam[0],
+                by - cam[1],
                 b.r[i],
                 zoom,
-            ));
+            );
+            // A planet is lit from the side of the star that gives it the
+            // most light (luminosity / distance²).
+            if shade_planets && matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
+                let mut best_flux = 0.0f64;
+                let mut best_angle = f64::NAN;
+                for &(lx, ly, l) in &self.light_scratch {
+                    let (dx, dy) = (lx - bx, ly - by);
+                    let d2 = dx * dx + dy * dy;
+                    if d2 <= 0.0 {
+                        continue;
+                    }
+                    let flux = l / d2;
+                    if flux > best_flux {
+                        best_flux = flux;
+                        best_angle = dy.atan2(dx);
+                    }
+                }
+                inst = inst.with_light(best_angle);
+            }
+            self.instance_scratch.push(inst);
         }
-        self.body_count = n as u32;
+        self.body_count = self.instance_scratch.len() as u32;
 
         // ---- Flashes ----
         let nf = b.flashes.len();
@@ -825,6 +1149,73 @@ impl Renderer {
                 });
             }
         }
+
+        // ---- Star glow ----
+        // One halo per luminous body. Radius and intensity are per-kind:
+        // stars get a big soft halo, brown dwarfs a modest one, white
+        // dwarfs a tight cool halo, neutron stars a pinprick of intense
+        // blue-white. Black holes are skipped (they would read as a
+        // spurious emission ring).
+        self.glow_scratch.clear();
+        for i in 0..n {
+            // Stars, brown dwarfs and white dwarfs glow in proportion to their
+            // luminosity. A neutron star keeps a fixed pinprick: most of its
+            // light is X-rays.
+            let (halo_mult, base_intensity, uses_lum) = match b.kind[i] {
+                BodyKind::Star => (3.0, 0.55, true),
+                BodyKind::BrownDwarf => (2.5, 0.30, true),
+                BodyKind::WhiteDwarf => (2.0, 0.45, true),
+                BodyKind::NeutronStar => (2.5, 0.90, false),
+                _ => continue,
+            };
+            let lum_factor = if uses_lum {
+                glow_luminosity_factor(self.lum_scratch[i])
+            } else {
+                1.0
+            };
+            let intensity = (base_intensity * lum_factor) as f32;
+            let (bx, by) = match override_body {
+                Some((idx, [x, y])) if idx == i => (x, y),
+                _ => (b.x[i], b.y[i]),
+            };
+            // Halo radius in world units. The floor is 6 screen pixels for a
+            // Sun-like body, smaller for a dim one and larger for a bright
+            // one, so a luminous star at wide zoom has a bigger glare.
+            let floor_px = 6.0 * lum_factor.sqrt();
+            let r_world = (b.r[i] * halo_mult).max(floor_px / zoom.max(1e-6) as f64);
+            let color = body_color(b, i);
+            self.glow_scratch.push(GlowInstance {
+                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
+                radius: r_world as f32,
+                intensity,
+                color,
+                _pad: 0.0,
+            });
+        }
+        self.glow_count = self.glow_scratch.len() as u32;
+
+        // ---- Black Holes ----
+        self.blackhole_scratch.clear();
+        for i in 0..n {
+            if b.kind[i] != BodyKind::BlackHole {
+                continue;
+            }
+            let (bx, by) = match override_body {
+                Some((idx, [x, y])) if idx == i => (x, y),
+                _ => (b.x[i], b.y[i]),
+            };
+            // `r` is the event horizon (Schwarzschild radius). The shader draws
+            // the shadow at BH_SHADOW_IN_RS times this, and the disk beyond it.
+            // The floor keeps the shadow at least 4 px in radius, so a hole
+            // does not vanish at wide zoom.
+            let r_world = b.r[i].max(4.0 / (BH_SHADOW_IN_RS * zoom.max(1e-6) as f64));
+            self.blackhole_scratch.push(BlackHoleInstance {
+                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
+                radius: r_world as f32,
+                _pad: 0.0,
+            });
+        }
+        self.blackhole_count = self.blackhole_scratch.len() as u32;
 
         // ---- Dust ----
         // Visible fields: big enough on screen and overlapping the view.
@@ -931,6 +1322,42 @@ impl Renderer {
                 &self.flash_buf,
                 0,
                 bytemuck::cast_slice(&self.flash_scratch),
+            );
+        }
+
+        // ---- Glow ----
+        let ng = self.glow_count as u64;
+        if ng > 0 {
+            let byte_len = ng * std::mem::size_of::<GlowInstance>() as u64;
+            if byte_len > self.glow_capacity {
+                self.glow_capacity = byte_len.next_power_of_two();
+                self.glow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("glow"),
+                    size: self.glow_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&self.glow_buf, 0, bytemuck::cast_slice(&self.glow_scratch));
+        }
+
+        // ---- Black Holes ----
+        let nb = self.blackhole_count as u64;
+        if nb > 0 {
+            let byte_len = nb * std::mem::size_of::<BlackHoleInstance>() as u64;
+            if byte_len > self.blackhole_capacity {
+                self.blackhole_capacity = byte_len.next_power_of_two();
+                self.blackhole_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("blackhole"),
+                    size: self.blackhole_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &self.blackhole_buf,
+                0,
+                bytemuck::cast_slice(&self.blackhole_scratch),
             );
         }
 
@@ -1047,6 +1474,16 @@ impl Renderer {
     /// flashes, bodies. `pass` is `'static` because the caller erased the
     /// encoder borrow with `forget_lifetime()`.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'static>) {
+        // Glow first: halos read as background scatter, so bodies, trails
+        // and flashes all draw on top of them. Additive blending means
+        // order among glow-quads is irrelevant, but this placement keeps
+        // trails and orbits crisp.
+        if self.glow_count > 0 {
+            pass.set_pipeline(&self.glow_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, self.glow_buf.slice(..));
+            pass.draw(0..4, 0..self.glow_count);
+        }
         if self.dust_count > 0 {
             pass.set_pipeline(&self.dust_pipeline);
             pass.set_bind_group(0, &self.camera_bg, &[]);
@@ -1071,6 +1508,12 @@ impl Renderer {
             pass.set_bind_group(0, &self.orbit_camera_bg, &[]);
             pass.set_vertex_buffer(0, self.orbit_buf.slice(..));
             pass.draw(0..self.orbit_vert_count, 0..1);
+        }
+        if self.blackhole_count > 0 {
+            pass.set_pipeline(&self.blackhole_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, self.blackhole_buf.slice(..));
+            pass.draw(0..4, 0..self.blackhole_count);
         }
         if self.flash_instance_count > 0 {
             pass.set_pipeline(&self.flash_pipeline);

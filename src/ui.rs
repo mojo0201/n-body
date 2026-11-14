@@ -506,6 +506,7 @@ pub struct ViewInfo {
     pub show_debris_orbits: bool,
     pub follow: bool,
     pub selected: Option<u64>,
+    pub follow_smooth: Option<(u64, [f64; 2])>,
     pub preset: crate::Preset,
     pub vsync: bool,
     pub behind: bool,
@@ -742,6 +743,19 @@ fn nice_length(target: f64) -> f64 {
     n * p
 }
 
+/// World-space position to draw body `i` at. For the followed body this
+/// returns the smoothed position from `ViewInfo::follow_smooth`; for
+/// everything else it returns the raw physics position.
+#[inline]
+fn drawn_pos(view: &ViewInfo, b: &Bodies, i: usize) -> (f64, f64) {
+    if let Some((id, pos)) = view.follow_smooth {
+        if b.id[i] == id {
+            return (pos[0], pos[1]);
+        }
+    }
+    (b.x[i], b.y[i])
+}
+
 /// Draw the selection ring, labels, and scale bar. All three are drawn on
 /// the `background` layer so they appear under egui's own layers (the dock,
 /// the status bar) but over the wgpu scene.
@@ -752,7 +766,8 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
     // Selection ring.
     if let Some(id) = view.selected {
         if let Some(i) = b.index_of_id(id) {
-            let c = world_to_screen(view, b.x[i], b.y[i]);
+            let (bx, by) = drawn_pos(view, b, i);
+            let c = world_to_screen(view, bx, by);
             let r_px = (b.r[i] * view.zoom as f64) as f32 / view.ppp;
             // Ring is 5 points outside the body, or 5 points outside a
             // 5-point minimum — so a tiny body still gets a visible ring.
@@ -778,7 +793,8 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
             if b.origin[i] != BodyOrigin::Spawned {
                 continue;
             }
-            let c = world_to_screen(view, b.x[i], b.y[i]);
+            let (bx, by) = drawn_pos(view, b, i);
+            let c = world_to_screen(view, bx, by);
             // Cull off-screen labels — `painter.text` still does layout
             // work even for off-screen glyphs on some backends.
             if !screen.contains(c) {

@@ -29,14 +29,20 @@ struct Instance {
     @location(0) pos: vec2<f32>,
     @location(1) radius: f32,
     @location(2) color: vec3<f32>,
+    // 1 = lit by a star (planets), 0 = self-luminous or unlit.
+    @location(3) lit: f32,
+    // Direction to the lighting star, as an angle in world axes (radians).
+    @location(4) light_angle: f32,
 };
- 
+
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) color: vec3<f32>,
+    // xy = unit vector toward the star (world axes), z = light strength 0..1.
+    @location(2) light: vec3<f32>,
 };
- 
+
 // draw(0..4, 0..n), triangle strip: vi 0..3 -> (-1,-1) (+1,-1) (-1,+1) (+1,+1).
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOut {
@@ -50,11 +56,21 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOut {
     out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.local = corner;
     out.color = inst.color;
+    // A shaded sphere needs a few pixels to read. Below that size the body
+    // stays a flat dot, so a distant planet does not lose half its light.
+    let px_r = inst.radius * camera.zoom;
+    let strength = inst.lit * smoothstep(2.5, 7.0, px_r);
+    out.light = vec3<f32>(cos(inst.light_angle), sin(inst.light_angle), strength);
     return out;
 }
- 
+
 // Anti-aliased disc. Colour is multiplied by alpha and ALPHA_BLENDING
 // multiplies again (alpha^2 edge): intentional, see render.rs.
+//
+// The sim is top-down, so the star always lights a planet from the side
+// (phase angle 90 deg): exactly half of the disc is lit. The surface normal
+// of the sphere is (local.x, local.y, sqrt(1 - d^2)). The light vector lies
+// in the screen plane, so N.L reduces to dot(local, toward_star).
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let d = length(in.local);
@@ -62,9 +78,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     let alpha = smoothstep(1.0, 0.85, d);
-    return vec4<f32>(in.color * alpha, alpha);
+    let n_dot_l = max(dot(in.local, in.light.xy), 0.0);
+    // Lambert term plus a faint floor for scattered light on the night side.
+    let lit_shade = 0.04 + 1.15 * pow(n_dot_l, 0.8);
+    let shade = mix(1.0, lit_shade, in.light.z);
+    return vec4<f32>(in.color * shade * alpha, alpha);
 }
- 
+
 // -------- Orbit lines (LineList) --------
  
 struct OrbitIn {
@@ -189,7 +209,293 @@ fn fs_dust(in: DustOut) -> @location(0) vec4<f32> {
     if d > 1.0 {
         discard;
     }
-    let a = smoothstep(1.0, 0.0, d) * in.intensity * 0.10;
+    let a = smoothstep(1.0, 0.0, d) * in.intensity * 0.15;
     // Warm grey; with (src_alpha, one) blending the result is colour * a.
     return vec4<f32>(0.62, 0.58, 0.54, a);
+}
+
+// ── Star glow ─────────────────────────────────────────────────────────
+//
+// Additive soft quad centred on a luminous body. The CPU side has already
+// subtracted the camera, so the vertex shader only needs zoom + viewport
+// (matching how vs_main places BodyInstance quads). `uv` runs −1..1
+// across the quad, so |uv| = 1 is the halo's outer edge.
+
+struct GlowIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) radius: f32,
+    @location(2) intensity: f32,
+    @location(3) color: vec3<f32>,
+};
+
+struct GlowOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) intensity: f32,
+};
+
+@vertex
+fn vs_glow(@builtin(vertex_index) vi: u32, inst: GlowIn) -> GlowOut {
+    var corners = array<vec2<f32>, 4>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0, -1.0),
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>( 1.0,  1.0),
+    );
+    let c = corners[vi];
+    let world = inst.pos + c * inst.radius;
+    let screen = (world - camera.pos) * camera.zoom;
+    let ndc = screen / (camera.viewport * 0.5);
+    var out: GlowOut;
+    out.clip = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.uv = c;
+    out.color = inst.color;
+    out.intensity = inst.intensity;
+    return out;
+}
+
+@fragment
+fn fs_glow(in: GlowOut) -> @location(0) vec4<f32> {
+    let r = length(in.uv);
+    if r > 1.0 {
+        discard;
+    }
+    // Wide power-law halo. The 2.5 exponent gives a long, soft skirt
+    // that reads as scattered light rather than a hard-edged disc.
+    let halo = pow(max(0.0, 1.0 - r), 2.5);
+    // Narrow exponential core so the center of the quad still brightens
+    // when the halo alone would be too dim near the star's edge.
+    let core = exp(-r * r * 6.0);
+    let a = (halo * 0.75 + core * 0.25) * in.intensity;
+    // Additive blending (SrcAlpha / One): result = color * a + dst.
+    return vec4<f32>(in.color, a);
+}
+
+// ── Black Holes ───────────────────────────────────────────────────────
+//
+// Each fragment traces one light ray backward from the camera through a
+// Schwarzschild spacetime and finds where it meets a thin accretion disk.
+//
+// Units: lengths are in Schwarzschild radii (Rs = 2GM/c^2), so the event
+// horizon is r = 1. With u = 1/r, a light ray in its orbital plane obeys
+//     d2u/dphi2 = -u + 1.5 u^2.
+// A ray that arrives at impact parameter b starts with u = 0, du/dphi = 1/b.
+// Rays with b < 3*sqrt(3)/2 = 2.598 Rs fall in: that is the black shadow.
+//
+// The disk is a Novikov-Thorne style thin disk from the innermost stable
+// orbit (3 Rs) outward. Its temperature follows T^4 ~ r^-3 (1 - sqrt(r_in/r)).
+// Brightness and colour use the Doppler shift of the orbiting gas and the
+// gravitational redshift. Tilt, outer radius and peak temperature are
+// artistic choices: see the constants.
+//
+// The picture shows: the shadow, the near side of the disk in front of it,
+// the far side bent over the top and under the bottom, and the thin photon
+// ring that comes from rays which circle the hole.
+
+// Half-size of the quad, in Rs. Must be larger than BH_R_OUT.
+const BH_QUAD: f32 = 10.0;
+const BH_R_ISCO: f32 = 3.0;
+const BH_R_OUT: f32 = 8.0;
+const BH_B_CRIT: f32 = 2.598076;
+// Disk tilt from face-on. 78 deg: nearly edge-on. A disk in the sim plane
+// would be face-on (0 deg) for this top-down camera.
+const BH_COS_I: f32 = 0.2079117;
+const BH_SIN_I: f32 = 0.9781476;
+// Colour temperature at the brightest part of the disk, in K.
+const BH_T_PEAK: f32 = 5600.0;
+const BH_STEPS: i32 = 170;
+const BH_DPHI: f32 = 0.075;
+const PI: f32 = 3.14159265;
+
+struct BlackHoleIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) radius: f32,   // event-horizon radius (Rs), world units
+};
+
+struct BlackHoleOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) local: vec2<f32>,  // position in Rs, centred on the hole
+};
+
+@vertex
+fn vs_blackhole(@builtin(vertex_index) vi: u32, inst: BlackHoleIn) -> BlackHoleOut {
+    let fx = f32(vi & 1u) * 2.0 - 1.0;
+    let fy = f32((vi >> 1u) & 1u) * 2.0 - 1.0;
+    let corner = vec2<f32>(fx, fy);
+
+    let world = inst.pos + corner * inst.radius * BH_QUAD;
+    let screen = (world - camera.pos) * camera.zoom;
+    let ndc = screen / (camera.viewport * 0.5);
+
+    var out: BlackHoleOut;
+    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.local = corner * BH_QUAD;
+    return out;
+}
+
+fn bh_accel(u: f32) -> f32 {
+    return -u + 1.5 * u * u;
+}
+
+// sRGB-ish colour of a blackbody, max channel 1. Same fit as
+// `blackbody_to_rgb` in render.rs.
+fn bb_rgb(t_kelvin: f32) -> vec3<f32> {
+    let t = clamp(t_kelvin / 100.0, 10.0, 400.0);
+    var r: f32;
+    var g: f32;
+    var b: f32;
+    if t <= 66.0 {
+        r = 255.0;
+        g = 99.4708025861 * log(t) - 161.1195681661;
+        if t <= 19.0 {
+            b = 0.0;
+        } else {
+            b = 138.5177312231 * log(t - 10.0) - 305.0447927307;
+        }
+    } else {
+        r = 329.698727446 * pow(t - 60.0, -0.1332047592);
+        g = 288.1221695283 * pow(t - 60.0, -0.0755148492);
+        b = 255.0;
+    }
+    return clamp(vec3<f32>(r, g, b) / 255.0, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Light from the disk at radius `r` (Rs) as seen by the camera.
+// Returns (premultiplied colour, opacity).
+//   pos_dir : unit vector from the hole to the emission point (3D, camera on +z)
+//   k       : unit direction of the photon, in the local static frame
+fn bh_disk_emission(r: f32, pos_dir: vec3<f32>, k: vec3<f32>) -> vec4<f32> {
+    // Orbit velocity as measured by a static observer: sqrt(M / (r - 2M)),
+    // with M = Rs / 2.
+    let beta = sqrt(0.5 / max(r - 1.0, 0.05));
+    let gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1e-4));
+    // Gas orbits counter-clockwise about the disk normal n = (0, sin i, cos i).
+    // For the point (x_d, y_d) in the disk, v_hat = (-y_d, x_d cos i, -x_d sin i) / r.
+    let xd = pos_dir.x;
+    let yd = pos_dir.y * BH_COS_I - pos_dir.z * BH_SIN_I;
+    let vhat = vec3<f32>(-yd, xd * BH_COS_I, -xd * BH_SIN_I);
+    let doppler = 1.0 / (gamma * (1.0 - beta * dot(vhat, k)));
+    let g = sqrt(max(1.0 - 1.0 / r, 0.0)) * doppler;
+
+    // Disk flux, normalised to 1 at its peak (r = 49/36 r_in).
+    let x = r / BH_R_ISCO;
+    let flux = pow(x, -3.0) * (1.0 - inverseSqrt(x)) / 0.05665;
+    // Taper the outer edge so the disk fades out instead of ending abruptly.
+    let taper = smoothstep(BH_R_OUT, BH_R_OUT - 1.5, r);
+    let t_emit = BH_T_PEAK * pow(max(flux, 0.0), 0.25);
+
+    // Bolometric intensity goes as g^4.
+    let intensity = pow(g, 4.0) * flux * taper;
+    let emitted = bb_rgb(g * t_emit) * (1.0 - exp(-3.0 * intensity));
+    let alpha = 1.0 - exp(-12.0 * intensity);
+    return vec4<f32>(emitted, alpha);
+}
+
+// Trace one ray. `p` is the position in the image plane in Rs (x right,
+// y up). Returns the light and opacity collected from the disk.
+// Premultiplied colour in .rgb, opacity in .a.
+fn bh_trace(p: vec2<f32>) -> vec4<f32> {
+    let b = length(p);
+    if b < 1e-3 {
+        return vec4<f32>(0.0);
+    }
+    let ph = p / b;
+
+    // The ray meets the disk plane at phi_c + k*pi along its orbital plane.
+    let phi_c = atan2(BH_COS_I, -ph.y * BH_SIN_I);
+
+    var u = 0.0;
+    var du = 1.0 / b;
+    var phi = 0.0;
+    var next_k = 0;
+    var acc = vec3<f32>(0.0);   // premultiplied light collected so far
+    var acc_a = 0.0;            // opacity collected so far
+
+    for (var s = 0; s < BH_STEPS; s++) {
+        // One RK4 step in phi.
+        let h = BH_DPHI;
+        let k1u = du;
+        let k1d = bh_accel(u);
+        let k2u = du + 0.5 * h * k1d;
+        let k2d = bh_accel(u + 0.5 * h * k1u);
+        let k3u = du + 0.5 * h * k2d;
+        let k3d = bh_accel(u + 0.5 * h * k2u);
+        let k4u = du + h * k3d;
+        let k4d = bh_accel(u + h * k3u);
+        let u_new = u + h / 6.0 * (k1u + 2.0 * k2u + 2.0 * k3u + k4u);
+        let du_new = du + h / 6.0 * (k1d + 2.0 * k2d + 2.0 * k3d + k4d);
+        let phi_new = phi + h;
+
+        // Did the ray cross the disk plane during this step?
+        let phi_k = phi_c + PI * f32(next_k);
+        if phi_k <= phi_new {
+            next_k += 1;
+            let t = clamp((phi_k - phi) / h, 0.0, 1.0);
+            let u_x = mix(u, u_new, t);
+            let du_x = mix(du, du_new, t);
+            if u_x > 1e-3 {
+                let r = 1.0 / u_x;
+                if r >= BH_R_ISCO && r <= BH_R_OUT {
+                    let sphi = sin(phi_k);
+                    let cphi = cos(phi_k);
+                    // Radial and tangential unit vectors of the ray plane.
+                    let rhat = vec3<f32>(sphi * ph.x, sphi * ph.y, cphi);
+                    let that = vec3<f32>(-cphi * ph.x, -cphi * ph.y, sphi);
+                    // Angle between the photon and the outward radial
+                    // direction, in the frame of a static observer.
+                    let sin_psi = clamp(b * sqrt(1.0 - 1.0 / r) / r, 0.0, 1.0);
+                    let cos_psi = sqrt(1.0 - sin_psi * sin_psi);
+                    // The photon travels toward decreasing phi. It moves
+                    // outward when u is falling in that direction.
+                    let radial_sign = select(-1.0, 1.0, du_x > 0.0);
+                    let k = radial_sign * cos_psi * rhat + sin_psi * that;
+                    let e = bh_disk_emission(r, rhat, k);
+                    acc += (1.0 - acc_a) * e.rgb;
+                    acc_a += (1.0 - acc_a) * e.a;
+                    if acc_a > 0.995 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        u = u_new;
+        du = du_new;
+        phi = phi_new;
+        if u >= 1.0 || u <= 0.0 {
+            break; // fell in, or escaped
+        }
+    }
+    return vec4<f32>(acc, acc_a);
+}
+
+@fragment
+fn fs_blackhole(in: BlackHoleOut) -> @location(0) vec4<f32> {
+    // Pixel size in Rs. Computed first, in uniform control flow.
+    let px = max(fwidth(in.local.x), 1e-4);
+
+    // Image plane: x to the right, y up. Screen y runs down, so flip it.
+    let p = vec2<f32>(in.local.x, -in.local.y);
+    let b = length(p);
+
+    var c = bh_trace(p);
+
+    // Near the photon ring the disk images are thinner than a pixel and
+    // would sparkle. Average 4 rays in a rotated grid there.
+    if b > BH_B_CRIT - 2.0 * px && b < BH_B_CRIT + 0.5 {
+        c = 0.25 * (bh_trace(p + px * vec2<f32>(0.125, 0.375))
+                  + bh_trace(p + px * vec2<f32>(0.375, -0.125))
+                  + bh_trace(p + px * vec2<f32>(-0.125, -0.375))
+                  + bh_trace(p + px * vec2<f32>(-0.375, 0.125)));
+    }
+
+    // Shadow: whatever the disk does not hide is black inside b_crit
+    // and clear outside it.
+    let shadow = 1.0 - smoothstep(BH_B_CRIT - px, BH_B_CRIT + px, b);
+    let a = c.a + (1.0 - c.a) * shadow;
+    if a < 1e-4 {
+        discard;
+    }
+    return vec4<f32>(c.rgb / a, a);
 }

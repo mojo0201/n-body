@@ -38,7 +38,7 @@ use winit::window::{Window, WindowId};
 use egui_wgpu::ScreenDescriptor;
 
 // Zoom range for the view: 1e-3 .. 1e5 px per Gm.
-const ZOOM_MIN: f32 = 1e-3;
+const ZOOM_MIN: f32 = 1e-7;
 const ZOOM_MAX: f32 = 1e5;
 // A click that moves less than this many pixels is treated as a click
 const CLICK_SLOP_PX: f32 = 4.0;
@@ -195,20 +195,57 @@ fn physics_loop(sh: Arc<Shared>) {
     }
 }
 
+/// Create the 4× MSAA offscreen color target used by the main render pass.
+/// `format` must match the surface format.
+fn create_msaa(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("msaa-color"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 4,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
 // ---------------------------------------------------------------------------
 // Graphics and view state
 // ---------------------------------------------------------------------------
 
 struct GfxState {
+    // --- Pipelines, buffers, bind groups, egui. All hold Device refs. ---
     renderer: Renderer,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
     egui_ctx: egui::Context,
+
+    // --- MSAA offscreen target. Must drop before `device`. ---
+    msaa_tex: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+
+    // --- Surface and its config. Must drop before `window`. ---
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
+
+    // --- Device & queue. Everything above has already released by now. ---
     device: wgpu::Device,
     queue: wgpu::Queue,
+
+    // --- Window LAST. Nothing may hold a Window ref after this drops. ---
     window: Arc<Window>,
 }
 
@@ -237,7 +274,7 @@ struct Trail {
     color: [u8; 4],
 }
 
-const TRAIL_MAX_POINTS: usize = 1800;
+const TRAIL_MAX_POINTS: usize = 4000;
 const TRAIL_MAX_VERTS: usize = 100_000;
 
 struct TrailState {
@@ -259,7 +296,7 @@ impl TrailState {
 
     /// O(n) under the lock. Returns (id, sim_time, x, y, rgb, period, parent_pos).
     /// `parent_pos` is used for arc sub-sampling in `update`.
-    fn snapshot(&self, b: &Bodies) -> Vec<TrailSample> {
+    fn snapshot(&self, b: &Bodies, override_pos: Option<(u64, [f64; 2])>) -> Vec<TrailSample> {
         if !self.cfg.enabled {
             return Vec::new();
         }
@@ -291,15 +328,11 @@ impl TrailState {
                     (o.period, Some((b.x[p] as f32, b.y[p] as f32)))
                 })
                 .unwrap_or((f64::INFINITY, None));
-            out.push((
-                b.id[i],
-                b.time,
-                b.x[i] as f32,
-                b.y[i] as f32,
-                color,
-                period,
-                parent_pos,
-            ));
+            let (bx, by) = match override_pos {
+                Some((id, pos)) if b.id[i] == id => (pos[0] as f32, pos[1] as f32),
+                _ => (b.x[i] as f32, b.y[i] as f32),
+            };
+            out.push((b.id[i], b.time, bx, by, color, period, parent_pos));
         }
         out
     }
@@ -325,10 +358,33 @@ impl TrailState {
             if is_new {
                 if let Some(&(t_last, x_last, y_last)) = trail.history.back() {
                     let dt = t - t_last;
-                    // Sub-sample the path if the frame jumped a significant
-                    // amount of sim time (e.g. at high simulation speeds).
-                    if dt > 0.005 {
-                        let steps = ((dt / 0.005).ceil() as usize).min(64);
+                    let steps = if let Some((px, py)) = parent_pos {
+                        let dx0 = x_last - px;
+                        let dy0 = y_last - py;
+                        let dx1 = x - px;
+                        let dy1 = y - py;
+                        let r0 = (dx0 * dx0 + dy0 * dy0).sqrt();
+                        let r1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+                        if r0 > 1e-6 && r1 > 1e-6 {
+                            let a0 = dy0.atan2(dx0);
+                            let a1 = dy1.atan2(dx1);
+                            let mut da = a1 - a0;
+                            if da > std::f32::consts::PI {
+                                da -= 2.0 * std::f32::consts::PI;
+                            } else if da < -std::f32::consts::PI {
+                                da += 2.0 * std::f32::consts::PI;
+                            }
+                            ((da.abs() / 0.035).ceil() as usize).min(256).max(1)
+                        } else {
+                            let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
+                            ((d / 0.01).ceil() as usize).min(256).max(1)
+                        }
+                    } else {
+                        let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
+                        ((d / 0.01).ceil() as usize).min(256).max(1)
+                    };
+
+                    if steps > 1 {
                         for s in 1..steps {
                             let frac = s as f32 / steps as f32;
                             let (ix, iy) = if let Some((px, py)) = parent_pos {
@@ -428,156 +484,13 @@ impl TrailState {
     }
 }
 
-/// Build comet tail and coma vertices for every active comet.
-///
-/// A comet is "active" when it is Icy, has a luminous host, and is
-/// inside that host's snow line. Its brightness scales roughly as
-/// the incident flux (1 / r²), clipped to [0, 1]. The tail is a cone
-/// of lines pointing **anti-sunward** (from host to comet), tapering
-/// from bright at the nucleus to transparent at the tip. The coma is
-/// a small sunburst of radiating lines around the nucleus.
-///
-/// Returns line-list vertices in **world** coordinates (same
-/// convention as trails and orbits — the orbit pipeline subtracts
-/// `camera.pos` itself). Empty when there are no comets in the
-/// system, so a plain Solar System without comet JSON costs nothing.
-fn build_comet_tails(b: &Bodies, _cam: [f64; 2]) -> Vec<OrbitVertex> {
-    let mut out = Vec::new();
-    // Bail out cheaply on systems with no comets.
-    if !b.origin.iter().any(|&o| o == BodyOrigin::Comet) {
-        return out;
-    }
-    let hosts: Vec<usize> = (0..b.len())
-        .filter(|&i| {
-            matches!(
-                b.kind[i],
-                BodyKind::Star
-                    | BodyKind::BrownDwarf
-                    | BodyKind::WhiteDwarf
-                    | BodyKind::NeutronStar
-                    | BodyKind::BlackHole
-            )
-        })
-        .collect();
-    if hosts.is_empty() {
-        return out;
-    }
-    let au = physics::au_in_gm();
-    for i in 0..b.len() {
-        if b.origin[i] != BodyOrigin::Comet || b.class[i] != BodyClass::Icy {
-            continue;
-        }
-        // Nearest host.
-        let mut r_min = f64::INFINITY;
-        let mut h = hosts[0];
-        for &k in &hosts {
-            let d = (b.x[i] - b.x[k]).hypot(b.y[i] - b.y[k]);
-            if d < r_min {
-                r_min = d;
-                h = k;
-            }
-        }
-        let r_au = r_min / au;
-        let lum = physics::luminosity_of(b, h).max(0.0);
-        if lum <= 0.0 {
-            continue;
-        }
-        let snow_au = 2.7 * lum.sqrt();
-        if r_au >= snow_au || r_au < 1e-3 {
-            continue;
-        }
-        // Activity: incident flux, clipped to [0, 1]. At 1 AU the tail
-        // is already fully developed; inside 1 AU it can't grow longer
-        // (clamped) but the comet stays bright.
-        let activity = (1.0 / (r_au * r_au)).min(1.0);
-        if activity <= 0.01 {
-            continue;
-        }
-        // Anti-sunward unit vector.
-        let dx = b.x[i] - b.x[h];
-        let dy = b.y[i] - b.y[h];
-        let r = dx.hypot(dy).max(1e-9);
-        let (ux, uy) = (dx / r, dy / r);
-        // Tail length: 0.06 AU at full activity is a realistic moderately
-        // bright comet (Hale-Bopp reached ~1 AU, most visible comets
-        // 0.05-0.3 AU). 0.06 AU no longer dominates the inner-system view.
-        let tail_len_gm = 0.06 * au * activity;
-        // Tail spread: real tails are narrow streams (aspect 20:1+), not
-        // wide fans. 0.008 rad total across the three rays — a stream.
-        // An ion tail is extremely straight and narrow.
-        const TAIL_LINES: usize = 3;
-        const TAIL_STEPS: usize = 3;
-        const TAIL_SPREAD: f64 = 0.008;
-        let (r_c, g_c, b_c) = (190u8, 220u8, 255u8);
-        // Coma: small fuzzy halo around the nucleus. 1.2 % of the tail
-        // = 0.0007 AU = 105,000 km at full activity — realistic for a
-        // bright active comet (real comas are 10^4-10^6 km radius).
-        let coma_r_gm = 0.012 * tail_len_gm;
-        // Start the tail rays at the coma's anti-sunward edge, NOT the
-        // nucleus. Without this, all N tail rays + the coma rays converge
-        // at one point, saturate, and read as a circular white blob.
-        let x_start = b.x[i] + ux * coma_r_gm;
-        let y_start = b.y[i] + uy * coma_r_gm;
-        for k in 0..TAIL_LINES {
-            let t = k as f64 / (TAIL_LINES - 1) as f64 - 0.5;
-            let ang = t * TAIL_SPREAD;
-            // `f64::sin_cos` returns (sin, cos), in that order.
-            let (sa, ca) = ang.sin_cos();
-            let tx = ux * ca - uy * sa;
-            let ty = ux * sa + uy * ca;
-            for s in 0..TAIL_STEPS {
-                let f0 = s as f64 / TAIL_STEPS as f64;
-                let f1 = (s + 1) as f64 / TAIL_STEPS as f64;
-                let x0 = x_start + tx * tail_len_gm * f0;
-                let y0 = y_start + ty * tail_len_gm * f0;
-                let x1 = x_start + tx * tail_len_gm * f1;
-                let y1 = y_start + ty * tail_len_gm * f1;
-                let a0 = ((1.0 - f0) * activity * 120.0) as u8;
-                let a1 = ((1.0 - f1) * activity * 120.0) as u8;
-                out.push(OrbitVertex {
-                    pos: [x0 as f32, y0 as f32],
-                    color: [r_c, g_c, b_c, a0],
-                });
-                out.push(OrbitVertex {
-                    pos: [x1 as f32, y1 as f32],
-                    color: [r_c, g_c, b_c, a1],
-                });
-            }
-        }
-        // Coma: 8 faint rays (was 24 bright ones). A soft glow, not a
-        // sunburst. At system scale this is sub-pixel; only when zoomed
-        // right in does it show structure.
-        if coma_r_gm > 1e-6 {
-            const COMA_RAYS: usize = 8;
-            for k in 0..COMA_RAYS {
-                let ang = k as f64 / COMA_RAYS as f64 * std::f64::consts::TAU;
-                let (sa, ca) = ang.sin_cos();
-                let x0 = b.x[i];
-                let y0 = b.y[i];
-                let x1 = b.x[i] + ca * coma_r_gm;
-                let y1 = b.y[i] + sa * coma_r_gm;
-                out.push(OrbitVertex {
-                    pos: [x0 as f32, y0 as f32],
-                    color: [220, 240, 255, 80],
-                });
-                out.push(OrbitVertex {
-                    pos: [x1 as f32, y1 as f32],
-                    color: [220, 240, 255, 0],
-                });
-            }
-        }
-    }
-    out
-}
-
 struct SimState {
     paused: bool,
     speed: f64,
+    last_frame_time: Instant,
+    follow_smooth: Option<(u64, [f64; 2])>,
     cam: [f64; 2],
     zoom: f32,
-    /// Per-system body count. For `Preset::Random` this is what the user set;
-    /// for `Preset::SolarSystem` this is the actual Solar preset count
-    /// (Sun + 13 planets + ~200 belt bodies), taken from `b.len()` after spawn.
     body_count: usize,
     seed: u128,
     fps_timer: Instant,
@@ -627,6 +540,8 @@ impl SimState {
         Self {
             paused: false,
             speed: 1.0,
+            last_frame_time: Instant::now(),
+            follow_smooth: None,
             cam: [0.0, 0.0],
             zoom: 0.7,
             body_count: 9,
@@ -800,12 +715,24 @@ impl SimState {
     fn pick(&self, b: &Bodies, p: [f32; 2], vp: [f32; 2]) -> Option<u64> {
         let mut best: Option<(f64, usize)> = None;
         for i in 0..b.len() {
-            let sx = vp[0] as f64 * 0.5 + (b.x[i] - self.cam[0]) * self.zoom as f64;
-            let sy = vp[1] as f64 * 0.5 + (b.y[i] - self.cam[1]) * self.zoom as f64;
+            // Match the exact position the renderer uses (follow smooth or raw).
+            let (bx, by) = match self.follow_smooth {
+                Some((id, pos)) if b.id[i] == id => (pos[0], pos[1]),
+                _ => (b.x[i], b.y[i]),
+            };
+            let sx = vp[0] as f64 * 0.5 + (bx - self.cam[0]) * self.zoom as f64;
+            let sy = vp[1] as f64 * 0.5 + (by - self.cam[1]) * self.zoom as f64;
             let dx = sx - p[0] as f64;
             let dy = sy - p[1] as f64;
             let d = (dx * dx + dy * dy).sqrt();
-            let rpx = (b.r[i] * self.zoom as f64).max(8.0);
+
+            // Black holes are drawn with an accretion disk 6x the event horizon.
+            // The minimum pick radius must match the visual size (24px).
+            let rpx = match b.kind[i] {
+                BodyKind::BlackHole => (b.r[i] * self.zoom as f64).max(24.0),
+                _ => (b.r[i] * self.zoom as f64).max(8.0),
+            };
+
             if d <= rpx && best.is_none_or(|(s, _)| d < s) {
                 best = Some((d, i));
             }
@@ -1075,6 +1002,10 @@ impl App {
         if let Some(h) = self.phys.take() {
             let _ = h.join();
         }
+        if let Some(gfx) = &self.gfx {
+            gfx.device.poll(wgpu::Maintain::Wait);
+        }
+        self.gfx = None;
     }
 }
 
@@ -1137,6 +1068,8 @@ impl ApplicationHandler for App {
         };
         surface.configure(&device, &config);
 
+        let (msaa_tex, msaa_view) = create_msaa(&device, format, config.width, config.height);
+
         let renderer = Renderer::new(&device, format);
 
         let egui_ctx = egui::Context::default();
@@ -1149,7 +1082,8 @@ impl ApplicationHandler for App {
             None,
             None,
         );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 4, false);
 
         self.gfx = Some(GfxState {
             renderer,
@@ -1162,6 +1096,8 @@ impl ApplicationHandler for App {
             device,
             queue,
             window,
+            msaa_tex,
+            msaa_view,
         });
         let vp = [size.width as f32, size.height as f32];
         {
@@ -1192,13 +1128,32 @@ impl ApplicationHandler for App {
         let vp = [gfx.config.width as f32, gfx.config.height as f32];
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.shared.quit.store(true, Ordering::Relaxed);
+                if let Some(h) = self.phys.take() {
+                    let _ = h.join();
+                }
+                if let Some(gfx) = &self.gfx {
+                    gfx.device.poll(wgpu::Maintain::Wait);
+                }
+                self.gfx = None;
+                event_loop.exit();
+            }
 
             WindowEvent::Resized(new_size) => {
                 gfx.size = new_size;
                 gfx.config.width = new_size.width.max(1);
                 gfx.config.height = new_size.height.max(1);
                 gfx.surface.configure(&gfx.device, &gfx.config);
+                // The MSAA texture must match the new surface dimensions.
+                let (tex, view) = create_msaa(
+                    &gfx.device,
+                    gfx.config.format,
+                    gfx.config.width,
+                    gfx.config.height,
+                );
+                gfx.msaa_tex = tex;
+                gfx.msaa_view = view;
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1208,10 +1163,26 @@ impl ApplicationHandler for App {
                 let pan = 40.0 / self.sim.zoom as f64;
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Space) => self.sim.paused = !self.sim.paused,
-                    Key::Named(NamedKey::ArrowUp) => self.sim.cam[1] -= pan,
-                    Key::Named(NamedKey::ArrowDown) => self.sim.cam[1] += pan,
-                    Key::Named(NamedKey::ArrowLeft) => self.sim.cam[0] -= pan,
-                    Key::Named(NamedKey::ArrowRight) => self.sim.cam[0] += pan,
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.sim.cam[1] -= pan;
+                        self.sim.follow = false;
+                        self.sim.follow_smooth = None;
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        self.sim.cam[1] += pan;
+                        self.sim.follow = false;
+                        self.sim.follow_smooth = None;
+                    }
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        self.sim.cam[0] -= pan;
+                        self.sim.follow = false;
+                        self.sim.follow_smooth = None;
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        self.sim.cam[0] += pan;
+                        self.sim.follow = false;
+                        self.sim.follow_smooth = None;
+                    }
                     Key::Named(NamedKey::Escape) => {
                         self.sim.selected = None;
                         self.sim.follow = false;
@@ -1235,10 +1206,26 @@ impl ApplicationHandler for App {
                         }
                         "+" | "=" => self.sim.zoom_at(1.25, [vp[0] * 0.5, vp[1] * 0.5], vp),
                         "-" | "_" => self.sim.zoom_at(0.8, [vp[0] * 0.5, vp[1] * 0.5], vp),
-                        "w" => self.sim.cam[1] -= pan,
-                        "s" => self.sim.cam[1] += pan,
-                        "a" => self.sim.cam[0] -= pan,
-                        "d" => self.sim.cam[0] += pan,
+                        "w" => {
+                            self.sim.cam[1] -= pan;
+                            self.sim.follow = false;
+                            self.sim.follow_smooth = None;
+                        }
+                        "s" => {
+                            self.sim.cam[1] += pan;
+                            self.sim.follow = false;
+                            self.sim.follow_smooth = None;
+                        }
+                        "a" => {
+                            self.sim.cam[0] -= pan;
+                            self.sim.follow = false;
+                            self.sim.follow_smooth = None;
+                        }
+                        "d" => {
+                            self.sim.cam[0] += pan;
+                            self.sim.follow = false;
+                            self.sim.follow_smooth = None;
+                        }
                         "`" => self.ui.show_dock = !self.ui.show_dock,
                         "o" => {
                             self.sim.show_orbits = !self.sim.show_orbits;
@@ -1332,7 +1319,10 @@ impl ApplicationHandler for App {
                     if self.sim.moved_px >= CLICK_SLOP_PX {
                         self.sim.cam[0] -= dx as f64 / self.sim.zoom as f64;
                         self.sim.cam[1] -= dy as f64 / self.sim.zoom as f64;
+                        // ALWAYS disable follow and clear the stale smooth position
+                        // when dragging the canvas.
                         self.sim.follow = false;
+                        self.sim.follow_smooth = None;
                     }
                 }
                 self.sim.cursor = pos;
@@ -1356,6 +1346,8 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let t_frame = Instant::now();
+                let frame_dt = (t_frame - self.sim.last_frame_time).as_secs_f64().min(0.1);
+                self.sim.last_frame_time = t_frame;
 
                 let want_mode = if self.sim.vsync {
                     wgpu::PresentMode::AutoVsync
@@ -1423,17 +1415,31 @@ impl ApplicationHandler for App {
                         ));
                     }
 
-                    // One O(n) lookup shared by the follow lerp and the
-                    // selection-cleanup check.
                     let selected_idx = self.sim.selected.and_then(|id| b.index_of_id(id));
                     if self.sim.follow {
                         match selected_idx {
                             Some(i) => {
-                                self.sim.cam[0] += (b.x[i] - self.sim.cam[0]) * 0.2;
-                                self.sim.cam[1] += (b.y[i] - self.sim.cam[1]) * 0.2;
+                                let id = b.id[i];
+                                const TAU: f64 = 0.06;
+                                let alpha = 1.0 - (-frame_dt / TAU).exp();
+                                let prev = match self.sim.follow_smooth {
+                                    Some((prev_id, pos)) if prev_id == id => pos,
+                                    _ => [b.x[i], b.y[i]],
+                                };
+                                let new_pos = [
+                                    prev[0] + (b.x[i] - prev[0]) * alpha,
+                                    prev[1] + (b.y[i] - prev[1]) * alpha,
+                                ];
+                                self.sim.follow_smooth = Some((id, new_pos));
+                                self.sim.cam = new_pos;
                             }
-                            None => self.sim.follow = false,
+                            None => {
+                                self.sim.follow = false;
+                                self.sim.follow_smooth = None;
+                            }
                         }
+                    } else {
+                        self.sim.follow_smooth = None;
                     }
                     if self.sim.selected.is_some() && selected_idx.is_none() {
                         self.sim.selected = None;
@@ -1466,6 +1472,7 @@ impl ApplicationHandler for App {
                         show_debris_orbits: self.sim.show_debris_orbits,
                         follow: self.sim.follow,
                         selected: self.sim.selected,
+                        follow_smooth: self.sim.follow_smooth,
                         preset: self.sim.preset,
                         vsync: self.sim.vsync,
                         behind: self.shared.behind.load(Ordering::Relaxed),
@@ -1478,12 +1485,7 @@ impl ApplicationHandler for App {
                     });
                     self.sim
                         .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
-                    // Snapshot *after* apply_actions, so a reset that
-                    // cleared the trail is captured from the *new* bodies
-                    // (time 0) rather than the pre-reset ones. Otherwise
-                    // the first push is stamped with the old sim time and
-                    // the trail stays frozen until sim time reaches it.
-                    trail_snapshot = self.sim.trail.snapshot(&b);
+                    trail_snapshot = self.sim.trail.snapshot(&b, self.sim.follow_smooth);
 
                     self.shared.paused.store(self.sim.paused, Ordering::Relaxed);
                     self.shared
@@ -1530,12 +1532,21 @@ impl ApplicationHandler for App {
                     }
 
                     let t_inst0 = Instant::now();
-                    gfx.renderer
-                        .build_instances(&b, self.sim.zoom, self.sim.cam, vp);
+                    let override_body = self
+                        .sim
+                        .follow_smooth
+                        .and_then(|(id, pos)| b.index_of_id(id).map(|idx| (idx, pos)));
+                    gfx.renderer.build_instances(
+                        &b,
+                        self.sim.zoom,
+                        self.sim.cam,
+                        vp,
+                        override_body,
+                    );
                     self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
                     let _ = std::mem::take(&mut self.sim.scene_dirty);
                     let t_comet0 = Instant::now();
-                    comet_tail_verts = build_comet_tails(&b, self.sim.cam);
+                    comet_tail_verts = Vec::new();
                     self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
                     flashes_active = !b.flashes.is_empty();
                     n_bodies = b.len();
@@ -1604,8 +1615,8 @@ impl ApplicationHandler for App {
                     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("main-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
+                            view: &gfx.msaa_view,
+                            resolve_target: Some(&view),
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
