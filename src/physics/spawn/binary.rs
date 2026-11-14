@@ -4,13 +4,23 @@ use super::*;
 
 /// Push the primary of a random system at the origin and give it an age.
 ///
-/// A star older than its total life is spawned as its remnant (kind, mass
-/// and cooling age), keeping `m_init`. Younger stars are spread uniformly over
-/// their life (not over Gyr), so a giant has also lost the mass its age implies.
-/// Ages never exceed `AGE_UNIVERSE_GYR`.
-/// Non-stellar primaries get a random age in the range that suits their kind.
-pub(in crate::physics) fn spawn_aged_primary(b: &mut Bodies, m_init: f64, kind: BodyKind, rng: &mut XorShift) -> usize {
+/// Ages are drawn uniformly over each star's *lifetime*, not over cosmic time,
+/// so a sample is equally likely to catch a star at any phase of its life.
+/// A star whose sampled age exceeds its total lifetime is instead spawned as
+/// its remnant (kind, mass and cooling age), preserving `m_init`. Surviving
+/// stars are placed on the main sequence or giant branch at the mass and radius
+/// `evolve_stars` would have produced by that age. Ages are capped at
+/// `AGE_UNIVERSE_GYR`. Non-stellar primaries get an age drawn from the range
+/// appropriate to their kind.
+pub(in crate::physics) fn spawn_aged_primary(
+    b: &mut Bodies,
+    m_init: f64,
+    kind: BodyKind,
+    rng: &mut XorShift,
+) -> usize {
     if kind != BodyKind::Star {
+        // Cooling-age ranges reflect the observable populations of each
+        // non-stellar primary kind.
         let age = match kind {
             BodyKind::WhiteDwarf => 0.1 + 9.9 * rng.next_f64(),
             BodyKind::BrownDwarf => 0.1 + 4.9 * rng.next_f64(),
@@ -19,19 +29,21 @@ pub(in crate::physics) fn spawn_aged_primary(b: &mut Bodies, m_init: f64, kind: 
         };
         let i = b.push(0.0, 0.0, 0.0, 0.0, m_init, kind);
         b.age_gyr[i] = age;
-        // The brown dwarf radius depends on age.
+        // Radius (e.g. a cooling brown dwarf) depends on age.
         b.set_mass(i, m_init);
         return i;
     }
     let t_total = star_total_life_gyr(m_init);
-    // No star is older than the universe, so the sampling range is capped.
+    // Sampling range is capped at the age of the universe.
     let t_cap = t_total.min(AGE_UNIVERSE_GYR);
-    // With ages uniform over the age of the universe, the chance that a star
-    // is older than its total life is 1 - t_total / AGE_UNIVERSE_GYR.
+    // With uniform-over-lifetime sampling, the fraction of stars drawn as
+    // remnants equals the fraction of the t_cap window that lies beyond the
+    // lifetime. Capped at 0.95 so even low-mass stars keep a small
+    // main-sequence tail.
     let p_remnant = (1.0 - t_cap / AGE_UNIVERSE_GYR).clamp(0.0, 0.95);
     let u = rng.next_f64();
     if u < p_remnant {
-        // The star has already evolved past its total life.
+        // The star has evolved past its total lifetime: spawn as a remnant.
         let (rkind, m_rem) = remnant_of(m_init);
         let cool_age = match rkind {
             BodyKind::WhiteDwarf => 0.1 + 9.9 * rng.next_f64(), // 0.1-10 Gyr
@@ -40,17 +52,16 @@ pub(in crate::physics) fn spawn_aged_primary(b: &mut Bodies, m_init: f64, kind: 
             _ => 0.0,
         };
         let i = b.push(0.0, 0.0, 0.0, 0.0, m_rem, rkind);
-        b.m_init[i] = m_init; // preserve initial mass
+        b.m_init[i] = m_init; // keep progenitor mass for evolution bookkeeping
         b.age_gyr[i] = cool_age;
         i
     } else {
-        // Main sequence or giant. Uniform in lifetime, not in Gyr, and never
-        // older than the universe.
+        // Surviving star: uniform in lifetime, never older than the universe.
         let age = rng.next_f64() * t_cap;
         let i = b.push(0.0, 0.0, 0.0, 0.0, m_init, BodyKind::Star);
         b.age_gyr[i] = age;
-        // Mass at this age (a giant has shed part of its envelope) and the
-        // evolved radius, as `evolve_stars` would have left them.
+        // Apply the mass loss and radius growth `evolve_stars` would have
+        // produced, so the star starts out self-consistent.
         let m_now = star_mass_at(m_init, age).min(m_init);
         b.set_mass(i, m_now);
         i
@@ -60,7 +71,7 @@ pub(in crate::physics) fn spawn_aged_primary(b: &mut Bodies, m_init: f64, kind: 
 /// Place a stellar companion on a bound orbit about `prim` (which sits at the
 /// origin) and move both stars onto their barycentric orbits. Returns `None`
 /// if the primary is too light to have a stellar companion. The companion
-/// co-forms with the primary, so it has the same age (`age_gyr`).
+/// co-forms with the primary, so it inherits `age_gyr`.
 pub(in crate::physics) fn spawn_companion(
     b: &mut Bodies,
     prim: usize,
@@ -68,16 +79,17 @@ pub(in crate::physics) fn spawn_companion(
     age_gyr: f64,
 ) -> Option<BinaryInfo> {
     let m1 = b.m[prim];
-    // A brown-dwarf primary gets a brown-dwarf companion (mass >= BD_M_MIN).
+    // Brown-dwarf primaries get brown-dwarf companions; otherwise the
+    // companion floor is the hydrogen-burning limit.
     let is_bd = b.kind[prim] == BodyKind::BrownDwarf;
     let m_floor = if is_bd { BD_M_MIN } else { STAR_M_MIN };
     let q_lo = m_floor / m1;
     if q_lo >= 1.0 {
         return None;
     }
-    // Mass ratio (Duchene & Kraus 2013): rises toward q = 1 for G/K primaries,
-    // roughly flat for M dwarfs. Density ~ q^alpha. Brown-dwarf pairs are
-    // strongly peaked at q ~ 1 (Burgasser 2007: alpha ~ 4).
+    // Mass-ratio distribution rises toward q = 1 for G/K primaries, is
+    // roughly flat for M dwarfs, and is strongly peaked at q ~ 1 for
+    // brown-dwarf pairs (Duchene & Kraus 2013; Burgasser 2007): density ~ q^alpha.
     let alpha = if is_bd {
         4.0
     } else if m1 > 0.5 * M_SUN_ME {
@@ -90,7 +102,8 @@ pub(in crate::physics) fn spawn_companion(
     let mt = m1 + m2;
     let au = au_in_gm();
     let tu = time_unit_s();
-    // Evolved radii: a giant primary is much larger than its main-sequence size.
+
+    // Evolved radii: a giant primary is much larger than its MS size.
     let r1 = b.r[prim].max(physical_radius(BodyKind::Star, m1));
     let r2 = if is_bd {
         r1
@@ -100,51 +113,63 @@ pub(in crate::physics) fn spawn_companion(
             .max(physical_radius(BodyKind::Star, m2))
     };
     let clear = BIN_PERI_CLEAR * (r1 + r2);
-    let a_of_p =
-        |p_days: f64| (G * mt * (p_days * 86_400.0 / tu / std::f64::consts::TAU).powi(2)).cbrt();
 
-    // Log-normal period, truncated to the range the integrator handles.
-    let mut chosen: Option<(f64, f64, f64)> = None;
-    for _ in 0..64 {
-        // Brown-dwarf binaries are tight: log10(a/AU) ~ N(0.55, 0.45), so the
-        // median is ~3.5 AU and nearly all lie inside 20 AU (Burgasser 2007).
-        let p_days = if is_bd {
-            let a_bd_au = 10f64.powf(sample_normal(rng, 0.55, 0.45)).min(20.0);
-            orbital_period_days(a_bd_au * au, mt)
-        } else {
-            10f64.powf(sample_normal(rng, BIN_LOGP_MEAN, BIN_LOGP_SIGMA))
-        };
-        if p_days < BIN_P_MIN_D {
-            continue;
+    // Kepler's third law in code units:
+    //   a(P) = (G·mt·(P_days·86400/tu/TAU)²)^(1/3).
+    // Hoist the constant factor out of the rejection loop.
+    let day_unit = 86_400.0 / tu / std::f64::consts::TAU;
+    let a_k = G * mt * day_unit * day_unit;
+    let a_of_p = |p_days: f64| (a_k * p_days * p_days).cbrt();
+    // Compare in gm units to avoid dividing `a` by `au` each iteration.
+    let a_max_gm = BIN_A_MAX_AU * au;
+
+    // Rejection-sample a period; if 64 tries fail (e.g. an extreme m1 that
+    // forces a small q_lo), fall back to the integrator's minimum period
+    // stretched outward to clear the collision limit.
+    let (p_days, a, e) = 'search: {
+        for _ in 0..64 {
+            let p_days = if is_bd {
+                // Brown-dwarf binaries: log10(a/AU) ~ N(0.55, 0.45),
+                // truncated at 20 AU (Burgasser 2007).
+                let a_bd_au = 10f64.powf(sample_normal(rng, 0.55, 0.45)).min(20.0);
+                orbital_period_days(a_bd_au * au, mt)
+            } else {
+                10f64.powf(sample_normal(rng, BIN_LOGP_MEAN, BIN_LOGP_SIGMA))
+            };
+            if p_days < BIN_P_MIN_D {
+                continue;
+            }
+            let a = a_of_p(p_days);
+            if a > a_max_gm {
+                continue;
+            }
+            // Tight binaries are tidally circularised; wider ones follow a
+            // thermal distribution f(e) = 2e, while brown-dwarf pairs stay
+            // nearly circular.
+            let e = if p_days < BIN_CIRC_P_D {
+                0.0
+            } else if is_bd {
+                rng.next_f64() * 0.3
+            } else {
+                rng.next_f64().sqrt() * 0.95
+            };
+            if a * (1.0 - e) < clear {
+                continue;
+            }
+            break 'search (p_days, a, e);
         }
-        let a = a_of_p(p_days);
-        if a / au > BIN_A_MAX_AU {
-            continue;
-        }
-        // Circularised when tight; otherwise thermal, f(e) = 2e.
-        let e = if p_days < BIN_CIRC_P_D {
-            0.0
-        } else if is_bd {
-            rng.next_f64() * 0.3
-        } else {
-            rng.next_f64().sqrt() * 0.95
-        };
-        if a * (1.0 - e) < clear {
-            continue;
-        }
-        chosen = Some((p_days, a, e));
-        break;
-    }
-    let (p_days, a, e) = chosen.unwrap_or_else(|| {
         let a = a_of_p(BIN_P_MIN_D).max(clear);
         (orbital_period_days(a, mt), a, 0.0)
-    });
+    };
 
-    // Phase uniform in mean anomaly (time), not true anomaly.
+    // Uniform in mean anomaly (time), not in true anomaly.
     let mean_anom = rng.next_f64() * std::f64::consts::TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
     let omega = rng.next_f64() * std::f64::consts::TAU;
     let (rx, ry, rvx, rvy) = kepler_state(G * mt, a, e, nu, omega);
+    // Split the relative state into barycentric pieces. `prim` was at the
+    // origin, so this simultaneously moves it and leaves the companion
+    // opposite across the barycentre.
     let (f1, f2) = (m2 / mt, m1 / mt);
     b.x[prim] = -f1 * rx;
     b.y[prim] = -f1 * ry;
@@ -183,22 +208,35 @@ pub(in crate::physics) struct OuterStar {
 }
 
 /// Plan a star on a wide orbit about an inner system of mass `m_in` whose
-/// own widest orbit is `a_in_au`. `m1` is the primary mass, used to scale
-/// the mass ratio. The orbit respects the Mardling & Aarseth (2001)
-/// stability limit, a_out / a_in > 2.8 [(1+q)(1+e)/sqrt(1-e)]^(2/5), with a
-/// log-uniform factor of 1-20 on top. Returns `None` if no such star fits.
-pub(in crate::physics) fn plan_outer_star(m1: f64, m_in: f64, a_in_au: f64, rng: &mut XorShift) -> Option<OuterStar> {
+/// own widest orbit is `a_in_au`.
+///
+/// The orbit respects the Mardling & Aarseth (2001) stability limit
+///   a_out / a_in > 2.8 · [(1+q)(1+e)/√(1-e)]^(2/5),
+/// multiplied by a log-uniform factor in [1, 20] so stars don't pile up right
+/// at the stability edge. An extra periapsis constraint keeps highly
+/// eccentric orbits from grazing the inner system. `m1` is the primary mass,
+/// used only to scale the companion's mass ratio. Returns `None` if the drawn
+/// orbit is non-finite or exceeds `OUTER_A_MAX_AU`.
+pub(in crate::physics) fn plan_outer_star(
+    m1: f64,
+    m_in: f64,
+    a_in_au: f64,
+    rng: &mut XorShift,
+) -> Option<OuterStar> {
+    // Mass-ratio density ~ q^1.5: wide, likely-captured outer stars share the
+    // companion peak-toward-unity seen in field binaries.
     let q_lo = STAR_M_MIN / m1;
     if q_lo >= 1.0 {
         return None;
     }
     let q = q_lo + (1.0 - q_lo) * rng.next_f64().powf(1.0 / 1.5);
     let m = q * m1;
+    // Thermal eccentricity distribution truncated at 0.8.
     let ecc = rng.next_f64().sqrt() * 0.8;
     let q_out = m / m_in;
     let crit = 2.8 * ((1.0 + q_out) * (1.0 + ecc) / (1.0 - ecc).sqrt()).powf(0.4);
-    // The periapsis must also clear 3x the inner orbit: the formula alone
-    // lets very eccentric orbits dip close to the inner system.
+    // The formula alone lets very eccentric orbits dip toward the inner
+    // system, so additionally require periapsis > 3·a_in.
     let a_au = (a_in_au * crit * 10f64.powf(1.3 * rng.next_f64())).max(3.0 * a_in_au / (1.0 - ecc));
     if !a_au.is_finite() || a_au > OUTER_A_MAX_AU {
         return None;
@@ -206,10 +244,15 @@ pub(in crate::physics) fn plan_outer_star(m1: f64, m_in: f64, a_in_au: f64, rng:
     Some(OuterStar { m, a_au, ecc })
 }
 
-/// Add the planned star on its orbit about the centre of mass of every body
-/// already in `b`. The inner system moves as a unit about the new common
-/// centre of mass, so its internal orbits are unchanged.
-pub(in crate::physics) fn place_outer_star(b: &mut Bodies, s: &OuterStar, age_gyr: f64, rng: &mut XorShift) {
+/// Add the planned outer star on its orbit about the centre of mass of every
+/// body already in `b`. The inner system is translated as a rigid unit about
+/// the new common COM, so its internal relative orbits are unchanged.
+pub(in crate::physics) fn place_outer_star(
+    b: &mut Bodies,
+    s: &OuterStar,
+    age_gyr: f64,
+    rng: &mut XorShift,
+) {
     let au = au_in_gm();
     let n0 = b.len();
     let m_in: f64 = b.m[..n0].iter().sum();
@@ -219,28 +262,38 @@ pub(in crate::physics) fn place_outer_star(b: &mut Bodies, s: &OuterStar, age_gy
     let omega = rng.next_f64() * std::f64::consts::TAU;
     let (rx, ry, rvx, rvy) = kepler_state(G * mt, s.a_au * au, s.ecc, nu, omega);
     let (f_in, f_out) = (s.m / mt, m_in / mt);
-    // Centre of mass of the inner system before the shift.
+    let (dx, dy, dvx, dvy) = (f_in * rx, f_in * ry, f_in * rvx, f_in * rvy);
+
+    // Single fused pass: accumulate the pre-shift COM and translate every
+    // inner body by the same barycentric offset. Reading the pre-shift
+    // values first keeps the COM bit-identical to a separate loop.
     let (mut cx, mut cy, mut cvx, mut cvy) = (0.0, 0.0, 0.0, 0.0);
     for i in 0..n0 {
-        cx += b.m[i] * b.x[i];
-        cy += b.m[i] * b.y[i];
-        cvx += b.m[i] * b.vx[i];
-        cvy += b.m[i] * b.vy[i];
+        let mi = b.m[i];
+        let xi = b.x[i];
+        let yi = b.y[i];
+        let vxi = b.vx[i];
+        let vyi = b.vy[i];
+        cx += mi * xi;
+        cy += mi * yi;
+        cvx += mi * vxi;
+        cvy += mi * vyi;
+        let nx = xi - dx;
+        let ny = yi - dy;
+        b.x[i] = nx;
+        b.y[i] = ny;
+        b.vx[i] = vxi - dvx;
+        b.vy[i] = vyi - dvy;
+        b._px[i] = nx;
+        b._py[i] = ny;
     }
-    (cx, cy, cvx, cvy) = (cx / m_in, cy / m_in, cvx / m_in, cvy / m_in);
-    for i in 0..n0 {
-        b.x[i] -= f_in * rx;
-        b.y[i] -= f_in * ry;
-        b.vx[i] -= f_in * rvx;
-        b.vy[i] -= f_in * rvy;
-        b._px[i] = b.x[i];
-        b._py[i] = b.y[i];
-    }
+    // The outer star sits at the (shifted) inner-system COM plus its own
+    // barycentric offset.
     let star = b.push(
-        cx + f_out * rx,
-        cy + f_out * ry,
-        cvx + f_out * rvx,
-        cvy + f_out * rvy,
+        cx / m_in + f_out * rx,
+        cy / m_in + f_out * ry,
+        cvx / m_in + f_out * rvx,
+        cvy / m_in + f_out * rvy,
         s.m,
         BodyKind::Star,
     );
@@ -264,7 +317,8 @@ pub(in crate::physics) fn spawn_binary_planets(
     let mt = m1 + m2;
     let p0 = compact_period_p0(rng);
 
-    // Candidate S-type host: usually the primary.
+    // S-type host: usually the primary, occasionally the secondary when the
+    // mass ratio favours it.
     let host = if rng.next_f64() < 0.5 * m2 / m1 {
         comp
     } else {
@@ -276,6 +330,8 @@ pub(in crate::physics) fn spawn_binary_planets(
     let r_host_au = (b.r[host] / au).max(1e-5);
     let inner_s = inner_edge_au(p0, b.m[host], r_host_au);
 
+    // P-type probability ramps linearly in log(a): close binaries always get
+    // circumbinary planets, wide ones never do.
     let p_prob = if bi.a_au <= BIN_P_TYPE_BELOW_AU {
         1.0
     } else if bi.a_au >= BIN_S_TYPE_ABOVE_AU {
@@ -284,7 +340,8 @@ pub(in crate::physics) fn spawn_binary_planets(
         1.0 - (bi.a_au / BIN_P_TYPE_BELOW_AU).ln()
             / (BIN_S_TYPE_ABOVE_AU / BIN_P_TYPE_BELOW_AU).ln()
     };
-    // S-type needs room for the compact inner planets.
+    // S-type needs enough room between the host's inner edge and the
+    // Holman-Wiegert limit to fit a compact planetary system.
     let s_ok = a_hi_s >= 3.0 * inner_s;
     let use_p = !s_ok || rng.next_f64() < p_prob;
 
@@ -298,7 +355,8 @@ pub(in crate::physics) fn spawn_binary_planets(
         let inner = inner_edge_au(p0_cb, mt, r_au);
         bi.arch = BinaryArch::PType;
         bi.a_crit_au = a_crit_p;
-        // The stars were placed about the barycentre, which is still the origin.
+        // The binary was placed about the barycentre, which is still at the
+        // origin, so the P-type frame uses a zero-offset COM at rest.
         let fr = Frame {
             centre: (0.0, 0.0, 0.0, 0.0, mt),
             m_class_sun: m1 / M_SUN_ME,
@@ -318,6 +376,8 @@ pub(in crate::physics) fn spawn_binary_planets(
             BinaryArch::STypeSecondary
         };
         bi.a_crit_au = a_crit_s;
+        // S-type planets orbit the host's current state; the companion
+        // contributes half its light to the outer-HZ estimate only.
         let fr = Frame {
             centre: (b.x[host], b.y[host], b.vx[host], b.vy[host], b.m[host]),
             m_class_sun: b.m[host] / M_SUN_ME,

@@ -4,6 +4,8 @@
 //! sub-modules. Everything is re-exported from here.
 
 use super::*;
+use std::f64::consts::TAU;
+use std::sync::OnceLock;
 
 pub mod belts;
 pub mod binary;
@@ -33,7 +35,7 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
         return None;
     }
     let a = a_lo * (a_hi / a_lo).powf(rng.next_f64());
-    let angle = rng.next_f64() * std::f64::consts::TAU;
+    let angle = rng.next_f64() * TAU;
     let (sa, ca) = angle.sin_cos();
     let v_circ = (G * b.m[i] / a).sqrt();
     let m_moon = b.m[i] * 10f64.powf(-4.0 + rng.next_f64() * 2.0);
@@ -55,6 +57,62 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
     let text = format!("{} spawned as a moon of {}", tag(b, moon), tag(b, i));
     b.log(EventKind::User, text, x, y);
     Some(moon)
+}
+
+/// Common inbound trajectory shared by `spawn_interstellar_object` and
+/// `spawn_rogue_planet`.
+///
+/// Draws exactly three `next_f64()` values, in this order: position
+/// angle, impact distance, impact angle. Both spawners therefore keep
+/// the RNG stream they had before this helper was factored out.
+struct Inbound {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    b_impact_au: f64,
+}
+
+/// Set up an unbound inbound trajectory from `0.9 × CULL_DIST`, aimed
+/// at a random impact parameter of 0.5–50 AU (log-uniform) from the
+/// primary, arriving 10 % above escape velocity. Returns `None` if
+/// there is no primary or `MAX_BODIES` is already reached.
+fn setup_inbound(b: &mut Bodies) -> Option<Inbound> {
+    let prim = primary_index(b)?;
+    if b.len() + 1 > MAX_BODIES {
+        return None;
+    }
+    let m_prim = b.m[prim];
+
+    // Start at 0.9 × CULL_DIST, at a random direction from the primary.
+    let r0 = 0.9 * CULL_DIST;
+    let theta = b.rng.next_f64() * TAU;
+    let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
+
+    // Aim at a point offset from the primary by `b_impact` in a random
+    // direction. Log-uniform 0.5 to 50 AU. The closest approach of the
+    // straight-line trajectory to the primary is approximately
+    // `b_impact` because b_impact << r0.
+    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
+    let b_impact = b_impact_au * au_in_gm();
+    let aim_theta = b.rng.next_f64() * TAU;
+    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
+    let (dx, dy) = (ax - sx, ay - sy);
+    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+    let (ux, uy) = (dx / d, dy / d);
+
+    // 10 % above the primary's escape speed at `r0`: bound orbit has
+    // E = 0, so E = 0.105 × v_esc² > 0 — unbound, leaves the system.
+    let v_esc = (2.0 * G * m_prim / r0).sqrt();
+    let v = 1.1 * v_esc;
+
+    Some(Inbound {
+        x: sx,
+        y: sy,
+        vx: ux * v,
+        vy: uy * v,
+        b_impact_au,
+    })
 }
 
 /// Spawn an interstellar object inbound from `0.9 × CULL_DIST`.
@@ -79,33 +137,7 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
 /// shifted stream, but `advance` never calls this, so no automatic
 /// test's RNG stream is affected.
 pub fn spawn_interstellar_object(b: &mut Bodies) -> Option<usize> {
-    let prim = primary_index(b)?;
-    if b.len() + 1 > MAX_BODIES {
-        return None;
-    }
-    let m_prim = b.m[prim];
-
-    // Start at 0.9 × CULL_DIST, at a random direction from the primary.
-    let r0 = 0.9 * CULL_DIST;
-    let theta = b.rng.next_f64() * std::f64::consts::TAU;
-    let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
-
-    // Aim at a point offset from the primary by `b_impact` in a random
-    // direction. Log-uniform 0.5 to 50 AU. The closest approach of the
-    // straight-line trajectory to the primary is approximately
-    // `b_impact` because b_impact << r0.
-    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
-    let b_impact = b_impact_au * au_in_gm();
-    let aim_theta = b.rng.next_f64() * std::f64::consts::TAU;
-    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
-    let (dx, dy) = (ax - sx, ay - sy);
-    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
-    let (ux, uy) = (dx / d, dy / d);
-
-    // 10 % above the primary's escape speed at `r0`: bound orbit has
-    // E = 0, so E = 0.105 × v_esc² > 0 — unbound, leaves the system.
-    let v_esc = (2.0 * G * m_prim / r0).sqrt();
-    let v = 1.1 * v_esc;
+    let t = setup_inbound(b)?;
 
     // Mass: log-uniform 1e-9 to 1e-6 M⊕ (≈ 6 km to 65 km radius).
     let m = 1e-9 * 10f64.powf(3.0 * b.rng.next_f64());
@@ -117,7 +149,7 @@ pub fn spawn_interstellar_object(b: &mut Bodies) -> Option<usize> {
         _ => BodyClass::Icy,
     };
 
-    let i = b.push(sx, sy, ux * v, uy * v, m, BodyKind::Planet);
+    let i = b.push(t.x, t.y, t.vx, t.vy, m, BodyKind::Planet);
     b.origin[i] = BodyOrigin::Interstellar;
     b.class[i] = class;
     b.bulk_density[i] = draw_density(&mut b.rng, class);
@@ -127,9 +159,9 @@ pub fn spawn_interstellar_object(b: &mut Bodies) -> Option<usize> {
     let text = format!(
         "{} entered the system inbound ({:.1} AU closest approach)",
         tag(b, i),
-        b_impact_au
+        t.b_impact_au
     );
-    b.log(EventKind::Interstellar, text, sx, sy);
+    b.log(EventKind::Interstellar, text, t.x, t.y);
     Some(i)
 }
 
@@ -142,14 +174,18 @@ pub fn add_ring(b: &mut Bodies, i: usize, n: usize, rng: &mut XorShift) -> Vec<u
     let n = n.clamp(1, 30);
     let r0 = b.r[i];
     let m_total = 1e-4 * b.m[i];
+    // 2.6 / 1.4 — hoisted so the ratio isn't recomputed per particle.
+    const RING_RATIO: f64 = 2.6 / 1.4;
     let radii: Vec<f64> = (0..n)
-        .map(|_| r0 * 1.4 * (2.6_f64 / 1.4).powf(rng.next_f64()))
+        .map(|_| r0 * 1.4 * RING_RATIO.powf(rng.next_f64()))
         .collect();
-    let weights: Vec<f64> = radii.iter().map(|&r| (r / r0).sqrt()).collect();
-    let wsum: f64 = weights.iter().sum();
-    for (r, w) in radii.iter().zip(weights.iter()) {
+    // The `w = sqrt(r / r0)` weights are cheap to recompute; storing
+    // them in a second `Vec` only bought an allocation.
+    let wsum: f64 = radii.iter().map(|&r| (r / r0).sqrt()).sum();
+    for &r in &radii {
+        let w = (r / r0).sqrt();
         let m = m_total * w / wsum;
-        let angle = rng.next_f64() * std::f64::consts::TAU;
+        let angle = rng.next_f64() * TAU;
         let (sa, ca) = angle.sin_cos();
         let v_circ = (G * b.m[i] / r).sqrt();
         let k = b.push(
@@ -288,8 +324,12 @@ pub(super) fn spacing_range(
 /// gravitational parameter `mu`, counter-clockwise, periapsis along `omega`.
 pub(super) fn kepler_state(mu: f64, a: f64, e: f64, nu: f64, omega: f64) -> (f64, f64, f64, f64) {
     let (sn, cn) = nu.sin_cos();
-    let r = a * (1.0 - e * e) / (1.0 + e * cn);
-    let h = (mu * a * (1.0 - e * e)).sqrt();
+    // `1 - e²` was computed twice; hoist it. The `a * one_minus_e2`
+    // grouping matches the original `a * (1 - e*e)` exactly, so `r`
+    // and `h` are bit-identical to the pre-refactor values.
+    let one_minus_e2 = 1.0 - e * e;
+    let r = a * one_minus_e2 / (1.0 + e * cn);
+    let h = (mu * a * one_minus_e2).sqrt();
     let v_t = h / r;
     let v_r = mu / h * e * sn;
     let (x_orb, y_orb) = (r * cn, r * sn);
@@ -322,8 +362,9 @@ pub(super) fn solve_kepler(mean_anom: f64, e: f64) -> f64 {
 }
 
 pub(super) fn true_anomaly(ecc_anom: f64, e: f64) -> f64 {
-    2.0 * ((1.0 + e).sqrt() * (ecc_anom * 0.5).sin())
-        .atan2((1.0 - e).sqrt() * (ecc_anom * 0.5).cos())
+    // `ecc_anom * 0.5` was computed twice; hoist it.
+    let half = ecc_anom * 0.5;
+    2.0 * ((1.0 + e).sqrt() * half.sin()).atan2((1.0 - e).sqrt() * half.cos())
 }
 
 /// Push a test body on a Kepler orbit about an arbitrary centre (position,
@@ -338,8 +379,8 @@ pub(super) fn push_kepler_about(
     kind: BodyKind,
 ) -> usize {
     let (cx, cy, cvx, cvy, mc) = centre;
-    let omega = rng.next_f64() * std::f64::consts::TAU;
-    let mean_anom = rng.next_f64() * std::f64::consts::TAU;
+    let omega = rng.next_f64() * TAU;
+    let mean_anom = rng.next_f64() * TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
     let (x, y, vx, vy) = kepler_state(G * (mc + m), a, e, nu, omega);
     b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind)
@@ -453,17 +494,26 @@ pub(super) fn push_kepler(
 
 /// Kroupa (2001) IMF, two-piece: dN/dm ∝ m^-1.3 below 0.5 M☉, m^-2.3 above.
 pub(super) fn sample_imf_mass(rng: &mut XorShift) -> f64 {
+    // The four endpoint powers were recomputed on every call via
+    // `powf`; hoist them into a `OnceLock`. The expressions are
+    // unchanged, so the constants are bit-identical to the originals.
+    static IMF: OnceLock<(f64, f64, f64, f64)> = OnceLock::new();
+    let &(a1, c1, a2, c2) = IMF.get_or_init(|| {
+        (
+            0.08_f64.powf(-0.3),
+            0.50_f64.powf(-0.3),
+            0.50_f64.powf(-1.3),
+            50.0_f64.powf(-1.3),
+        )
+    });
+
     let u = rng.next_f64();
     if u < 0.76 {
         let u2 = u / 0.76;
-        let a = 0.08_f64.powf(-0.3);
-        let c = 0.50_f64.powf(-0.3);
-        (a + u2 * (c - a)).powf(1.0 / -0.3)
+        (a1 + u2 * (c1 - a1)).powf(1.0 / -0.3)
     } else {
         let u2 = (u - 0.76) / 0.24;
-        let a = 0.50_f64.powf(-1.3);
-        let c = 50.0_f64.powf(-1.3);
-        (a + u2 * (c - a)).powf(1.0 / -1.3)
+        (a2 + u2 * (c2 - a2)).powf(1.0 / -1.3)
     }
 }
 
@@ -495,7 +545,7 @@ pub(super) fn sample_primary(rng: &mut XorShift) -> (f64, BodyKind) {
 pub(super) fn sample_normal(rng: &mut XorShift, mu: f64, sigma: f64) -> f64 {
     let u1 = rng.next_f64().max(1e-12);
     let u2 = rng.next_f64();
-    mu + sigma * (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    mu + sigma * (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
 }
 
 pub(super) fn poisson(rng: &mut XorShift, mean: f64) -> usize {
@@ -584,7 +634,9 @@ pub fn hw_critical_p(a_b: f64, e: f64, mu: f64) -> f64 {
 }
 
 pub(super) fn orbital_period_days(a_gm: f64, m_tot: f64) -> f64 {
-    std::f64::consts::TAU * (a_gm.powi(3) / (G * m_tot)).sqrt() * time_unit_s() / 86_400.0
+    // Explicit cube: LLVM lowers `powi(3)` to exactly this association,
+    // but writing it out makes the cost obvious.
+    TAU * ((a_gm * a_gm * a_gm) / (G * m_tot)).sqrt() * time_unit_s() / 86_400.0
 }
 
 pub fn spawn_system(b: &mut Bodies, body_count: usize, seed: u128) {
@@ -690,30 +742,7 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> 
 /// User-triggered — from a UI button or hotkey — so it draws from
 /// `b.rng` freely. Not called from `advance`.
 pub fn spawn_rogue_planet(b: &mut Bodies) -> Option<usize> {
-    let prim = primary_index(b)?;
-    if b.len() + 1 > MAX_BODIES {
-        return None;
-    }
-    let m_prim = b.m[prim];
-
-    // Same geometry as `spawn_interstellar_object`: inbound from
-    // 0.9 × CULL_DIST, aimed at a random impact parameter. 6 RNG draws
-    // per call (theta, impact distance, impact angle, mass, class,
-    // density) — identical structure to the ISO spawner.
-    let r0 = 0.9 * CULL_DIST;
-    let theta = b.rng.next_f64() * std::f64::consts::TAU;
-    let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
-
-    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
-    let b_impact = b_impact_au * au_in_gm();
-    let aim_theta = b.rng.next_f64() * std::f64::consts::TAU;
-    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
-    let (dx, dy) = (ax - sx, ay - sy);
-    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
-    let (ux, uy) = (dx / d, dy / d);
-
-    let v_esc = (2.0 * G * m_prim / r0).sqrt();
-    let v = 1.1 * v_esc;
+    let t = setup_inbound(b)?;
 
     // Mass: 0.1 to 10 M_Jup (log-uniform). Matches the free-floating
     // planet mass range from microlensing (Sumi 2011, Mróz 2017).
@@ -725,7 +754,7 @@ pub fn spawn_rogue_planet(b: &mut Bodies) -> Option<usize> {
         _ => BodyClass::Rocky,
     };
 
-    let i = b.push(sx, sy, ux * v, uy * v, m, BodyKind::Planet);
+    let i = b.push(t.x, t.y, t.vx, t.vy, m, BodyKind::Planet);
     b.origin[i] = BodyOrigin::RoguePlanet;
     b.class[i] = class;
     b.bulk_density[i] = 0.6 + 1.1 * b.rng.next_f64();
@@ -735,8 +764,8 @@ pub fn spawn_rogue_planet(b: &mut Bodies) -> Option<usize> {
     let text = format!(
         "{} entered the system inbound ({:.1} AU closest approach)",
         tag(b, i),
-        b_impact_au
+        t.b_impact_au
     );
-    b.log(EventKind::Interstellar, text, sx, sy);
+    b.log(EventKind::Interstellar, text, t.x, t.y);
     Some(i)
 }

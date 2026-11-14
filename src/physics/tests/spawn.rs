@@ -1,4 +1,18 @@
 //! Tests: initial conditions, multi-system layout, spawn variants.
+//!
+//! Test-name prefixes group tests by the code path under test:
+//!
+//!   `g_`  initial-condition statistics — IMF, remnant mix, occurrence rates
+//!   `j_`  compaction invariants — `Bodies::compact` and the parent cache
+//!   `t_`  multi-system spawn — ring layout and per-system binding
+//!   `aa_` user-facing spawn entry points — `spawn_random_systems`, presets
+//!   `b_`  belt spawning internals — tracers, Kirkwood gaps, comets (`belts.rs`)
+//!   `m_`  samplers, Kepler helpers, small-body spawners (`mod.rs`)
+//!   `c_`  cluster placement — ring and Plummer layout (`cluster.rs`)
+//!   `s_`  evolved/remnant systems (`systems.rs`)
+//!
+//! `TAU` is written fully qualified (`std::f64::consts::TAU`) below, matching
+//! the existing style here; the bare name is not in scope via the globs.
 
 use super::super::*;
 use super::shared::*;
@@ -6,14 +20,17 @@ use super::shared::*;
 // ===========================================================================
 // g — initial-condition statistics
 // ===========================================================================
+
+/// `spawn_system` must yield a primary, never more than `body_count` bodies,
+/// and — across a sample — belts in the majority of systems. A failure means
+/// either the count ceiling is broken, or belt spawning regressed below its
+/// physical occurrence rate.
 #[test]
 fn g_ic_random_architecture_sane() {
-    // Belts are common (see `debris_belt_occurrence_fraction`). What must
-    // always hold is that the count never exceeds the ceiling and that
-    // small bodies are present.
-    // Belt occurrence is probabilistic (debris_belt_occurrence_fraction),
-    // and ~15 % of primaries are remnants whose belts are usually empty.
-    // Expected belt fraction: 0.85 × 0.85 + 0.15 × 0.30 ≈ 0.77.
+    // Expected belt fraction ≈ 0.85 (star) × 0.85 (belt occurrence)
+    //                       + 0.15 (remnant) × 0.30 (evolved-belt occurrence)
+    //                       ≈ 0.77.
+    // The 0.70 floor leaves ~3σ margin over 200 seeds.
     let mut with_belt = 0;
     for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
@@ -31,6 +48,10 @@ fn g_ic_random_architecture_sane() {
     );
 }
 
+/// Every host kind `spawn_aged_primary` can return must appear as a primary:
+/// MS star, brown dwarf, white dwarf, neutron star, black hole. A miss means
+/// one of the three `sample_primary` branches (stellar / BD draw) or the
+/// `remnant_of` conversion has stopped firing.
 #[test]
 fn g_ic_primary_diversity() {
     let mut seen = [false; 5];
@@ -53,9 +74,12 @@ fn g_ic_primary_diversity() {
     assert!(seen[4], "no black holes in 1500 seeds");
 }
 
+/// `sample_primary` returns a stellar-mass primary 85 % of the time
+/// (Kroupa-integral approximation). This tests the sampler directly, so the
+/// 15 % brown-dwarf branch is visible *before* `spawn_aged_primary` filters
+/// some stellar draws into remnants.
 #[test]
 fn g_ic_primary_imf_mass_vs_remnant_split() {
-    // Before aging: 85 % of primaries are stellar-mass draws.
     let mut rng = XorShift::new(12345);
     let n = 20_000;
     let stars = (0..n)
@@ -65,10 +89,12 @@ fn g_ic_primary_imf_mass_vs_remnant_split() {
     assert!((0.82..=0.88).contains(&f), "stellar-mass fraction {}", f);
 }
 
+/// After aging, the sample is still mostly MS stars but contains a realistic
+/// remnant fraction and every compact kind. The 50–85 % star band is wide
+/// on purpose: the remnant rate depends on the uniform-in-lifetime draw,
+/// `AGE_UNIVERSE_GYR`, and the per-mass `star_total_life_gyr`.
 #[test]
 fn g_ic_primary_mix_realistic() {
-    // After aging: most primaries are still Stars, but a real share of the
-    // 85 % stellar draws has already died, and every compact kind occurs.
     let n = 3000u128;
     let (mut ms, mut bd, mut wd, mut ns, mut bh) = (0, 0, 0, 0, 0);
     for seed in 0..n {
@@ -91,10 +117,13 @@ fn g_ic_primary_mix_realistic() {
         f(bd)
     );
     assert!(wd > 0 && ns > 0 && bh > 0, "wd {} ns {} bh {}", wd, ns, bh);
-    // Remnants now come only from aged stars.
     assert!(f(wd) > 0.0, "white dwarf fraction {}", f(wd));
 }
 
+/// The Kroupa (2001) IMF is heavily skewed low; a median well below 0.6
+/// M☉ confirms the two-piece power law in `sample_imf_mass` is not
+/// degenerating to a uniform draw. A median outside [0.2, 0.6] points to a
+/// wrong endpoint or exponent.
 #[test]
 fn g_ic_imf_median_mass() {
     let mut ms: Vec<f64> = Vec::new();
@@ -111,6 +140,9 @@ fn g_ic_imf_median_mass() {
     assert!(med > 0.20 && med < 0.60, "median {}", med);
 }
 
+/// Hot Jupiters occur in ~1 % of FGK hosts (Steffen 2012). The wide
+/// [0.3 %, 3 %] band accommodates Poisson noise over 2000 seeds plus the
+/// per-host metallicity boost from `giant_occ`.
 #[test]
 fn g_ic_hot_jupiter_rate() {
     let au = au_in_gm();
@@ -140,6 +172,10 @@ fn g_ic_hot_jupiter_rate() {
 // ===========================================================================
 // j — compaction invariants
 // ===========================================================================
+
+/// `compact()` must remap `parent_cache` to the new indices and null out
+/// entries whose parent was removed. A failure means subsequent
+/// `find_parent` calls return stale or dangling indices.
 #[test]
 fn j_compact_remaps_parent_cache() {
     let mut b = Bodies::with_capacity(8);
@@ -165,14 +201,16 @@ fn j_compact_remaps_parent_cache() {
 // ===========================================================================
 // t — multi-system spawn
 // ===========================================================================
-/// Each of the 3 spawned suns must remain near the ring radius after a few
-/// steps; the mutual gravity of the ring is in equilibrium with the
-/// tangential velocity that `spawn_solar_systems` gave them.
+
+/// The three spawned suns must stay near their initial ring radius for 50
+/// steps. `spawn_solar_systems_impl` gives each system the circular-ring
+/// velocity for the ring's summed mutual potential, so the ring is in
+/// equilibrium: a failure means `ring_sum` or `ring_slot` is wrong, and the
+/// cluster collapses or flies apart.
 #[test]
 fn t_multi_system_ring() {
     let mut b = Bodies::with_capacity(32);
     let (_radius, ranges) = spawn_solar_systems_impl(&mut b, 3);
-    // Record initial sun positions.
     let suns: Vec<usize> = (0..b.len())
         .filter(|&i| b.kind[i] == BodyKind::Star)
         .collect();
@@ -181,9 +219,6 @@ fn t_multi_system_ring() {
     for _ in 0..50 {
         advance(&mut b, DT);
     }
-    // After 50 steps, each sun is still inside the same cluster: within
-    // 3x its initial distance from the origin (the cluster is virialised,
-    // so it moves but does not fly apart on this timescale).
     for (k, &i) in suns.iter().enumerate() {
         let (x0, y0) = initial[k];
         let r0 = x0.hypot(y0).max(1.0);
@@ -193,9 +228,11 @@ fn t_multi_system_ring() {
     let _ = ranges;
 }
 
-/// Every planet in a 3-system spawn must be bound to its own sun (not to
-/// a foreign one). Skip belt and debris bodies — they may be unbound or
-/// have high eccentricity by design.
+/// Every spawned planet in a 3-system run must be bound to the sun it was
+/// spawned around — not a foreign one — and on a near-circular orbit. Belts
+/// and debris are skipped: they may be unbound by design (Hildas, comets).
+/// Moons are skipped too: their velocity is dominated by the planet orbit,
+/// so "bound to nearest sun" is the wrong test.
 #[test]
 fn t_multi_system_planets_bound_to_own_sun() {
     let mut b = Bodies::with_capacity(32);
@@ -214,12 +251,9 @@ fn t_multi_system_planets_bound_to_own_sun() {
         if b.m[i] < 0.01 {
             continue;
         }
-        // Skip moons: a moon's velocity is dominated by its own orbit
-        // about its planet, so "bound to nearest sun" is the wrong check.
         if is_moon(&b, i) {
             continue;
         }
-        // Nearest sun by euclidean distance.
         let mut nearest = suns[0];
         let mut best = f64::INFINITY;
         for &k in &suns {
@@ -239,13 +273,15 @@ fn t_multi_system_planets_bound_to_own_sun() {
 // ===========================================================================
 // aa — spawn variants
 // ===========================================================================
+
+/// `spawn_random_systems(_, 20, _, 3)` must produce 3 systems, a body count
+/// in the plausible range (realistic spawning under-fills `body_count` —
+/// typically 5–15 bodies per system), and non-overlapping layout.
 #[test]
 fn aa_random_systems_ring_and_count() {
     let mut b = Bodies::with_capacity(64);
     let infos = spawn_random_systems(&mut b, 20, 42, 3);
-    // `n=20` is a ceiling, not a target: with realistic spawning, each
-    // system typically ends up with 5–15 bodies. 3 systems → 15–45
-    // bodies expected; accept 10..=60.
+    // 3 × (5–15) = 15–45 expected; 10–60 gives headroom on both sides.
     assert!(
         (10..=60).contains(&b.len()),
         "3 systems of n=20 produced {} bodies",
@@ -262,6 +298,9 @@ fn aa_random_systems_ring_and_count() {
     );
 }
 
+/// `spawn_solar_system` must produce a Sun at the preset age (4.6 Gyr), an
+/// Earth at ~1 AU, and at least the 9 preset planets. Belt bodies join them,
+/// so the exact count depends on `PRESET_BELT_BUDGET`.
 #[test]
 fn solar_preset_loads_at_present_age() {
     let preset = solar_system_preset();
@@ -269,12 +308,9 @@ fn solar_preset_loads_at_present_age() {
     assert_eq!(preset.planets.len(), 21);
     let mut b = Bodies::with_capacity(0);
     spawn_solar_system(&mut b);
-    // Belt bodies now join the 9 (Sun + 8 planets). The exact count
-    // depends on PRESET_BELT_BUDGET, so check the lower bound.
     assert!(b.len() >= 9, "Solar System spawned {} bodies", b.len());
     assert_eq!(b.kind[0], BodyKind::Star);
     assert_eq!(b.kind[0], BodyKind::Star);
-    // The preset's star is spawned at its present age (4.6 Gyr).
     assert!(
         (b.age_gyr[0] - 4.6).abs() < 1e-9,
         "preset star age = {}",
@@ -288,11 +324,14 @@ fn solar_preset_loads_at_present_age() {
     assert!((o.semi_major / au_in_gm() - 1.0).abs() < 0.01);
 }
 
+/// Three independent Solar spawns must give each Earth a distinct azimuth,
+/// i.e. the per-system phase seed actually varies. A failure means the
+/// spawner is not seeding per-system RNG correctly, and the multi-system
+/// ring degenerates to a single phase.
 #[test]
 fn solar_ring_systems_have_independent_phases() {
     let mut b = Bodies::with_capacity(0);
     spawn_solar_systems(&mut b, 3);
-    // Each system has 9 planets + ~200 belts. The suns are still 3.
     assert!(
         b.len() >= 27,
         "expected at least 27 bodies, got {}",
@@ -302,7 +341,7 @@ fn solar_ring_systems_have_independent_phases() {
         .filter(|&i| b.kind[i] == BodyKind::Star)
         .collect();
     assert_eq!(suns.len(), 3);
-    // Each system's Earth is at sun + 3 (Sun, Mercury, Venus, Earth).
+    // Earth is sun + 3 (Sun, Mercury, Venus, Earth).
     let ang: Vec<f64> = suns
         .iter()
         .map(|&s| (b.y[s + 3] - b.y[s]).atan2(b.x[s + 3] - b.x[s]))
@@ -310,6 +349,8 @@ fn solar_ring_systems_have_independent_phases() {
     assert!((ang[0] - ang[1]).abs() > 1e-6 && (ang[1] - ang[2]).abs() > 1e-6);
 }
 
+/// The preset must spawn a dense belt (not just the 9 planets). 100 is the
+/// loosest bound that still rules out an empty belt population.
 #[test]
 fn solar_preset_has_belt_bodies() {
     let mut b = Bodies::with_capacity(0);
@@ -318,6 +359,10 @@ fn solar_preset_has_belt_bodies() {
     assert!(n_belt > 100, "belt bodies: {}", n_belt);
 }
 
+/// Every belt population the Solar System preset declares must actually
+/// appear. A miss means one of the belt spec branches in `belt_spec_for`
+/// (asteroid, Kuiper cold/hot/resonant/scattered, Trojan, Hilda) is not
+/// firing for the preset's parameters.
 #[test]
 fn solar_preset_has_every_belt_population() {
     let mut b = Bodies::with_capacity(0);
@@ -336,11 +381,12 @@ fn solar_preset_has_every_belt_population() {
     }
 }
 
+/// Mean-anomaly sampling must be uniform in *time*, not in true anomaly.
+/// For e = 0.5, a time-uniform sampler spends (π/2 − e)/π ≈ 0.34 of its
+/// time with r < a; a true-anomaly sampler would give 2/3 instead. So this
+/// distinguishes the two conventions.
 #[test]
 fn mean_anomaly_sampling_is_uniform_in_time() {
-    // For e = 0.5, a body spends (π - 2e) / (2π) of its *time* with r < a,
-    // i.e. (π/2 - e)/π ≈ 0.34. A true-anomaly sampler would give 2/3
-    // instead. So this distinguishes the two.
     let mut b = Bodies::with_capacity(1000);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let mut rng = XorShift::new(7);
@@ -358,10 +404,11 @@ fn mean_anomaly_sampling_is_uniform_in_time() {
     );
 }
 
+/// `body_count` is a strict ceiling for `spawn_system`: a sparse system may
+/// under-fill it, but no path (belts, comets, background debris, moons) may
+/// exceed it.
 #[test]
 fn random_systems_never_exceed_body_count() {
-    // `body_count` is a ceiling: sparse systems may under-fill it, but no
-    // system may exceed it.
     for seed in 0..200u128 {
         let mut b = Bodies::with_capacity(100);
         spawn_system(&mut b, 100, seed);
@@ -369,12 +416,12 @@ fn random_systems_never_exceed_body_count() {
     }
 }
 
+/// `push` seeds `bulk_density` so that `radius_from_density` reproduces
+/// `planet_true_r` at the body's initial mass. This is what keeps a
+/// freshly-spawned planet visually the same size as before the bulk-density
+/// change.
 #[test]
 fn default_density_matches_mass_radius_law() {
-    // `push` seeds `bulk_density` so that `radius_from_density` reproduces
-    // `planet_true_r` at the body's initial mass. This is what keeps a
-    // freshly-spawned planet visually the same size as before the
-    // bulk-density change.
     let mut b = Bodies::with_capacity(4);
     for &m in &[0.01, 1.0, 5.0, 100.0] {
         let i = b.push(1.0, 0.0, 0.0, 0.0, m, BodyKind::Planet);
@@ -382,9 +429,10 @@ fn default_density_matches_mass_radius_law() {
     }
 }
 
-/// `spawn_solar_system` must produce the same body count as `spawn_from_preset`.
-/// The UI's "systems" row multiplies this count by systems; the old code
-/// hard-coded 9 and the row read "1 × 9" while the body row read "214".
+/// `spawn_solar_system` and `spawn_from_preset(solar_system_preset())` must
+/// agree on body count. The UI's "systems" row multiplies this count by
+/// system count; the old code hard-coded 9 and the row read "1 × 9" while
+/// the body row read "214".
 #[test]
 fn solar_system_spawn_count_matches_preset() {
     let mut b = Bodies::with_capacity(0);
@@ -399,7 +447,8 @@ fn solar_system_spawn_count_matches_preset() {
     );
 }
 
-/// `fit` on the Solar preset must include Neptune (30 AU ≈ 4500 Gm).
+/// `fit` on the Solar preset must reach Neptune (30 AU ≈ 4500 Gm). A
+/// smaller extent would clip the outer solar system off-screen.
 #[test]
 fn fit_solar_includes_neptune() {
     let neptune_gm = 30.07 * au_in_gm();
@@ -411,8 +460,9 @@ fn fit_solar_includes_neptune() {
     );
 }
 
-/// R on the Solar preset must change the planet phases. Two spawns with
-/// different phase seeds must produce different angles for the same body.
+/// R on the Solar preset must re-phase the planets: two different phase
+/// seeds must put Earth at different azimuths. A failure means the reset
+/// path is not threading the seed through the spawner.
 #[test]
 fn solar_reset_changes_phases() {
     let mut b1 = Bodies::with_capacity(0);
@@ -431,9 +481,10 @@ fn solar_reset_changes_phases() {
     assert!((a1 - a2).abs() > 1e-6, "phases identical: {a1} vs {a2}");
 }
 
-/// Collisions inside `step_block` must trigger a tree rebuild; otherwise
-/// the stale body indices either panic or silently compute wrong forces.
-/// This exercises the `stats_before != stats_after` rebuild path.
+/// Collisions inside `step_block` must trigger a tree rebuild. If they don't,
+/// stale body indices either panic or silently compute wrong forces. This
+/// exercises the `stats_before != stats_after` rebuild path by seeding 20
+/// overlapping pairs that force ≥20 merges in five steps.
 #[test]
 fn step_block_with_collisions_runs_clean() {
     let mut b = Bodies::with_capacity(800);
@@ -452,7 +503,6 @@ fn step_block_with_collisions_runs_clean() {
             BodyKind::Planet,
         );
     }
-    // Twenty overlapping pairs, to trigger many merges in one step_block.
     for k in 0..20 {
         let r = 5.0 + (k as f64) * 1.5;
         let th = 0.1 + (k as f64) * 0.3;
@@ -476,6 +526,11 @@ fn step_block_with_collisions_runs_clean() {
     assert!(b.stats.merges >= 20, "expected ≥ 20 merges");
 }
 
+// --- ring geometry ---------------------------------------------------------
+
+/// `ring_radius_for_extent` must never shrink below `solar_ring_radius_gm(n)`
+/// and must widen to 3× the widest system extent. A failure means wide
+/// binaries overlap their neighbours at spawn.
 #[test]
 fn m1_ring_accommodates_wide_binary() {
     assert!((ring_radius_for_extent(3, 0.0) - solar_ring_radius_gm(3)).abs() < 1e-9);
@@ -490,8 +545,6 @@ fn m1_ring_accommodates_wide_binary() {
         if !wide {
             continue;
         }
-        // The two systems must not overlap: centre distance exceeds the sum
-        // of their reach about their own centres of mass.
         let c: Vec<(f64, f64)> = ranges.iter().map(|&r| range_com(&b, r)).collect();
         let reach: Vec<f64> = ranges
             .iter()
@@ -512,12 +565,15 @@ fn m1_ring_accommodates_wide_binary() {
     panic!("no wide binary in 500 seeds - adjust seed range");
 }
 
+/// `ring_slots` must scatter systems radially. A failure means the semi-major
+/// axis jitter (±15 % around the ring radius) has been lost, collapsing the
+/// ring to a single radius.
 #[test]
 fn m2_radial_scatter() {
     let mut b = Bodies::with_capacity(0);
     let _ = spawn_random_systems(&mut b, 5, 42, 6);
     let prim: Vec<f64> = (0..b.len())
-        .filter(|&i| is_host_kind(b.kind[i])) // Star | BD | WD | NS | BH
+        .filter(|&i| is_host_kind(b.kind[i]))
         .map(|i| b.x[i].hypot(b.y[i]))
         .collect();
     assert!(prim.len() >= 6);
@@ -527,6 +583,8 @@ fn m2_radial_scatter() {
     assert!(max_r - min_r > 0.05 * ring, "no radial scatter");
 }
 
+/// `ring_theta` must add jitter of exactly ±0.15 polygon steps. A failure
+/// means the angular jitter coefficient has changed or the base angle is off.
 #[test]
 fn m3_angular_jitter() {
     let n = 6usize;
@@ -546,6 +604,8 @@ fn m3_angular_jitter() {
     assert!(differs, "seeds give the same angles");
 }
 
+/// `ring_slot` must give the e = 0 circular speed for the summed ring
+/// potential, and speed must scale as √m (Kepler's third law at fixed `a`).
 #[test]
 fn m4_per_system_speed() {
     let s = ring_sum(4);
@@ -554,9 +614,7 @@ fn m4_per_system_speed() {
         vx.hypot(vy)
     };
     assert!((speed(10.0) / speed(1.0) - 10f64.sqrt()).abs() < 1e-9);
-    // e = 0 gives the circular ring speed.
     assert!((speed(2.0) - (G * 2.0 * s / 1e4).sqrt()).abs() < 1e-9);
-    // In a spawn the systems do not share one speed.
     let mut b = Bodies::with_capacity(0);
     let (_, ranges) = spawn_random_systems_impl(&mut b, 5, 42, 4);
     let v: Vec<f64> = ranges
@@ -576,6 +634,10 @@ fn m4_per_system_speed() {
     assert!(hi > lo * 1.0001, "all systems have the same speed: {v:?}");
 }
 
+/// The M5 rescale in `spawn_random_systems_impl` must keep each system within
+/// [2, 60] bodies. The floor of 2 (not 3) allows the degenerate BD + BD
+/// case: ~8 % BD primaries × 20 % BD companions ≈ 1.7 % of systems, which
+/// spawn no planets and no belts.
 #[test]
 fn m5_body_count_scales_with_mass() {
     let mut any_scaled = false;
@@ -583,21 +645,18 @@ fn m5_body_count_scales_with_mass() {
         let mut b = Bodies::with_capacity(0);
         let (_, ranges) = spawn_random_systems_impl(&mut b, 30, seed, 4);
         for &(s, e) in &ranges {
-            // Realistic spawning occasionally produces degenerate systems: a
-            // brown-dwarf primary + brown-dwarf companion, no planets, no
-            // belts. That is a legitimate 2-body outcome (P ≈ 8 % × 20 % ≈
-            // 1.7 % per BD system), so the floor is 2, not 3.
             assert!((2..=60).contains(&(e - s)), "seed {seed}: size {}", e - s);
             any_scaled |= e - s != 30;
         }
     }
     assert!(any_scaled, "no system was rescaled");
-    // One system is never rescaled.
     let mut b = Bodies::with_capacity(0);
     let _ = spawn_random_systems(&mut b, 30, 5, 1);
     assert!(b.len() <= 30, "{} bodies", b.len());
 }
 
+/// `ring_slot` must produce states on the intended Kepler ellipse for
+/// eccentric mutual orbits, and periapsis must be closer than apoapsis.
 #[test]
 fn m6_eccentric_mutual_orbits() {
     let s = ring_sum(6);
@@ -614,6 +673,12 @@ fn m6_eccentric_mutual_orbits() {
     assert!(xa.hypot(ya) > 1.5 * xp.hypot(yp));
 }
 
+// --- planet-architecture statistics ----------------------------------------
+
+/// Compact chains are "peas in a pod" (2+ planets) or absent: a lone compact
+/// planet is not one of the spawner's modes. `P_COMPACT_CHAIN` is ~40 %, so
+/// the ~30 % of systems with a chain here leaves room for under-fill from
+/// small body budgets.
 #[test]
 fn spawn_compact_chain_is_bimodal() {
     let (mut zero, mut one, mut chain) = (0u32, 0u32, 0u32);
@@ -631,6 +696,9 @@ fn spawn_compact_chain_is_bimodal() {
     assert!(zero > 400, "no compact planet: {}/1000", zero);
 }
 
+/// Compact chains and giant planets must coexist sometimes: a system with a
+/// full 3+ super-Earth chain and a giant below is the standard Kepler
+/// architecture (e.g. our own Solar System, if Jupiter counts as a giant).
 #[test]
 fn spawn_compact_and_giant_coexist() {
     let mut both = 0u32;
@@ -644,9 +712,12 @@ fn spawn_compact_and_giant_coexist() {
     assert!(both > 20, "systems with a chain and a giant: {}", both);
 }
 
+/// The Kuiper belt with a Jupiter at 5.2 AU must carry a mass in the observed
+/// cold-classical range (median ≈ 0.03 M⊕) and the tracer population must
+/// carry a reasonable fraction of that mass. The ±5× band accommodates the
+/// log-normal scatter and the per-tracer mass cap.
 #[test]
 fn spawn_outer_belt_mass_realistic() {
-    // Solar analogue with a Jupiter: the outer belt carries `outer_mass`.
     let centre = (0.0, 0.0, 0.0, 0.0, M_SUN_ME);
     let planets = [(1usize, 317.8, 5.2)];
     let mut spec_masses = Vec::new();
@@ -694,7 +765,8 @@ fn spawn_outer_belt_mass_realistic() {
         v.sort_by(|a, c| a.total_cmp(c));
         v[v.len() / 2]
     };
-    // Observed cold classical Kuiper belt: ~0.03 Me.
+    // Observed cold classical Kuiper belt: ~0.03 M⊕. ±5× = the log-normal
+    // scatter budget.
     let m_med = median(&mut spec_masses);
     assert!(
         m_med > 0.03 / 5.0 && m_med < 0.03 * 5.0,
@@ -709,6 +781,9 @@ fn spawn_outer_belt_mass_realistic() {
     );
 }
 
+/// Outer-belt mass barely declines with age: the `(1 + t/3)⁻⁰·³` factor is
+/// mild by design, unlike the inner belt's `(1 + t/0.3)⁻¹`. A failure means
+/// the depletion exponents were swapped.
 #[test]
 fn outer_belt_mass_barely_declines_with_age() {
     let old = belt_mass_earth_outer(1.0, 0.0, 10.0, &mut XorShift::new(42));
@@ -716,11 +791,17 @@ fn outer_belt_mass_barely_declines_with_age() {
     assert!(old > 0.5 * young, "old {} young {}", old, young);
 }
 
+/// `debris_belt_occurrence_fraction` is an *intrinsic* (formation) rate, not
+/// a detection rate — belts persist even when too faint for IR-excess
+/// surveys. The floor of 0.80 is therefore tighter than any observed rate.
 #[test]
 fn debris_belt_occurrence_is_near_universal() {
     assert!(debris_belt_occurrence_fraction(1.0, 10.0) >= 0.80);
 }
 
+/// Brown-dwarf hosts get a BD companion in ~20 % of cases; over 500 seeds
+/// that is ~100 draws, so "more than 5" is a very safe floor that still
+/// catches a total failure of the BD-binary branch in `spawn_companion`.
 #[test]
 fn spawn_bd_binaries_exist() {
     let mut n = 0;
@@ -734,6 +815,9 @@ fn spawn_bd_binaries_exist() {
     assert!(n > 5, "brown-dwarf binaries: {}", n);
 }
 
+/// The BD mass function declines toward the hydrogen-burning limit, so the
+/// median BD draw sits below the midpoint of [BD_M_MIN, BD_M_MAX]. A failure
+/// means `sample_primary`'s BD branch is not log-uniform.
 #[test]
 fn sample_primary_bd_mass_skews_low() {
     let mut rng = XorShift::new(11);
@@ -756,6 +840,8 @@ fn sample_primary_bd_mass_skews_low() {
     );
 }
 
+/// Redundant safeguard alongside `random_systems_never_exceed_body_count`;
+/// kept as a distinct seed range so the two together cover 400 seeds.
 #[test]
 fn spawn_never_exceeds_body_count() {
     for seed in 0..200u128 {
@@ -765,10 +851,12 @@ fn spawn_never_exceeds_body_count() {
     }
 }
 
+/// Kuiper surface density Σ ∝ a⁻¹·⁵ gives a median semi-major axis below
+/// the midpoint of [10, 50] AU. A flat draw would put the median at 30;
+/// the falling Σ pulls it to ~26. A failure means `draw_a_outer` lost its
+/// √a weighting.
 #[test]
 fn outer_belt_radii_follow_falling_surface_density() {
-    // Sigma ~ a^-1.5: more bodies in the inner half of [10, 50] AU than a
-    // flat draw gives (median ~26 AU, not 30 AU), and all inside the range.
     let mut rng = XorShift::new(3);
     let mut v: Vec<f64> = (0..5000)
         .map(|_| draw_a_outer(&mut rng, 10.0, 50.0, &[]).unwrap())
@@ -778,6 +866,9 @@ fn outer_belt_radii_follow_falling_surface_density() {
     assert!(v[2500] < 28.0, "median {}", v[2500]);
 }
 
+/// Lone giants follow Rayleigh(0.15) truncated at 0.7, giving a mean
+/// eccentricity of ~0.20. Observed single giants are similar (Kipping 2013).
+/// A mean outside [0.12, 0.30] signals a wrong σ or truncation.
 #[test]
 fn spawn_lone_giants_are_eccentric() {
     let mut es = Vec::new();
@@ -810,6 +901,10 @@ fn spawn_lone_giants_are_eccentric() {
     assert!(mean > 0.12 && mean < 0.30, "mean e {}", mean);
 }
 
+/// Chains near 3:2 or 2:1 period ratios are a real Kepler feature (TRAPPIST-1
+/// being the famous example). `P_RESONANT_CHAIN` is ~30 %, so >15 % resonant
+/// chains with 3+ small planets confirms the branch fires and survives
+/// neighbour-spacing draws.
 #[test]
 fn spawn_compact_chains_include_resonant_systems() {
     let (mut chains, mut resonant) = (0u32, 0u32);
@@ -849,10 +944,12 @@ fn spawn_compact_chains_include_resonant_systems() {
     );
 }
 
+/// `P_UNSTABLE_GIANTS` packs 2+ giants inside ~2–3.5 mutual Hill radii so
+/// the system will scatter. Stable 1.5–2.2 period spacing gives ≫4.6 Hill
+/// radii, so finding >15/1000 systems below 4.6 confirms the unstable
+/// branch fires.
 #[test]
 fn spawn_unstable_giant_systems_exist() {
-    // Tightly packed giants: adjacent pairs inside ~4.6 mutual Hill radii
-    // (stable 1.5-2.2 period spacing gives > 10).
     let mut packed = 0u32;
     for seed in 0..1000u128 {
         let b = solar_mass_system(seed, 100);
@@ -877,6 +974,10 @@ fn spawn_unstable_giant_systems_exist() {
     assert!(packed > 15, "packed giant systems: {}/1000", packed);
 }
 
+/// Hierarchical multiplicity (`P_TRIPLE_GIVEN_BINARY` × `P_QUAD_GIVEN_TRIPLE`)
+/// must actually produce triples and quadruples. The >3 % triple floor is a
+/// safe bound given ~46 % of FGK stars are binary and the triple/quad
+/// probabilities stack on top.
 #[test]
 fn spawn_triples_and_quadruples_exist() {
     let (mut hosts, mut triples, mut quads) = (0u32, 0u32, 0u32);
@@ -907,6 +1008,9 @@ fn spawn_triples_and_quadruples_exist() {
     assert!(quads >= 3, "quadruples: {}", quads);
 }
 
+/// Outer stars must sit beyond twice the inner binary's periapsis. This is
+/// the Mardling–Aarseth stability check with a healthy safety margin;
+/// a failure means `plan_outer_star` is producing unstable hierarchies.
 #[test]
 fn hierarchical_stars_respect_stability_limit() {
     for seed in 0..3000u128 {
@@ -917,7 +1021,6 @@ fn hierarchical_stars_respect_stability_limit() {
             .filter(|&i| b.kind[i] == BodyKind::Star && i != 0 && i != bi.companion)
             .collect();
         for &s in &stars {
-            // Distance of the outer star from the inner pair's centre of mass.
             let (m0, m1) = (b.m[0], b.m[bi.companion]);
             let cx = (m0 * b.x[0] + m1 * b.x[bi.companion]) / (m0 + m1);
             let cy = (m0 * b.y[0] + m1 * b.y[bi.companion]) / (m0 + m1);
@@ -933,20 +1036,21 @@ fn hierarchical_stars_respect_stability_limit() {
     }
 }
 
+/// An interstellar object spawns at 0.9 × CULL_DIST, inbound, unbound, and
+/// logs an "entered" event. All three properties must hold together; a
+/// failure means `setup_inbound`'s geometry or the log call is broken.
 #[test]
 fn spawn_interstellar_object_is_inbound_and_logged() {
     let mut b = Bodies::with_capacity(2);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let n = spawn_interstellar_object(&mut b).expect("ISO should spawn");
     assert_eq!(b.origin[n], BodyOrigin::Interstellar);
-    // Starts near 0.9 × CULL_DIST from the primary.
     let r0 = (b.x[n] * b.x[n] + b.y[n] * b.y[n]).sqrt();
     assert!(
         (r0 - 0.9 * CULL_DIST).abs() < 1e-6 * CULL_DIST,
         "ISO start radius {} vs 0.9 × CULL_DIST",
         r0
     );
-    // Inbound: velocity dotted with the outward radial vector is negative.
     let (dx, dy) = (b.x[n] - b.x[0], b.y[n] - b.y[0]);
     let (vx, vy) = (b.vx[n] - b.vx[0], b.vy[n] - b.vy[0]);
     assert!(
@@ -954,12 +1058,10 @@ fn spawn_interstellar_object_is_inbound_and_logged() {
         "ISO must be inbound: r·v = {}",
         dx * vx + dy * vy
     );
-    // Unbound relative to the primary: specific orbital energy > 0.
     let v2 = vx * vx + vy * vy;
     let r = (dx * dx + dy * dy).sqrt();
     let e_spec = 0.5 * v2 - G * b.m[0] / r;
     assert!(e_spec > 0.0, "ISO must be unbound: E = {}", e_spec);
-    // Logged as "entered".
     assert!(
         b.events
             .iter()
@@ -968,6 +1070,9 @@ fn spawn_interstellar_object_is_inbound_and_logged() {
     );
 }
 
+/// A rogue planet uses the same `setup_inbound` trajectory but is 0.1–10
+/// M_Jup. Both mass bound and the inbound/unbound state must hold; a failure
+/// means the mass draw or the geometry regressed.
 #[test]
 fn spawn_rogue_planet_is_heavy_and_inbound() {
     let mut b = Bodies::with_capacity(2);
@@ -999,6 +1104,9 @@ fn spawn_rogue_planet_is_heavy_and_inbound() {
     assert!(0.5 * v2 - G * b.m[0] / r > 0.0, "rogue must be unbound");
 }
 
+/// An unbound rogue must have no parent: `refresh_parent_cache` runs the
+/// binding test and must reject it. A failure means the binding criterion
+/// is too permissive and treats unbound bodies as moons.
 #[test]
 fn rogue_planet_is_not_a_moon() {
     let mut b = Bodies::with_capacity(2);
@@ -1010,4 +1118,592 @@ fn rogue_planet_is_not_a_moon() {
         None,
         "rogue must not report a parent — it's unbound"
     );
+}
+
+// ===========================================================================
+// b — belt spawning internals
+// ===========================================================================
+
+/// `tracers_for_mass` must reject non-finite/non-positive masses, honour
+/// the budget ceiling, apply the physical and visibility floors, and be
+/// linear in mass below the cap. Each branch is a distinct consumer:
+/// bad inputs → 0, tiny belt → floor, huge belt → ceiling, moderate belt →
+/// proportional.
+#[test]
+fn b_tracers_for_mass_boundaries() {
+    assert_eq!(tracers_for_mass(0.0, 100), 0);
+    assert_eq!(tracers_for_mass(-1.0, 100), 0);
+    assert_eq!(tracers_for_mass(f64::NAN, 100), 0);
+    assert_eq!(tracers_for_mass(f64::INFINITY, 100), 0);
+    assert_eq!(tracers_for_mass(1.0, 0), 0);
+    assert_eq!(tracers_for_mass(1e-9, 0), 0);
+    assert_eq!(tracers_for_mass(1e-9, 100), BELT_MIN_TRACERS);
+    assert_eq!(tracers_for_mass(1e-9, 1), 1);
+    assert_eq!(tracers_for_mass(1e6, 50), 50);
+    let n1 = tracers_for_mass(0.001, 10_000);
+    let n2 = tracers_for_mass(0.002, 10_000);
+    assert_eq!(n2, 2 * n1, "expected {n1}*2, got {n2}");
+}
+
+/// Kirkwood gap positions for a Jupiter-mass perturber at 5.203 AU must
+/// follow the p:q formula `a = a_J · (q/p)^(2/3)`, giving ratios 0.48 /
+/// 0.54 / 0.57 / 0.63 in ascending order. Order matters: `crosses_gap`
+/// short-circuits.
+#[test]
+fn b_kirkwood_gaps_positions() {
+    let gaps = kirkwood_gaps(5.203);
+    assert_eq!(gaps.len(), 4);
+    let expect = [0.4807, 0.5429, 0.5714, 0.6300];
+    for (g, r) in gaps.iter().zip(expect) {
+        assert!(
+            (g.a_au / 5.203 - r).abs() < 0.005,
+            "ratio {}",
+            g.a_au / 5.203
+        );
+        assert!(g.width_au > 0.0);
+    }
+    for w in gaps.windows(2) {
+        assert!(w[0].a_au < w[1].a_au);
+    }
+}
+
+/// `draw_a_outside_gaps` must reject 100 % of samples that fall in a gap.
+/// A failure means the loop bound (16 tries) is insufficient for a dense
+/// gap set, or `crosses_gap` is missing gaps.
+#[test]
+fn b_crosses_gap_and_draw_avoidance() {
+    let gaps = kirkwood_gaps(5.203);
+    assert!(crosses_gap(gaps[0].a_au, &gaps));
+    assert!(!crosses_gap(1.0, &gaps));
+    assert!(!crosses_gap(2.5, &[]));
+
+    let mut rng = XorShift::new(99);
+    for _ in 0..5000 {
+        let a = draw_a_outside_gaps(&mut rng, 2.0, 5.0, &gaps).unwrap();
+        assert!(!crosses_gap(a, &gaps));
+    }
+}
+
+/// When gaps fully cover the target range, `draw_a_outside_gaps` must
+/// return `None` rather than looping forever or panicking.
+#[test]
+fn b_draw_a_outside_gaps_returns_none_when_fully_covered() {
+    let gaps = vec![Gap {
+        a_au: 3.0,
+        width_au: 100.0,
+    }];
+    let mut rng = XorShift::new(1);
+    assert!(draw_a_outside_gaps(&mut rng, 2.0, 4.0, &gaps).is_none());
+}
+
+/// The inner belt's median mass at solar age matches the observed asteroid
+/// belt (~1.5e-3 M⊕), and collisional depletion must be strong: a young
+/// belt is >2× heavier than a 10-Gyr one under the `(1 + t/0.3)⁻¹` factor.
+#[test]
+fn b_belt_mass_earth_inner_calibrated_and_depletes() {
+    let mut v = Vec::new();
+    for seed in 0..5000u128 {
+        v.push(belt_mass_earth(1.0, 0.0, 4.6, &mut XorShift::new(seed)));
+    }
+    v.sort_by(|a, c| a.total_cmp(c));
+    let med = v[v.len() / 2];
+    assert!((1e-3..3e-3).contains(&med), "median inner mass {med}");
+
+    let mean = |ts: &[f64]| ts.iter().sum::<f64>() / ts.len() as f64;
+    let young: Vec<_> = (0..2000u128)
+        .map(|s| belt_mass_earth(1.0, 0.0, 0.1, &mut XorShift::new(s)))
+        .collect();
+    let old: Vec<_> = (0..2000u128)
+        .map(|s| belt_mass_earth(1.0, 0.0, 10.0, &mut XorShift::new(s)))
+        .collect();
+    assert!(mean(&young) > 2.0 * mean(&old));
+}
+
+/// `giant_near` picks the closest spawned giant inside the 10 % window,
+/// ignoring dwarfs (< 50 M⊕) and non-spawned bodies. Both the angle and the
+/// mass must come from the same scan.
+#[test]
+fn b_giant_near_selects_heaviest_within_window() {
+    let au = au_in_gm();
+    let mut b = Bodies::with_capacity(4);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let giant = b.push(5.0 * au, 0.0, 0.0, 0.0, 317.8, BodyKind::Planet);
+    b.origin[giant] = BodyOrigin::Spawned;
+    let dwarf = b.push(5.1 * au, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.origin[dwarf] = BodyOrigin::Spawned;
+
+    let centre = (0.0, 0.0, 0.0, 0.0, M_SUN_ME);
+    assert!((giant_mass_near(&b, centre, 5.0).unwrap() - 317.8).abs() < 1e-9);
+    assert!(giant_angle(&b, centre, 5.0).unwrap().abs() < 1e-9);
+    assert!(giant_near(&b, centre, 1.0).is_none());
+}
+
+/// A belt body carries its caller's `origin`, gets a class from `class_for`
+/// (S-type inside 2.5 AU for asteroid-belt origin), and lands on the `a_au`
+/// it was spawned with. `class_for` must see the same AU as the caller for
+/// gap checks.
+#[test]
+fn b_spawn_belt_body_sets_origin_class_and_keeps_a() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let mut rng = XorShift::new(7);
+    let centre = (0.0, 0.0, 0.0, 0.0, M_SUN_ME);
+
+    let i = spawn_belt_body(
+        &mut b,
+        centre,
+        2.0,
+        0.1,
+        1e-4,
+        BodyOrigin::AsteroidBelt,
+        2.7,
+        &mut rng,
+    );
+    assert_eq!(b.origin[i], BodyOrigin::AsteroidBelt);
+    assert_eq!(b.class[i], BodyClass::S);
+    let o = orbit_info(&b, i, 0);
+    assert!(o.bound);
+    assert!((o.semi_major / au_in_gm() - 2.0).abs() < 1e-3);
+}
+
+/// Comets are drawn with perihelion q ≤ 3 AU and semi-major axis a ≥ 20 AU,
+/// giving e = 1 − q/a ≥ 0.85 (clamped at 0.99). They must be `Icy` and
+/// bound. A failure means the sungrazer orbit geometry regressed.
+#[test]
+fn b_spawn_comets_are_icy_and_high_e() {
+    let mut b = Bodies::with_capacity(64);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let centre = (0.0, 0.0, 0.0, 0.0, M_SUN_ME);
+    let mut rng = XorShift::new(1);
+    spawn_comets(&mut b, centre, 2.7, 50, &mut rng);
+    let comets: Vec<usize> = (1..b.len())
+        .filter(|&i| b.origin[i] == BodyOrigin::Comet)
+        .collect();
+    assert!(!comets.is_empty() && comets.len() <= 4);
+    for i in comets {
+        assert_eq!(b.class[i], BodyClass::Icy);
+        let o = orbit_info(&b, i, 0);
+        assert!(o.bound);
+        assert!(o.ecc > 0.8, "comet ecc {} too low", o.ecc);
+    }
+}
+
+/// `spawn_background` clamps its Poisson draw to [0, 8] and then to the
+/// budget. A budget of 0 must add nothing; any budget must produce only
+/// `BackgroundDebris` bodies and no more than `budget` of them.
+#[test]
+fn b_spawn_background_respects_budget() {
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let centre = (0.0, 0.0, 0.0, 0.0, M_SUN_ME);
+    let mut rng = XorShift::new(1);
+    spawn_background(&mut b, centre, 2.7, 0, &mut rng);
+    assert_eq!(b.len(), 1, "budget 0 added bodies");
+    for budget in [1, 3, 5, 8] {
+        let mut b = Bodies::with_capacity(2);
+        b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+        let mut rng = XorShift::new(1);
+        spawn_background(&mut b, centre, 2.7, budget, &mut rng);
+        assert!(b.len() - 1 <= budget);
+        for i in 1..b.len() {
+            assert_eq!(b.origin[i], BodyOrigin::BackgroundDebris);
+        }
+    }
+}
+
+/// `draw_a_outer` gives a √a-uniform distribution when `hi` is finite
+/// (median ≈26 AU for [10, 50]), and falls back to `draw_a_outside_gaps`
+/// when `hi` is not finite. The non-finite fallback must not panic.
+#[test]
+fn b_draw_a_outer_sqrt_distribution_and_fallback() {
+    let mut rng = XorShift::new(1);
+    let mut v: Vec<f64> = (0..10_000)
+        .map(|_| draw_a_outer(&mut rng, 10.0, 50.0, &[]).unwrap())
+        .collect();
+    v.sort_by(|a, c| a.total_cmp(c));
+    let expected = ((10f64.sqrt() + 50f64.sqrt()) / 2.0).powi(2); // ≈26.2
+    assert!((v[v.len() / 2] - expected).abs() < 1.0);
+    assert!(v.iter().all(|&a| (10.0..=50.0).contains(&a)));
+
+    let a = draw_a_outer(&mut rng, 1.0, f64::INFINITY, &[]);
+    assert!(a.is_some());
+}
+
+// ===========================================================================
+// m — samplers, Kepler helpers, small bodies
+// ===========================================================================
+
+/// `sample_rayleigh` must reproduce the Rayleigh mean σ·√(π/2) to within 2 %.
+/// A failure means the inverse-CDF transform (`√(−2 ln(1−u))`) is wrong.
+#[test]
+fn m_sample_rayleigh_mean() {
+    let mut rng = XorShift::new(3);
+    let n = 20_000;
+    let s = 0.3;
+    let mean = (0..n).map(|_| sample_rayleigh(&mut rng, s)).sum::<f64>() / n as f64;
+    let expected = s * (std::f64::consts::PI / 2.0).sqrt();
+    assert!((mean - expected).abs() < 0.02 * expected);
+    let mut rng = XorShift::new(4);
+    assert!((0..1000).all(|_| sample_rayleigh(&mut rng, 1.0) >= 0.0));
+}
+
+/// `sample_mass_power_law` must stay inside [m_min, m_max] and, for p > 1,
+/// concentrate most draws in the low-mass tail (below the geometric midpoint
+/// in the example below, taken as the boundary for a sharp skew test).
+#[test]
+fn m_sample_mass_power_law_bounds_and_skew() {
+    let mut rng = XorShift::new(9);
+    for _ in 0..5000 {
+        let m = sample_mass_power_law(&mut rng, 1e-3, 1e-1, 1.8);
+        assert!((1e-3..=1e-1).contains(&m));
+    }
+    let mut rng = XorShift::new(9);
+    let n = 10_000;
+    let below_mid = (0..n)
+        .filter(|_| sample_mass_power_law(&mut rng, 1e-3, 1e-1, 1.8) < 5e-3)
+        .count();
+    assert!(below_mid > n / 2, "p=1.8 should skew low: {below_mid}/{n}");
+}
+
+/// `spacing_range` returns `(base_lo, base_hi)` when n ≤ 1 or when the
+/// spacing that fits all planets across [a_min, a_max] is ≥ base_hi;
+/// otherwise it compresses both bounds to fit. Both branches must be hit.
+#[test]
+fn m_spacing_range_branches() {
+    assert_eq!(spacing_range(1, 0.1, 10.0, 1.4, 2.2), (1.4, 2.2));
+    // n=2: ratio_fit = 100 > 2.2 → unchanged.
+    assert_eq!(spacing_range(2, 0.1, 10.0, 1.4, 2.2), (1.4, 2.2));
+    // n=10: ratio_fit ≈ 1.668 < 2.2 → compressed.
+    let (lo, hi) = spacing_range(10, 0.1, 10.0, 1.4, 2.2);
+    let ratio_fit = (10.0f64 / 0.1).powf(1.0 / 9.0);
+    assert!(lo >= 1.02);
+    assert!((hi - ratio_fit.max(1.02)).abs() < 1e-9);
+}
+
+/// Holman–Wiegert (1999): S-type critical axis is 0.464·a_b at (e=0, μ=0)
+/// and floors at 0.01·a_b; it decreases monotonically with eccentricity.
+/// P-type is 1.60·a_b at (e=0, μ=0) and increases with perturber mass.
+#[test]
+fn m_hw_critical_limits() {
+    assert!((hw_critical_s(1.0, 0.0, 0.0) - 0.464).abs() < 1e-9);
+    assert!(hw_critical_s(1.0, 0.99, 0.99) >= 0.01);
+    let a0 = hw_critical_s(1.0, 0.0, 0.3);
+    let a1 = hw_critical_s(1.0, 0.3, 0.3);
+    let a2 = hw_critical_s(1.0, 0.6, 0.3);
+    assert!(a0 > a1 && a1 > a2);
+
+    assert!((hw_critical_p(1.0, 0.0, 0.0) - 1.60).abs() < 1e-9);
+    assert!(hw_critical_p(1.0, 0.0, 0.3) > hw_critical_p(1.0, 0.0, 0.1));
+}
+
+/// `orbital_period_days` must satisfy Kepler's third law in code units:
+/// `(a³ / P²) = G·M / (2π)²` after converting the period from days back to
+/// code time. A failure means the unit conversion or the `G` factor is off.
+#[test]
+fn m_orbital_period_round_trips_kepler3() {
+    let au = au_in_gm();
+    let tu = time_unit_s();
+    for &(a_au, m) in &[(1.0, M_SUN_ME), (5.2, M_SUN_ME), (0.1, M_SUN_ME * 0.5)] {
+        let p_days = orbital_period_days(a_au * au, m);
+        let p_code = p_days * 86_400.0 / tu;
+        let lhs = (a_au * au).powi(3) / p_code.powi(2);
+        let rhs = G * m / (std::f64::consts::TAU * std::f64::consts::TAU);
+        assert!((lhs - rhs).abs() / rhs < 1e-9, "a={a_au}");
+    }
+}
+
+/// `class_for` must be exhaustive across every `BodyOrigin` and match the
+/// documented physical mapping (inner asteroid S-type / outer C-type,
+/// Kuiper/Trojan/Comet Icy, Hilda C, generic Spawned split by snow line,
+/// Interstellar and Rogue always override). A miss means a variant added
+/// to the enum is falling through to the wrong class.
+#[test]
+fn m_class_for_every_origin() {
+    let snow = 2.7;
+    assert_eq!(class_for(BodyOrigin::AsteroidBelt, 2.0, snow), BodyClass::S);
+    assert_eq!(class_for(BodyOrigin::AsteroidBelt, 3.0, snow), BodyClass::C);
+    for o in [
+        BodyOrigin::KuiperCold,
+        BodyOrigin::KuiperHot,
+        BodyOrigin::KuiperResonant,
+        BodyOrigin::KuiperScattered,
+        BodyOrigin::Trojan,
+        BodyOrigin::Comet,
+    ] {
+        assert_eq!(class_for(o, 10.0, snow), BodyClass::Icy);
+    }
+    assert_eq!(class_for(BodyOrigin::Hilda, 4.0, snow), BodyClass::C);
+    for o in [
+        BodyOrigin::Spawned,
+        BodyOrigin::ImpactDebris,
+        BodyOrigin::TidalDebris,
+        BodyOrigin::BackgroundDebris,
+    ] {
+        assert_eq!(class_for(o, 1.0, snow), BodyClass::Rocky);
+        assert_eq!(class_for(o, 5.0, snow), BodyClass::Icy);
+    }
+    assert_eq!(
+        class_for(BodyOrigin::Interstellar, 1.0, snow),
+        BodyClass::Rocky
+    );
+    assert_eq!(
+        class_for(BodyOrigin::RoguePlanet, 1.0, snow),
+        BodyClass::Icy
+    );
+}
+
+/// `draw_density` must produce densities inside the documented range for
+/// each class. The bounds mirror the per-class linear expressions in
+/// `draw_density`; a failure means a coefficient was changed without
+/// updating the docs.
+#[test]
+fn m_draw_density_per_class() {
+    let ranges = [
+        (BodyClass::C, 1.2, 2.0),
+        (BodyClass::S, 2.4, 3.4),
+        (BodyClass::M, 5.0, 8.0),
+        (BodyClass::V, 2.9, 3.4),
+        (BodyClass::Icy, 0.5, 2.5),
+        (BodyClass::Rocky, 2.5, 5.5),
+    ];
+    let mut rng = XorShift::new(1);
+    for (c, lo, hi) in ranges {
+        for _ in 0..500 {
+            let d = draw_density(&mut rng, c);
+            assert!((lo..=hi).contains(&d), "{c:?} density {d}");
+        }
+    }
+}
+
+/// `kepler_state` and `orbit_info` must round-trip: given (a, e) and a
+/// state built from `kepler_state`, `orbit_info` recovers `a` and `e` to
+/// 1e-6 across circular, moderate, and high eccentricity.
+#[test]
+fn m_kepler_state_round_trips() {
+    let au = au_in_gm();
+    let mu = G * M_SUN_ME;
+    for &(a_au, e) in &[(1.0, 0.0), (5.0, 0.3), (2.0, 0.8)] {
+        let a = a_au * au;
+        for nu in [0.0, 1.0, 2.0, 3.0, 5.0] {
+            for omega in [0.0, 1.5, 3.0] {
+                let (x, y, vx, vy) = kepler_state(mu, a, e, nu, omega);
+                let mut b = Bodies::with_capacity(2);
+                b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+                b.push(x, y, vx, vy, 1e-6, BodyKind::Planet);
+                let o = orbit_info(&b, 1, 0);
+                assert!(o.bound, "a={a_au} e={e} nu={nu} unbound");
+                assert!((o.semi_major / a - 1.0).abs() < 1e-6);
+                assert!((o.ecc - e).abs() < 1e-6);
+            }
+        }
+    }
+}
+
+/// `push_kepler_about` must place the body on the requested Kepler orbit
+/// about an arbitrary (moving) centre, keeping the centre's translation
+/// baked into the returned state.
+#[test]
+fn m_push_kepler_about_nonzero_centre() {
+    let au = au_in_gm();
+    let mut b = Bodies::with_capacity(2);
+    b.push(100.0, 200.0, 5.0, -3.0, M_SUN_ME, BodyKind::Star);
+    let centre = (100.0, 200.0, 5.0, -3.0, M_SUN_ME);
+    let mut rng = XorShift::new(1);
+    let i = push_kepler_about(
+        &mut b,
+        centre,
+        5.0 * au,
+        0.2,
+        1.0,
+        &mut rng,
+        BodyKind::Planet,
+    );
+    let o = orbit_info(&b, i, 0);
+    assert!(o.bound);
+    assert!((o.semi_major / au - 5.0).abs() < 0.01);
+}
+
+/// `compact_period_p0` returns a period in [2, 20] days. A failure means the
+/// log-uniform range `10^(0.3 + u)` or its day conversion is off.
+#[test]
+fn m_compact_period_p0_range() {
+    let tu = time_unit_s();
+    let mut rng = XorShift::new(1);
+    for _ in 0..1000 {
+        let p_days = compact_period_p0(&mut rng) * tu / 86_400.0;
+        assert!((2.0..=20.0).contains(&p_days), "p0 = {p_days} d");
+    }
+}
+
+/// `inner_edge_au` floors at 5·r★ and 0.005 AU; the larger dominates.
+/// A failure means one of the two `.max()` calls has been dropped.
+#[test]
+fn m_inner_edge_au_floors() {
+    assert!((inner_edge_au(1e-9, M_SUN_ME, 0.1) - 0.5).abs() < 1e-9);
+    assert!((inner_edge_au(1e-9, M_SUN_ME, 1e-9) - 0.005).abs() < 1e-9);
+}
+
+/// `binary_fraction` follows the piecewise constants in `mod.rs`. The
+/// monotone inequalities catch a piece-swap even when the individual
+/// constants are correct.
+#[test]
+fn m_binary_fraction_values() {
+    assert!((binary_fraction(0.3) - 0.30).abs() < 1e-9);
+    assert!((binary_fraction(1.0) - 0.46).abs() < 1e-9);
+    assert!((binary_fraction(5.0) - 0.80).abs() < 1e-9);
+    assert!(binary_fraction(0.1) < binary_fraction(0.6));
+    assert!(binary_fraction(0.6) < binary_fraction(0.9));
+    assert!(binary_fraction(1.3) < binary_fraction(2.0));
+}
+
+/// `spawn_moon` must place the moon inside the parent's Hill radius, on a
+/// bound orbit about the planet, and inherit the parent's `BodyClass`
+/// (moons of icy giants stay Icy). Non-planet hosts must be rejected.
+#[test]
+fn m_spawn_moon_orbits_parent_and_inherits_class() {
+    let au = au_in_gm();
+    let mut b = Bodies::with_capacity(4);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let p = b.push(5.0 * au, 0.0, 0.0, 10.0, 317.8, BodyKind::Planet);
+    b.class[p] = BodyClass::Icy;
+    b.bulk_density[p] = 1.0;
+    b.r[p] = b.radius_now(p);
+    let mut rng = XorShift::new(2);
+    let moon = spawn_moon(&mut b, p, &mut rng).expect("moon should spawn");
+    assert_eq!(b.class[moon], BodyClass::Icy);
+    let r_hill = 5.0 * au * (b.m[p] / (3.0 * M_SUN_ME)).cbrt();
+    let d = (b.x[moon] - b.x[p]).hypot(b.y[moon] - b.y[p]);
+    assert!(d < r_hill);
+    assert!(orbit_info(&b, moon, p).bound);
+
+    assert!(spawn_moon(&mut b, 0, &mut rng).is_none());
+}
+
+/// `add_ring` must place each particle between 1.4 and 2.6 planet radii on
+/// a circular orbit (v_rel/v_circ ≈ 1), tag it `ImpactDebris`, and make it
+/// Icy. Non-planet hosts must return an empty vector.
+#[test]
+fn m_add_ring_particles_in_radii_band() {
+    let au = au_in_gm();
+    let mut b = Bodies::with_capacity(32);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let p = b.push(5.0 * au, 0.0, 0.0, 10.0, 317.8, BodyKind::Planet);
+    b.r[p] = 1e6;
+    let mut rng = XorShift::new(3);
+    let ids = add_ring(&mut b, p, 25, &mut rng);
+    assert_eq!(ids.len(), 25);
+    for &k in &ids {
+        assert_eq!(b.origin[k], BodyOrigin::ImpactDebris);
+        assert_eq!(b.class[k], BodyClass::Icy);
+        let ratio = (b.x[k] - b.x[p]).hypot(b.y[k] - b.y[p]) / b.r[p];
+        assert!((1.4..=2.6).contains(&ratio), "ratio {ratio}");
+        let v_rel = (b.vx[k] - b.vx[p]).hypot(b.vy[k] - b.vy[p]);
+        let v_c = (G * b.m[p] / (ratio * b.r[p])).sqrt();
+        assert!((v_rel / v_c - 1.0).abs() < 0.01);
+    }
+    assert!(add_ring(&mut b, 0, 25, &mut rng).is_empty());
+}
+
+/// `body_count` is a *soft* ceiling: the primary is always spawned, even
+/// when `body_count` is 0. This documents the actual behaviour of
+/// `spawn_system` (the body budget applies to everything after the primary).
+#[test]
+fn m_spawn_system_zero_body_count_still_spawns_primary() {
+    let mut b = Bodies::with_capacity(0);
+    spawn_system(&mut b, 0, 1);
+    assert_eq!(b.len(), 1);
+    assert!(is_host_kind(b.kind[0]));
+}
+
+// ===========================================================================
+// c — cluster placement internals
+// ===========================================================================
+
+/// `cluster_slots` must place every pair at least `SEP_FACTOR · (reach_i +
+/// reach_j)` apart and produce finite velocities. A failure means the
+/// scale-radius growth loop is not escaping a crowded configuration, or the
+/// separation test is comparing the wrong quantity.
+#[test]
+fn c_cluster_slots_no_overlap_and_finite_velocities() {
+    let reaches = vec![100.0; 5];
+    let masses = vec![M_SUN_ME; 5];
+    let slots = cluster_slots(7, &reaches, &masses);
+    for i in 0..5 {
+        for j in (i + 1)..5 {
+            let d = (slots[i].0 - slots[j].0).hypot(slots[i].1 - slots[j].1);
+            assert!(d >= SEP_FACTOR * (reaches[i] + reaches[j]), "pair {i},{j}");
+        }
+        assert!(slots[i].2.is_finite() && slots[i].3.is_finite());
+    }
+}
+
+/// `cluster_slots` with n ≤ 1 returns one zero-state slot per caller; an
+/// empty input produces an empty output. No infinite loop.
+#[test]
+fn c_cluster_slots_trivial_n() {
+    assert!(cluster_slots(1, &[], &[]).is_empty());
+    let slots = cluster_slots(1, &[100.0], &[1.0]);
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0], (0.0, 0.0, 0.0, 0.0));
+}
+
+/// `system_reach_gm` returns 0 for empty input, is floored at 200 Gm for a
+/// single body, and `system_extent_gm` includes the apoapsis of an eccentric
+/// bound orbit (not just the instantaneous distance).
+#[test]
+fn c_system_reach_and_extent() {
+    let b = Bodies::with_capacity(0);
+    assert_eq!(system_reach_gm(&b), 0.0);
+    assert_eq!(system_extent_gm(&b), 0.0);
+
+    let mut b = Bodies::with_capacity(2);
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    assert_eq!(system_reach_gm(&b), 200.0);
+
+    let au = au_in_gm();
+    let mut rng = XorShift::new(1);
+    push_kepler(&mut b, 0, 2.0 * au, 0.5, 1.0, &mut rng, BodyKind::Planet);
+    let ext = system_extent_gm(&b);
+    assert!(ext >= 3.0 * au * 0.99, "ext {ext} < apoapsis 3 AU");
+}
+
+// ===========================================================================
+// s — evolved systems
+// ===========================================================================
+
+/// Stellar remnants (WD / NS / BH) sometimes host debris belts. Over 500
+/// seeds enough remnant primaries exist to require at least one to have
+/// debris — a stricter check would test a rate, but `belt_spec_for_evolved`
+/// is currently probabilistic and the simpler "at least one" catches total
+/// failure of the evolved belt path.
+#[test]
+fn s_evolved_remnants_produce_debris() {
+    let (mut n_rem, mut n_with) = (0u32, 0u32);
+    for seed in 0..500u128 {
+        let mut b = Bodies::with_capacity(20);
+        spawn_system(&mut b, 20, seed);
+        if !matches!(
+            b.kind[0],
+            BodyKind::WhiteDwarf | BodyKind::NeutronStar | BodyKind::BlackHole
+        ) {
+            continue;
+        }
+        n_rem += 1;
+        let has = (1..b.len()).any(|i| {
+            matches!(
+                b.origin[i],
+                BodyOrigin::AsteroidBelt
+                    | BodyOrigin::KuiperCold
+                    | BodyOrigin::KuiperHot
+                    | BodyOrigin::KuiperResonant
+                    | BodyOrigin::KuiperScattered
+                    | BodyOrigin::BackgroundDebris
+            )
+        });
+        if has {
+            n_with += 1;
+        }
+    }
+    assert!(n_rem > 20, "only {n_rem} remnant primaries");
+    assert!(n_with > 0, "no evolved system produced debris");
 }
