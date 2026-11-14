@@ -243,11 +243,7 @@ pub fn set_kinds(b: &mut Bodies, edits: &[(usize, BodyKind)]) {
 /// `compact()` call, giving O(N) total instead of O(N·K) for K
 /// sequential `delete_body` calls.
 ///
-/// Note: this produces the same *surviving set* as K sequential
-/// `delete_body` calls, but the survivors may end up in a different
-/// array order, because `compact()` is a swap-remove. Callers that
-/// depend on stable post-delete ordering should call `delete_body`
-/// in the desired removal order instead.
+/// Note: compact() is a stable shift, so survivors keep their relative order.
 pub fn delete_bodies(b: &mut Bodies, mut indices: Vec<usize>) {
     if indices.is_empty() {
         return;
@@ -275,7 +271,7 @@ pub fn delete_bodies(b: &mut Bodies, mut indices: Vec<usize>) {
 /// Safe to batch: `circularize_raw` only changes velocities, never
 /// positions or masses, so the parent cache (which depends only on the
 /// latter) is valid across the entire batch. That means `find_parent`'s
-/// expensive path runs once for the batch rather than once per body.
+/// (Each body still calls the uncached find_parent.)
 ///
 /// Returns the number of bodies successfully circularized.
 pub fn circularize_many(b: &mut Bodies, indices: &[usize]) -> usize {

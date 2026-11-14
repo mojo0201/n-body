@@ -303,6 +303,9 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         // Force evaluation for the active subset only. Cold bodies are
         // handled by the tree's node COMs, which are still valid.
         eval_forces_with(b, &active, tree.as_ref());
+        if needs_pn(b) {
+            add_pn_corrections(b, Some(&active));
+        }
 
         // Second half-kick (with old rung), re-evaluate this body's dtl,
         // promote its rung if it now needs a finer step, then apply the
@@ -426,6 +429,8 @@ pub fn advance(b: &mut Bodies, dt: f64) {
         step_block(b, dt, kmax);
         b.stats.last_nsub = 1u32 << kmax;
     }
+    mark_energy(b);
+    tidal_dissipation(b, dt);
     evolve_stars(b, dt);
     dust::evolve(b, dt);
     coalesce_debris(b);

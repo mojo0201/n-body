@@ -6,7 +6,7 @@
 //   OrbitVertex    <-> struct OrbitIn
 //   FlashInstance  <-> struct FlashIn
 //   DustVertex     <-> struct DustIn
-//   dust centres   <-> struct DustFields (128 x vec4)
+//   dust centres   <-> struct DustFields (256 x vec4)
 //
 // Bind groups: group 0 is one camera uniform. Bodies, flashes and dust use
 // the "relative" camera (pos = 0, positions pre-subtracted on the CPU);
@@ -166,7 +166,7 @@ fn fs_flash(in: FlashOut) -> @location(0) vec4<f32> {
 // density shows up as overlap. The pipeline blends additively (src_alpha, one).
  
 struct DustFields {
-    c: array<vec4<f32>, 128>,
+    c: array<vec4<f32>, 256>,
 };
  
 @group(1) @binding(0) var<uniform> dust_fields: DustFields;
@@ -198,8 +198,7 @@ fn vs_dust(@builtin(vertex_index) vi: u32, inst: DustIn) -> DustOut {
     var out: DustOut;
     out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.local = corner;
-    // Tracer mass is ~1e-8..1e-3 Earth masses: map log10 onto 0.15..1.
-    out.intensity = clamp((log(inst.weight) / 2.302585 + 9.0) / 6.0, 0.15, 1.0);
+    out.intensity = clamp((log(inst.weight) / 2.302585 + 16.0) / 6.0, 0.15, 1.0);
     return out;
 }
  

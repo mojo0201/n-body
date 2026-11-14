@@ -37,7 +37,10 @@ use winit::window::{Window, WindowId};
 
 use egui_wgpu::ScreenDescriptor;
 
-// Zoom range for the view: 1e-3 .. 1e5 px per Gm.
+// Zoom range for the view: 1e-7 .. 1e5 px per Gm.
+/// Seconds in one Gyr (Julian years). Used to age stars in real time.
+const SECONDS_PER_GYR: f64 = 3.15576e16;
+
 const ZOOM_MIN: f32 = 1e-7;
 const ZOOM_MAX: f32 = 1e5;
 // A click that moves less than this many pixels is treated as a click
@@ -531,6 +534,10 @@ struct SimState {
     evolution_rate: f64,
     sn_kicks: bool,
     mass_transfer: bool,
+    /// Pause when a merger, impact or tidal break-up happens.
+    pause_on_event: bool,
+    /// Merger + impact + tidal count at the last frame.
+    last_pause_events: u64,
     /// Slug of the library preset that `R` reloads. `None`: random seed.
     last_loaded_preset: Option<String>,
 }
@@ -545,7 +552,7 @@ impl SimState {
             cam: [0.0, 0.0],
             zoom: 0.7,
             body_count: 9,
-            seed: 12345,
+            seed: ui::random_seed(),
             fps_timer: Instant::now(),
             fps_frames: 0,
             fps: 0.0,
@@ -580,9 +587,14 @@ impl SimState {
             last_comets: 0,
             last_comet_verts: 0,
             trail: TrailState::new(),
-            evolution_rate: 0.0,
+            // Real time: one simulation time unit ages a star by exactly the
+            // time it represents (`time_unit_s` seconds), so nothing visible
+            // happens to a star during a session.
+            evolution_rate: physics::time_unit_s() / SECONDS_PER_GYR,
             sn_kicks: true,
             mass_transfer: true,
+            pause_on_event: false,
+            last_pause_events: 0,
             last_loaded_preset: None,
         }
     }
@@ -785,6 +797,7 @@ impl SimState {
         shared: &Shared,
     ) {
         if act.edit.is_some()
+            || act.multi_edit.is_some()
             || act.reset
             || act.step_once
             || act.preset.is_some()
@@ -862,18 +875,6 @@ impl SimState {
         if act.step_once {
             physics::advance(b, physics::DT);
         }
-        if act.spawn_iso {
-            if physics::spawn_interstellar_object(b).is_some() {
-                self.orbit_buf_valid = false;
-                self.scene_dirty = true;
-            }
-        }
-        if act.spawn_rogue {
-            if physics::spawn_rogue_planet(b).is_some() {
-                self.orbit_buf_valid = false;
-                self.scene_dirty = true;
-            }
-        }
         if let Some(s) = act.speed {
             self.speed = s.clamp(0.01, 100.0);
         }
@@ -941,23 +942,44 @@ impl SimState {
                 self.orbit_buf_valid = false;
             }
         }
+        if let Some((ids, edit)) = act.multi_edit {
+            let idx: Vec<usize> = ids.iter().filter_map(|&id| b.index_of_id(id)).collect();
+            if !idx.is_empty() {
+                // One batched call each: the O(N^2) physics commit runs once
+                // for the whole selection, not once per body.
+                match edit {
+                    Edit::MassMul(f) => {
+                        let e: Vec<(usize, f64)> = idx.iter().map(|&i| (i, f)).collect();
+                        physics::scale_masses(b, &e);
+                    }
+                    Edit::SetKind(k) => {
+                        let e: Vec<(usize, BodyKind)> = idx.iter().map(|&i| (i, k)).collect();
+                        physics::set_kinds(b, &e);
+                    }
+                    Edit::Circularize => {
+                        physics::circularize_many(b, &idx);
+                    }
+                    Edit::Delete => {
+                        if self.selected.map_or(false, |s| ids.contains(&s)) {
+                            self.selected = None;
+                            self.follow = false;
+                        }
+                        physics::delete_bodies(b, idx);
+                    }
+                    Edit::SpawnMoon | Edit::AddRing => {}
+                }
+                self.orbit_buf_valid = false;
+                self.scene_dirty = true;
+            }
+        }
         if let Some(t) = act.trails {
             self.trail.cfg.enabled = t;
         }
         if let Some(v) = act.diag_visible {
             ui_state.diag.visible = v;
         }
-        if let Some(r) = act.evolution_rate {
-            physics::set_evolution_rate(b, r);
-            self.evolution_rate = r;
-        }
-        if let Some(k) = act.sn_kicks {
-            b.sn_kicks = k;
-            self.sn_kicks = k;
-        }
-        if let Some(m) = act.mass_transfer {
-            b.mass_transfer = m;
-            self.mass_transfer = m;
+        if let Some(p) = act.pause_on_event {
+            self.pause_on_event = p;
         }
     }
 }
@@ -1258,20 +1280,6 @@ impl ApplicationHandler for App {
                             let b = self.shared.lock_for_render();
                             self.sim.cycle_selection(&b, -1);
                         }
-                        "i" => {
-                            let mut b = self.shared.lock_for_render();
-                            if physics::spawn_interstellar_object(&mut b).is_some() {
-                                self.sim.orbit_buf_valid = false;
-                                self.sim.scene_dirty = true;
-                            }
-                        }
-                        "t" => {
-                            let mut b = self.shared.lock_for_render();
-                            if physics::spawn_rogue_planet(&mut b).is_some() {
-                                self.sim.orbit_buf_valid = false;
-                                self.sim.scene_dirty = true;
-                            }
-                        }
                         "." => {
                             let mut b = self.shared.lock_for_render();
                             physics::advance(&mut b, physics::DT);
@@ -1476,9 +1484,7 @@ impl ApplicationHandler for App {
                         preset: self.sim.preset,
                         vsync: self.sim.vsync,
                         behind: self.shared.behind.load(Ordering::Relaxed),
-                        evolution_rate: self.sim.evolution_rate,
-                        sn_kicks: self.sim.sn_kicks,
-                        mass_transfer: self.sim.mass_transfer,
+                        pause_on_event: self.sim.pause_on_event,
                     };
                     full_output = gfx.egui_ctx.run(raw_input, |ctx| {
                         actions = ui::draw(ctx, &mut self.ui, &view_info, &b);
@@ -1486,6 +1492,21 @@ impl ApplicationHandler for App {
                     self.sim
                         .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
                     trail_snapshot = self.sim.trail.snapshot(&b, self.sim.follow_smooth);
+
+                    // Pause when the merger / impact / tidal count grows. A drop
+                    // means a new system replaced the old one: no pause then.
+                    let pause_events = b
+                        .stats
+                        .merges
+                        .wrapping_add(b.stats.impacts)
+                        .wrapping_add(b.stats.tidal);
+                    if self.sim.pause_on_event
+                        && !self.sim.paused
+                        && pause_events > self.sim.last_pause_events
+                    {
+                        self.sim.paused = true;
+                    }
+                    self.sim.last_pause_events = pause_events;
 
                     self.shared.paused.store(self.sim.paused, Ordering::Relaxed);
                     self.shared

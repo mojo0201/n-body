@@ -290,16 +290,49 @@ pub(super) fn belt_spec_for(
         spec.archetype = BeltArchetype::SolarType;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng);
 
+        // Only the single most massive giant gets a substantial Trojan
+        // cloud. Real Jupiter Trojans are ~8% of the main belt; Saturn's
+        // are unobservable, and Neptune's are uncertain but likely a few
+        // per cent of Jupiter's. Below ~30 M⊕ the L4/L5 resonance is not
+        // deep enough to capture a cloud at all.
+        //
+        // Computed before the inner belt so its mass fraction can take
+        // the remainder of `total_mass`.
+        let trojan_frac: f64 = if let Some((gm, ga)) = giants
+            .iter()
+            .filter(|(m, a)| *m >= 30.0 && *a > 0.3)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+        {
+            let m_jup = gm / JUPITER_MASS;
+            let frac = (0.08 * m_jup.powf(1.5)).clamp(0.005, 0.10);
+            spec.trojans.push(Trojan {
+                giant_a_au: *ga,
+                leading_frac: 0.5,
+                mass_frac: frac,
+            });
+            spec.gaps.extend(kirkwood_gaps(*ga));
+            frac
+        } else {
+            0.0
+        };
+
         // Main belt sits between the outermost compact planet and the
         // innermost giant, but never inside the snow line or outside the
         // caller's requested radial window.
         let ast_lo = (a_compact * 1.2).max(snow_line_au * 0.7).max(a_lo_au);
         let ast_hi = (a_giant_inner * 0.6).min(a_hi_au);
         if ast_hi > ast_lo {
+            // `total_mass` is the asteroid belt itself (see
+            // `belt_mass_earth`). Trojans and Hildas take their share
+            // first, and the inner belt takes the remainder — so a
+            // Jupiter-analogue system spawns the belt plus an 8%
+            // Trojan cloud (matching the real Solar System) without
+            // over-spending the calibrated total.
+            let inner_frac = (1.0 - trojan_frac - belts::HILDA_MASS_FRAC).max(0.0);
             spec.inner = Some(InnerBelt {
                 a_lo_au: ast_lo,
                 a_hi_au: ast_hi,
-                mass_frac: 0.04,
+                mass_frac: inner_frac,
                 e_sigma: 0.10,
                 plaw: MASS_PLAW_ASTEROID,
                 m_min: MASS_ASTEROID_MIN,
@@ -353,20 +386,6 @@ pub(super) fn belt_spec_for(
                     ),
                 ],
             });
-        }
-
-        // Trojans and gaps scale with the giants: a giant too close to the
-        // star has no stable L4/L5, and too small a giant can't hold a
-        // Trojan cloud.
-        for &(gm, ga) in &giants {
-            if gm > 50.0 && ga > 0.3 {
-                spec.trojans.push(Trojan {
-                    giant_a_au: ga,
-                    leading_frac: 0.5,
-                    mass_frac: 0.06,
-                });
-                spec.gaps.extend(kirkwood_gaps(ga));
-            }
         }
     } else {
         // Sparse: old, quiet, giant-poor system. Its inner belt was cleared

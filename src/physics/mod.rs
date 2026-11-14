@@ -34,6 +34,16 @@ pub use barnes_hut::*;
 use collisions::*;
 pub use debris::*;
 pub use dust::*;
+
+/// Speed of light in simulation units (≈1.29×10⁶).
+///
+/// Derived once from `time_unit_s()` (≈4.31×10⁶ s) and the length unit
+/// (`LEN_KM × 1000` m). Used by the post-Newtonian corrections and by
+/// Poynting-Robertson drag in `dust.rs`.
+pub fn c_sim() -> f64 {
+    static C: OnceLock<f64> = OnceLock::new();
+    *C.get_or_init(|| 299_792_458.0 * time_unit_s() / (LEN_KM * 1000.0))
+}
 pub use edit::*;
 pub use energy::*;
 pub use evolution::*;
@@ -649,8 +659,10 @@ pub const DUST_YIELD_FRAC: f64 = 0.02;
 /// drifts from 1 AU in about 10 yr at 100.
 pub const PR_DRAG_BOOST: f64 = 100.0;
 
-/// Fraction of a body's dust that is converted to belt material per step.
-pub const DUST_TO_BELT_MASS: f64 = 0.3;
+/// Initial dust mass injected per belt source body, as a fraction of the
+/// body's own mass. The physical steady-state zodiacal cloud is roughly
+/// belt mass × (PR-drag lifetime / collision timescale) ≈ 10⁻⁸ M⊕/M⊕;
+pub const DUST_TO_BELT_MASS: f64 = 1e-7;
 
 /// Advance the dust field every N steps (dust is slower than the bodies).
 pub const DUST_STEP_INTERVAL: u64 = 2;
@@ -666,6 +678,9 @@ pub const COMET_MAX_FRAC_PER_STEP: f64 = 1e-4;
 
 /// A comet below this mass (M⊕) is treated as exhausted and removed.
 pub const COMET_DEAD_MASS: f64 = 1e-13;
+
+/// Maximum comet-trail dust grains one comet may emit over its lifetime.
+pub const COMET_GRAIN_CAP: usize = 5_000;
 
 // ---- Miscellaneous ---------------------------------------------------------
 
@@ -1017,8 +1032,8 @@ pub struct Bodies {
     pub mass_transfer: bool,
     pub evolution_rate: f64,
     pub rlof: Vec<bool>,
+    pub comet_grains: Vec<u32>,
 }
-
 impl Bodies {
     /// Allocate SoA storage for `n` bodies up front. Growing individually
     /// reallocates each of the ~25 parallel vectors once per capacity bump, so
@@ -1078,6 +1093,7 @@ impl Bodies {
             mass_transfer: true,
             evolution_rate: 0.0,
             rlof: Vec::with_capacity(n),
+            comet_grains: Vec::with_capacity(n),
         }
     }
 
@@ -1131,6 +1147,7 @@ impl Bodies {
         });
         self.m_init.push(m);
         self.rlof.push(false);
+        self.comet_grains.push(0);
         i
     }
 
@@ -1234,6 +1251,7 @@ impl Bodies {
                 self.age_gyr[write] = self.age_gyr[read];
                 self.m_init[write] = self.m_init[read];
                 self.rlof[write] = self.rlof[read];
+                self.comet_grains[write] = self.comet_grains[read];
                 self.dead[write] = false;
             }
             write += 1;
@@ -1265,6 +1283,7 @@ impl Bodies {
         self.age_gyr.truncate(write);
         self.m_init.truncate(write);
         self.rlof.truncate(write);
+        self.comet_grains.truncate(write);
         // Dust fields follow their primary; a field whose primary died is dropped.
         let fields = std::mem::take(&mut self.dust_fields);
         self.dust_fields = fields

@@ -207,7 +207,7 @@ pub fn compute_orbit_segments(
         }
     }
     let planet_stride = n_planets.div_ceil(ORBIT_MAX_BODIES).max(1);
-    let debris_stride = if n_debris <= 256 { 1 } else { n_debris / 256 };
+    let debris_stride = n_debris.div_ceil(256).max(1);
 
     // Pre-size assuming the worst case of 64 segments per visible body; the
     // adaptive count can exceed that for very large on-screen ellipses but

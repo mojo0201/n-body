@@ -166,11 +166,10 @@ pub(in crate::physics) fn spawn_ms_frame(
     } else {
         0.001
     };
-    let a_hj = (inner_au * (1.5 + rng.next_f64() * 2.0))
-        .min(0.07 * m_sun.cbrt())
-        .max(inner_au * 1.2);
+    let a_hj = (inner_au * (1.5 + rng.next_f64() * 2.0)).min(0.07 * m_sun.cbrt());
     let has_hj = rng.next_f64() < (hj_frac * giant_occ).min(0.5)
         && n_giants < max_planets_here
+        && a_hj >= inner_au * 1.2
         && a_hj >= a_lo
         && a_hj <= a_hi;
     if has_hj {
@@ -252,8 +251,9 @@ pub(in crate::physics) fn spawn_ms_frame(
     // ---- Warm Jupiter (~10 % of giant hosts, never with a hot Jupiter) ----
     // Real systems (WASP-107, WASP-117) put one giant at 0.1–1 AU with
     // moderate eccentricity — inside the snow line.
-    let has_warm =
-        rng.next_f64() < (0.10 * giant_occ).min(0.5) && n_giants < max_planets_here && !has_hj;
+    let has_warm = rng.next_f64() < (0.10 * giant_occ).min(0.5)
+        && n_compact + n_giants < max_planets_here
+        && !has_hj;
     let mut placed_w = 0usize;
     if has_warm {
         let a_warm = inner_au + (snow_line_au - inner_au) * (0.3 + 0.6 * rng.next_f64());

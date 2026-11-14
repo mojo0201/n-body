@@ -65,7 +65,7 @@ pub fn seed_from_base62(s: &str) -> Option<u128> {
     Some(v)
 }
 
-/// 32-bit splitmix32 generator.
+/// 32-bit mulberry32 generator.
 ///
 /// The state is a single word. All RNG output is derived from it via the
 /// constants below; do not touch `next_u32` — its exact bit sequence is part

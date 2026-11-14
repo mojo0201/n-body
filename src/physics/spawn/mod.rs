@@ -521,7 +521,7 @@ pub(super) fn sample_imf_mass(rng: &mut XorShift) -> f64 {
 ///
 /// The 85 / 15 split between stellar-mass and brown-dwarf primaries is a
 /// coarse population-synthesis approximation, not a direct IMF integral.
-/// Kroupa (2001) with a lower cutoff of 0.08 M_sun gives ~85 % of draws
+/// Kroupa (2001) with a lower cutoff of 0.08 M_sun gives ~76 % of draws
 /// below 0.5 M_sun, most of which are M dwarfs. Doing the IMF integral
 /// properly (integrating the mass function over [0.08, STAR_M_MIN] vs
 /// [STAR_M_MIN, 50]) gives ~86 / 14, close enough that the constant is

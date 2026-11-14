@@ -54,9 +54,6 @@ const BELT_GRIND_CHUNK: f64 = 0.02;
 pub const BELT_GRIND_MIN_M: f64 = 1e-9;
 /// Planets lighter than this (Earth masses) do not perturb grains.
 const PERT_MIN_M: f64 = 0.01;
-/// Most comets that may exist at once. Extras are removed (named preset
-/// comets and the ones closest to their host are kept).
-pub const MAX_COMETS: usize = 32;
 /// Mean lifetime of a comet-tail tracer, in time units (1 tu is about 50
 /// days, so 12 tu is about 1.6 yr). Each grain draws 0.5-1.5 times this, so
 /// the tail thins out gradually instead of vanishing at once.
@@ -118,10 +115,6 @@ struct Star {
     r: f64,
     /// (L / L_sun) / (M / M_sun), for beta.
     l_over_m: f64,
-}
-
-fn c_sim() -> f64 {
-    299_792_458.0 * time_unit_s() / (LEN_KM * 1000.0)
 }
 
 /// Relative mass of a tracer of size `size_um`. In a collisional cascade
@@ -289,15 +282,15 @@ impl DustField {
         kick: f64,
         dir: Option<(f64, f64)>,
         rng: &mut XorShift,
-    ) {
+    ) -> usize {
         // `n` is a const, so the scratch arrays live on the stack.
         let n = DUST_EMIT_GRAINS;
         if self.grains.len() + n > DUST_MAX_GRAINS || mass <= 0.0 {
-            return;
+            return 0;
         }
         // `dir` is set only for comet tails. Cap them lower than the rest.
         if dir.is_some() && self.grains.len() + n > DUST_COMET_FIELD_CAP {
-            return;
+            return 0;
         }
         let mut sizes = [0.0f64; DUST_EMIT_GRAINS];
         let mut weights = [0.0f64; DUST_EMIT_GRAINS];
@@ -369,10 +362,11 @@ impl DustField {
             });
         }
         self.version = self.version.wrapping_add(1);
+        n
     }
 
-    fn emit(&mut self, p: (f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) {
-        self.emit_dir(p, mass, kick, None, rng);
+    fn emit(&mut self, p: (f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) -> usize {
+        self.emit_dir(p, mass, kick, None, rng)
     }
 }
 
@@ -385,9 +379,10 @@ pub fn deposit(
     mass: f64,
     dir: Option<(f64, f64)>,
     kick_scale: f64,
-) {
+) -> usize {
     let mut fields = std::mem::take(&mut b.dust_fields);
     let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
+    let mut added = 0usize;
     for f in fields.iter_mut() {
         let p = f.primary;
         if p >= b.len() {
@@ -397,12 +392,13 @@ pub fn deposit(
         if r < f.extent_gm {
             let vc = (G * b.m[p] / r.max(1e-6)).sqrt();
             let kick = DUST_EJECT_FRAC * vc * kick_scale;
-            f.emit_dir((x, y, vx, vy), mass, kick, dir, &mut rng);
+            added = f.emit_dir((x, y, vx, vy), mass, kick, dir, &mut rng);
             break;
         }
     }
     b.rng = rng;
     b.dust_fields = fields;
+    added
 }
 
 /// (a, e, periapsis angle) of body `i` about `p`, or `None` if unbound.
@@ -506,37 +502,11 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
 pub static DUST_STAT_NS: AtomicU64 = AtomicU64::new(0);
 pub static DUST_STAT_GRAINS: AtomicU64 = AtomicU64::new(0);
 
-/// Keep at most `MAX_COMETS` comets. Surplus comets are marked dead and
-/// removed by `compact`. Named (preset) comets are kept first, then the ones
-/// closest to their host, which are the active, visible ones.
-fn enforce_comet_limit(b: &mut Bodies) {
-    let mut comets: Vec<(usize, bool, f64)> = (0..b.len())
-        .filter(|&i| !b.dead[i] && b.origin[i] == BodyOrigin::Comet)
-        .map(|i| (i, b.name[i].is_some(), host_distance(b, i)))
-        .collect();
-    if comets.len() <= MAX_COMETS {
-        return;
-    }
-    comets.sort_by(|a, c| c.1.cmp(&a.1).then(a.2.total_cmp(&c.2)));
-    let (x, y) = (b.x[comets[MAX_COMETS].0], b.y[comets[MAX_COMETS].0]);
-    let removed = comets.len() - MAX_COMETS;
-    for &(i, _, _) in &comets[MAX_COMETS..] {
-        b.dead[i] = true;
-    }
-    b.log(
-        EventKind::Comet,
-        format!("{removed} comet(s) removed: limit is {MAX_COMETS}"),
-        x,
-        y,
-    );
-}
-
 /// Advance every field. Runs every `DUST_STEP_INTERVAL` physics steps.
 pub fn evolve(b: &mut Bodies, dt: f64) {
     if !b.stats.steps.is_multiple_of(DUST_STEP_INTERVAL) {
         return;
     }
-    enforce_comet_limit(b);
     if b.dust_fields.is_empty() {
         return;
     }

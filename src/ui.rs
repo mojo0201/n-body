@@ -22,13 +22,6 @@ use egui::{Align2, Color32, FontId, RichText, Stroke};
 use crate::physics::{self as ph, Bodies, BodyKind, BodyOrigin, EventKind};
 use crate::theme::{install_fonts, theme};
 
-// Mirrors `ph::ENERGY_MAX_N` — `total_energy` returns `None` above this, so
-// the energy-drift chart has no data to show. Re-declared here because the
-// constant in `physics.rs` is `pub` but we want the intent ("this is the
-// threshold above which the diagnostics panel shows 'no data'") to live in
-// the UI file too.
-const ENERGY_MAX_N: usize = 1500;
-
 // ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
@@ -126,7 +119,7 @@ pub fn fmt_speed(v: f64, si: bool) -> String {
     // The conversion: 1 sim length unit = 1e6 km, 1 sim time unit ≈ 50 days.
     // So `v * LEN_KM / time_unit_s()` gives km/s. (LEN_KM = 1e6, so
     // `v * 1e6 / 4.3e6 ≈ v * 0.23` — a body moving at `v = 1` sim unit per
-    // sim time unit is moving at ~0.23 km/s.)
+    // sim time unit is moving at ~0.2(≈390 km/s).)
     let kms = v * ph::LEN_KM / ph::time_unit_s();
     if kms >= 1000.0 {
         format!("{:.0} km/s", kms)
@@ -214,6 +207,35 @@ pub struct StatsSnapshot {
     pub dwarf_planets: usize,
     /// Stars in the red giant or red supergiant phase (also counted in `stars`).
     pub giants: usize,
+    /// Comets (origin == Comet), reported separately from planets.
+    pub comets: usize,
+    /// Interstellar objects (origin == Interstellar).
+    pub interstellar: usize,
+    /// Rogue planets (origin == RoguePlanet).
+    pub rogues: usize,
+    /// Mass held by stars and remnants, by planets and dwarfs, and by
+    /// debris (belts, rubble, comets).
+    pub mass_stellar: f64,
+    pub mass_planets: f64,
+    pub mass_debris: f64,
+    /// Total kinetic energy, simulation units.
+    pub kinetic: f64,
+    /// Distance of the barycentre from the origin, and its speed.
+    pub com_dist: f64,
+    pub com_speed: f64,
+    /// Heaviest star-like body: label and mass.
+    pub primary: Option<(String, f64)>,
+    /// Heaviest spawned planet: label and mass.
+    pub heaviest_planet: Option<(String, f64)>,
+    /// Bound body farthest from the primary: label and distance.
+    pub farthest: Option<(String, f64)>,
+    /// Bodies on escape orbits about the primary.
+    pub unbound: usize,
+    /// Spawned planets with a flux between 0.36 and 1.1 S⊕. `None` above
+    /// 3000 bodies (one flux sum per planet is too slow there).
+    pub hz_planets: Option<usize>,
+    /// Age of the oldest star, in Gyr.
+    pub oldest_star_gyr: Option<f64>,
 }
 
 /// One pass over `Bodies` to count everything the stats panel needs.
@@ -247,7 +269,13 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
             BodyKind::BlackHole => s.black_holes += 1,
             BodyKind::Planet | BodyKind::DwarfPlanet => {
                 let o = b.origin[i];
-                if o.is_belt() || o.is_rubble() {
+                if o == BodyOrigin::Comet {
+                    s.comets += 1;
+                } else if o == BodyOrigin::Interstellar {
+                    s.interstellar += 1;
+                } else if o == BodyOrigin::RoguePlanet {
+                    s.rogues += 1;
+                } else if o.is_belt() || o.is_rubble() {
                     s.rubble += 1;
                     if o.is_belt() {
                         s.belt_bodies += 1;
@@ -284,25 +312,110 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
         s.planets -= moons_planet.min(s.planets);
         s.dwarf_planets -= moons_dwarf.min(s.dwarf_planets);
     }
+    // ---- extra statistics, one O(n) pass ---------------------------------
+    let n = b.len();
+    let label = |i: usize| -> String {
+        b.name[i]
+            .clone()
+            .unwrap_or_else(|| format!("#{} {}", b.id[i], ph::class_name(b, i)))
+    };
+    let (mut mx, mut my, mut mvx, mut mvy) = (0.0, 0.0, 0.0, 0.0);
+    for i in 0..n {
+        let m = b.m[i];
+        mx += m * b.x[i];
+        my += m * b.y[i];
+        mvx += m * b.vx[i];
+        mvy += m * b.vy[i];
+        s.kinetic += 0.5 * m * (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i]);
+        match b.kind[i] {
+            BodyKind::Planet | BodyKind::DwarfPlanet => {
+                let o = b.origin[i];
+                if o.is_belt() || o.is_rubble() || o.is_comet() {
+                    s.mass_debris += m;
+                } else {
+                    s.mass_planets += m;
+                }
+            }
+            k => {
+                s.mass_stellar += m;
+                if k == BodyKind::Star {
+                    let age = b.age_gyr[i];
+                    if s.oldest_star_gyr.is_none_or(|a| age > a) {
+                        s.oldest_star_gyr = Some(age);
+                    }
+                }
+            }
+        }
+    }
+    if s.total_mass > 0.0 {
+        let cx = mx / s.total_mass;
+        let cy = my / s.total_mass;
+        s.com_dist = (cx * cx + cy * cy).sqrt();
+        s.com_speed = (mvx * mvx + mvy * mvy).sqrt() / s.total_mass;
+    }
+    if let Some(p) = ph::primary_index(b) {
+        s.primary = Some((label(p), b.m[p]));
+        let mut heaviest: Option<usize> = None;
+        let mut far: Option<(usize, f64)> = None;
+        for i in 0..n {
+            if i == p {
+                continue;
+            }
+            let dx = b.x[i] - b.x[p];
+            let dy = b.y[i] - b.y[p];
+            let r = (dx * dx + dy * dy).sqrt().max(1e-12);
+            let dvx = b.vx[i] - b.vx[p];
+            let dvy = b.vy[i] - b.vy[p];
+            let mu = ph::G * (b.m[p] + b.m[i]);
+            if 0.5 * (dvx * dvx + dvy * dvy) - mu / r >= 0.0 {
+                s.unbound += 1;
+            } else if far.is_none_or(|(_, d)| r > d) {
+                far = Some((i, r));
+            }
+            if b.kind[i] == BodyKind::Planet
+                && b.origin[i] == BodyOrigin::Spawned
+                && heaviest.is_none_or(|h| b.m[i] > b.m[h])
+            {
+                heaviest = Some(i);
+            }
+        }
+        s.heaviest_planet = heaviest.map(|h| (label(h), b.m[h]));
+        s.farthest = far.map(|(i, d)| (label(i), d));
+    }
+    if n <= 3000 {
+        let mut hz = 0;
+        for i in 0..n {
+            if b.kind[i] == BodyKind::Planet && b.origin[i] == BodyOrigin::Spawned {
+                let f = ph::stellar_flux(b, b.x[i], b.y[i], i);
+                if (0.36..=1.1).contains(&f) {
+                    hz += 1;
+                }
+            }
+        }
+        s.hz_planets = Some(hz);
+    }
     s.drift = ph::energy_drift_pct(b);
     s.dissipated = ph::energy_dissipated_pct(b);
     s.ang_mom = ph::total_angular_momentum(b);
     s
 }
 
-/// One diagnostic sample.
+/// One point in the diagnostics history. Sampled once per wall-clock second.
+/// Percent values are `None` when they have no meaning (for example the
+/// energy drift above `ENERGY_MAX_N` bodies).
 pub struct DiagSample {
     pub t: f64,
     pub n: usize,
+    /// Integrator energy drift, percent of the baseline energy.
     pub drift: Option<f64>,
+    /// Energy removed or added by merges, break-ups and escapes, percent.
+    pub dissipated: Option<f64>,
+    /// Change of total angular momentum since the baseline, percent.
+    pub l_drift: Option<f64>,
+    /// Fine time steps used in the last step (close encounters raise this).
+    pub nsub: u32,
 }
 
-/// Rolling history for the three diagnostic plots: N(t), energy drift, and
-/// eccentricity histogram.
-///
-/// `samples` is capped at `max_samples = 300`, which is 5 minutes of history
-/// at the 1 Hz sampling rate. `eccs` is recomputed fresh each sample (it's a
-/// snapshot of the *current* eccentricity distribution, not a history).
 pub struct DiagHistory {
     pub samples: std::collections::VecDeque<DiagSample>,
     pub max_samples: usize,
@@ -312,6 +425,10 @@ pub struct DiagHistory {
     pub ecc_bin_width: f64,
     pub ecc_bin_count: usize,
     pub visible: bool,
+    /// Angular momentum baseline. Set at the first sample and again when the
+    /// energy baseline changes (a user edit re-anchors both).
+    l0: Option<f64>,
+    e0_seen: f64,
 }
 
 impl DiagHistory {
@@ -319,41 +436,70 @@ impl DiagHistory {
         Self {
             samples: std::collections::VecDeque::new(),
             max_samples: 300,
-            // `now - 10s` forces the first sample to fire on the first
-            // frame, so the plots aren't blank while the user wonders if
-            // they're broken.
+            // `now - 10s` forces the first sample on the first frame.
             last_sample: Instant::now() - Duration::from_secs(10),
             eccs: Vec::new(),
             ecc_bins: vec![0; 20],
             ecc_bin_width: 0.05,
             ecc_bin_count: 20,
-            visible: true,
+            // Closed at launch. Open it with G or the View section.
+            visible: false,
+            l0: None,
+            e0_seen: 0.0,
         }
     }
 
-    /// Called from the render thread at most once per second while holding the lock.
-    ///
-    /// Cost note: the eccentricity pass calls `find_parent` and `orbit_info`
-    /// for every planet. For n = 5000, that's 5000 × O(n) = 2.5×10⁷ ops.
-    /// That's why this is throttled to 1 Hz and `eccs` is capped at 500.
-    /// If you want a live eccentricity histogram at large n, this needs
-    /// to become O(n) (a coarse-grained Hill-sphere census).
+    /// Forget all samples and the angular-momentum baseline.
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.eccs.clear();
+        self.ecc_bins.fill(0);
+        self.l0 = None;
+    }
+
     pub fn maybe_sample(&mut self, b: &Bodies) {
         if self.last_sample.elapsed() < Duration::from_secs(1) {
             return;
         }
         self.last_sample = Instant::now();
 
+        if let Some(last) = self.samples.back() {
+            if b.time < last.t {
+                // Time went backwards: a new system replaced the old one.
+                self.clear();
+            } else if b.time == last.t {
+                // Paused: a second sample at the same time adds nothing.
+                return;
+            }
+        }
+
         let n = b.len();
-        let drift = if n <= ENERGY_MAX_N {
+        let drift = if n <= ph::ENERGY_MAX_N {
             ph::energy_drift_pct(b)
         } else {
             None
         };
+        let dissipated = ph::energy_dissipated_pct(b);
+
+        let l = ph::total_angular_momentum(b);
+        if self.e0_seen != b.stats.energy0 {
+            self.e0_seen = b.stats.energy0;
+            self.l0 = None;
+        }
+        let l0 = *self.l0.get_or_insert(l);
+        let l_drift = if l0.abs() > 1e-12 && l.is_finite() {
+            Some((l - l0) / l0.abs() * 100.0)
+        } else {
+            None
+        };
+
         self.samples.push_back(DiagSample {
             t: b.time,
             n,
             drift,
+            dissipated,
+            l_drift,
+            nsub: b.stats.last_nsub,
         });
         while self.samples.len() > self.max_samples {
             self.samples.pop_front();
@@ -372,24 +518,38 @@ impl DiagHistory {
             }
             if let Some(p) = ph::find_parent(b, i) {
                 let o = ph::orbit_info(b, i, p);
-                // `bound` filters out escape orbits: a hyperbolic body has
-                // e > 1, which has no meaningful bin in the histogram. If
-                // the sample is mostly escaping bodies, the histogram will
-                // be biased toward the bound ones — that's correct, the
-                // plot is titled "eccentricity of bound planets".
+                // Hyperbolic bodies (e > 1) have no bin: only bound orbits count.
                 if o.bound && o.ecc.is_finite() {
                     self.eccs.push(o.ecc);
                 }
             }
         }
-
-        // Rebuild the bins from scratch. `bin = min(e / width, count-1)`
-        // puts e=1.0 into the last bin rather than overflowing.
+        // `min(count - 1)` puts e = 1.0 in the last bin.
         self.ecc_bins.fill(0);
         for &e in &self.eccs {
             let bin = ((e / self.ecc_bin_width) as usize).min(self.ecc_bin_count - 1);
             self.ecc_bins[bin] += 1;
         }
+    }
+
+    /// The history as CSV text (time in simulation units).
+    pub fn to_csv(&self) -> String {
+        let opt = |v: Option<f64>| v.map(|x| format!("{x:e}")).unwrap_or_default();
+        let mut s = String::from(
+            "t,n,energy_drift_pct,energy_dissipated_pct,ang_mom_drift_pct,fine_steps\n",
+        );
+        for p in &self.samples {
+            s.push_str(&format!(
+                "{:e},{},{},{},{},{}\n",
+                p.t,
+                p.n,
+                opt(p.drift),
+                opt(p.dissipated),
+                opt(p.l_drift),
+                p.nsub
+            ));
+        }
+        s
     }
 }
 
@@ -412,8 +572,6 @@ pub struct UiState {
     pub show_help: bool,
     pub show_dock: bool,
     pub show_trails: bool,
-    /// The preset library window is open.
-    pub preset_library_open: bool,
     /// Slug of the preset that is loaded now, if any.
     pub loaded_preset_slug: Option<String>,
     pub diag: DiagHistory,
@@ -427,10 +585,39 @@ pub struct UiState {
     pub sort: SortKey,
     pub sort_desc: bool,
     pub list_limit: usize,
+    /// Text typed in the body-list search box (matches name or class).
+    pub list_query: String,
+    /// Bodies ticked in the body list, by id. Edits apply to all of them.
+    pub multi: std::collections::BTreeSet<u64>,
+    /// Bit mask of event kinds shown in the Events list (see `event_bit`).
+    pub event_mask: u16,
     pub list_rows: Vec<ListRow>,
     list_time: Instant,
     pub stats: StatsSnapshot,
     stats_time: Instant,
+}
+
+/// A fresh random seed that uses all `SEED_LEN` base62 digits, so the text
+/// shown in the seed box never starts with a long run of zeros.
+///
+/// The source is the clock and the address of a stack value, mixed with an
+/// LCG. It is not cryptographic. It only has to differ between launches.
+pub fn random_seed() -> u128 {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let probe = 0u8;
+    let mut x = (d.subsec_nanos() as u64)
+        ^ d.as_secs().wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (&probe as *const u8 as u64).wrapping_mul(2_654_435_761);
+    let mut v: u128 = 0;
+    for _ in 0..ph::SEED_LEN {
+        x = x
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        v = v * 62 + ((x >> 33) % 62) as u128;
+    }
+    v
 }
 
 /// Parse seed text as base62. Return `fallback` when the text is not valid.
@@ -458,7 +645,6 @@ impl UiState {
             show_help: false,
             show_dock: true,
             show_trails: true,
-            preset_library_open: false,
             loaded_preset_slug: None,
             diag: DiagHistory::new(),
             pending_count: body_count,
@@ -471,6 +657,9 @@ impl UiState {
             sort: SortKey::Mass,
             sort_desc: true,
             list_limit: 100,
+            list_query: String::new(),
+            multi: std::collections::BTreeSet::new(),
+            event_mask: 0x1FF,
             list_rows: Vec::new(),
             // `old` is 10 seconds ago so the first `stats_time.elapsed()`
             // is large and the first frame computes stats immediately.
@@ -495,7 +684,7 @@ pub struct ViewInfo {
     pub ppp: f32,
     pub seed: u128,
     /// Bodies per system (the "bodies" slider target). For Solar this is
-    /// always 9; for Random it's the user's `pending_count` at spawn time.
+    /// the spawned system's body count; for Random it's the user's `pending_count` at spawn time.
     pub body_count: usize,
     /// Number of systems currently spawned (the "systems" slider target).
     pub systems: usize,
@@ -510,10 +699,8 @@ pub struct ViewInfo {
     pub preset: crate::Preset,
     pub vsync: bool,
     pub behind: bool,
-    /// Stellar aging rate in Gyr per simulation time unit (0 = off).
-    pub evolution_rate: f64,
-    pub sn_kicks: bool,
-    pub mass_transfer: bool,
+    /// Pause the simulation when a merger, impact or tidal break-up happens.
+    pub pause_on_event: bool,
 }
 
 /// A single body edit requested by the UI. Applied by `SimState::apply_actions`
@@ -540,14 +727,6 @@ pub struct Actions {
     pub reset: bool,
     pub toggle_pause: bool,
     pub step_once: bool,
-    /// Spawn one interstellar object inbound from `0.9 × CULL_DIST`.
-    /// Not part of any automatic spawn path, so it never affects RNG
-    /// state for other tests.
-    pub spawn_iso: bool,
-    /// Spawn one rogue planet inbound from `0.9 × CULL_DIST` (gas-giant
-    /// mass). Exempt from the `CULL_DIST` cull, so it persists through
-    /// the outer system until `HARD_CULL_DIST`.
-    pub spawn_rogue: bool,
     pub speed: Option<f64>,
     pub body_count: Option<usize>,
     pub seed: Option<u128>,
@@ -567,9 +746,9 @@ pub struct Actions {
     pub vsync: Option<bool>,
     pub trails: Option<bool>,
     pub diag_visible: Option<bool>,
-    pub evolution_rate: Option<f64>,
-    pub sn_kicks: Option<bool>,
-    pub mass_transfer: Option<bool>,
+    pub pause_on_event: Option<bool>,
+    /// One edit applied to many bodies (ids from the body list), committed once.
+    pub multi_edit: Option<(Vec<u64>, Edit)>,
     /// Slug of a preset from the library to load.
     pub load_preset: Option<String>,
 }
@@ -704,7 +883,6 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
     if ui_state.show_list {
         list_window(ctx, ui_state, view, b, &mut act);
     }
-    preset_window(ctx, ui_state, &mut act);
     if ui_state.show_help {
         help_window(ctx, ui_state);
     }
@@ -900,6 +1078,18 @@ fn status_bar(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies
                 // Only show the "close encounter" warning when the block
                 // step has actually been subdivided. `last_nsub = 1 << kmax`,
                 // so `last_nsub > 4` means rung ≥ 3 (8× or more fine ticks).
+                ui.separator();
+                let drift = st.stats.drift;
+                let drift_col = match drift {
+                    Some(d) if d.abs() > 1.0 => theme().colors.warn(),
+                    _ => theme().colors.dim(),
+                };
+                ui.label(
+                    RichText::new(format!("ΔE {}", fmt_pct(drift)))
+                        .monospace()
+                        .color(drift_col),
+                )
+                .on_hover_text("integrator energy drift (n/a for very large systems)");
                 if b.stats.last_nsub > 4 {
                     ui.separator();
                     ui.label(
@@ -919,7 +1109,13 @@ fn status_bar(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies
                 // Right-aligned "? help" so the top-right corner is a
                 // consistent affordance regardless of what's left-aligned.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("? help").color(theme().colors.dim()));
+                    if ui
+                        .small_button("? help")
+                        .on_hover_text("keyboard shortcuts (H)")
+                        .clicked()
+                    {
+                        st.show_help = !st.show_help;
+                    }
                 });
             });
         });
@@ -961,8 +1157,8 @@ fn dock(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies, act:
                     // immediately reset a system they just made.
                     section_simulation(ui, st, view, b, act);
                     section_stats(ui, st, view, b);
-                    section_evolution(ui, st, view, act);
                     section_view(ui, st, view, act);
+                    section_advanced(ui, st, view, act);
                     section_generate(ui, st, view, act);
                     section_events(ui, st, b, act);
                 });
@@ -994,20 +1190,6 @@ fn section_simulation(
                 if ui.button("Step").on_hover_text("one step (.)").clicked() {
                     act.step_once = true;
                 }
-                if ui
-                    .button("Spawn ISO")
-                    .on_hover_text("spawn an interstellar object inbound (I)")
-                    .clicked()
-                {
-                    act.spawn_iso = true;
-                }
-                if ui
-                    .button("Spawn rogue")
-                    .on_hover_text("spawn a gas-giant rogue planet inbound (Shift+I)")
-                    .clicked()
-                {
-                    act.spawn_rogue = true;
-                }
             });
             // Speed slider is logarithmic: the useful range spans 0.01× to
             // 100×, and a linear slider would spend 99 % of its length on
@@ -1031,6 +1213,14 @@ fn section_simulation(
                     }
                 }
             });
+            let mut pause_ev = view.pause_on_event;
+            if ui
+                .checkbox(&mut pause_ev, "pause on merger / impact")
+                .on_hover_text("pause when a merger, impact or tidal break-up happens")
+                .changed()
+            {
+                act.pause_on_event = Some(pause_ev);
+            }
         });
 }
 
@@ -1078,6 +1268,15 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
                     if let Some(m) = s.moons {
                         comp += &format!(" {} moons", m);
                     }
+                    if s.comets > 0 {
+                        comp += &format!(" {} comets", s.comets);
+                    }
+                    if s.interstellar > 0 {
+                        comp += &format!(" {} ISO", s.interstellar);
+                    }
+                    if s.rogues > 0 {
+                        comp += &format!(" {} rogues", s.rogues);
+                    }
                     comp += &format!(" {} debris", s.rubble);
                     if s.belt_bodies > 0 {
                         comp += &format!(" ({} in belts)", s.belt_bodies);
@@ -1087,15 +1286,6 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
                     }
                     kv(ui, "bodies", format!("{} ({})", s.n, comp));
                     kv(ui, "total mass", fmt_mass(s.total_mass, si));
-                    kv(
-                        ui,
-                        "evolution",
-                        if view.evolution_rate == 0.0 {
-                            "off".to_string()
-                        } else {
-                            format!("10^{:.1} Gyr/tu", view.evolution_rate.log10())
-                        },
-                    );
                     kv(
                         ui,
                         "phase mix",
@@ -1108,6 +1298,56 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
                             s.black_holes
                         ),
                     );
+
+                    if s.total_mass > 0.0 {
+                        let pc = |x: f64| 100.0 * x / s.total_mass;
+                        kv(
+                            ui,
+                            "mass split",
+                            format!(
+                                "{:.2} % stellar, {:.3} % planets, {:.4} % debris",
+                                pc(s.mass_stellar),
+                                pc(s.mass_planets),
+                                pc(s.mass_debris)
+                            ),
+                        );
+                    }
+
+                    heading_row(ui, "Population");
+                    if let Some((name, m)) = &s.primary {
+                        kv(ui, "primary", format!("{} ({})", name, fmt_mass(*m, si)));
+                    }
+                    if let Some((name, m)) = &s.heaviest_planet {
+                        kv(
+                            ui,
+                            "heaviest planet",
+                            format!("{} ({})", name, fmt_mass(*m, si)),
+                        );
+                    }
+                    if let Some((name, d)) = &s.farthest {
+                        kv(
+                            ui,
+                            "farthest bound",
+                            format!("{} ({})", name, fmt_len(*d, si)),
+                        );
+                    }
+                    kv(ui, "on escape orbits", format!("{}", s.unbound));
+                    if let Some(hz) = s.hz_planets {
+                        kv(ui, "in habitable zone", format!("{}", hz));
+                    }
+                    if let Some(age) = s.oldest_star_gyr {
+                        kv(ui, "oldest star", format!("{:.3} Gyr", age));
+                    }
+                    let eccs = &st.diag.eccs;
+                    if !eccs.is_empty() {
+                        let mean = eccs.iter().sum::<f64>() / eccs.len() as f64;
+                        let max = eccs.iter().copied().fold(0.0_f64, f64::max);
+                        kv(
+                            ui,
+                            "planet eccentricity",
+                            format!("mean {:.3}, max {:.3} (n={})", mean, max, eccs.len()),
+                        );
+                    }
 
                     heading_row(ui, "Events");
                     kv(ui, "merges", fmt_count(b.stats.merges));
@@ -1129,6 +1369,9 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
                     kv_color(ui, "integrator drift", fmt_pct(s.drift), drift_col);
                     kv(ui, "heat / escapes", fmt_pct(s.dissipated));
                     kv(ui, "ang. momentum", format!("{:.4e}", s.ang_mom));
+                    kv(ui, "kinetic energy", format!("{:.4e}", s.kinetic));
+                    kv(ui, "barycentre offset", fmt_len(s.com_dist, si));
+                    kv(ui, "barycentre speed", fmt_speed(s.com_speed, si));
 
                     heading_row(ui, "Solver");
                     // The solver names are hardcoded to match `physics.rs`'s
@@ -1162,53 +1405,11 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
         });
 }
 
-/// Stellar evolution controls: aging rate, supernova kicks, mass transfer.
-fn section_evolution(ui: &mut egui::Ui, _st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
-    egui::CollapsingHeader::new(RichText::new("Evolution").strong())
-        .default_open(false)
-        .show(ui, |ui| {
-            let off = view.evolution_rate <= 0.0;
-            // Logarithmic slider: 10^-3 to 10^3 Gyr per time unit.
-            let mut slider_val = if off { 0.0 } else { view.evolution_rate.log10() };
-            let changed = ui
-                .add(
-                    egui::Slider::new(&mut slider_val, -3.0..=3.0)
-                        .text("age rate (Gyr / time unit)")
-                        .custom_formatter(|v, _| format!("10^{:.1}", v)),
-                )
-                .changed();
-            let mut disable = off;
-            if ui.checkbox(&mut disable, "off").changed() {
-                act.evolution_rate = Some(if disable { 0.0 } else { 1.0 });
-            } else if changed {
-                act.evolution_rate = Some(10f64.powf(slider_val));
-            }
-            ui.label(
-                RichText::new(
-                    "A 1 M☉ star lives ~11.5 Gyr. At 1 Gyr/tu, evolution takes ~11 tu (~1.5 yr sim time at 1×).",
-                )
-                .small()
-                .color(theme().colors.dim()),
-            );
-            let mut kicks = view.sn_kicks;
-            if ui.checkbox(&mut kicks, "supernova natal kicks").changed() {
-                act.sn_kicks = Some(kicks);
-            }
-            let mut mt = view.mass_transfer;
-            if ui.checkbox(&mut mt, "mass transfer in binaries").changed() {
-                act.mass_transfer = Some(mt);
-            }
-        });
-}
-
 fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
     egui::CollapsingHeader::new(RichText::new("View").strong())
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Zoom buttons: ×1/1.4 and ×1.4 match the mouse-wheel factor
-                // (`exp(0.15 * dy)` is ~1.16 per notch; 1.4 is the "big step"
-                // equivalent of ~3 notches).
                 if ui.button("−").on_hover_text("zoom out (-)").clicked() {
                     act.zoom_mul = Some(1.0 / 1.4);
                 }
@@ -1225,39 +1426,43 @@ fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut 
                     act.cycle = 1;
                 }
             });
-            // Each toggle mirrors a `SimState` field. The checkbox reads
-            // from `view` (the committed value) and writes to `act` (the
-            // requested value); the render loop then applies it. This is
-            // why dragging a checkbox doesn't immediately change the sim —
-            // it takes one frame.
             let mut orbits = view.show_orbits;
             if ui.checkbox(&mut orbits, "orbit lines (O)").changed() {
                 act.orbits = Some(orbits);
             }
-            let mut debris = view.show_debris_orbits;
-            if ui.checkbox(&mut debris, "debris orbits (;)").changed() {
-                act.debris_orbits = Some(debris);
+            let mut follow = view.follow;
+            if ui.checkbox(&mut follow, "follow selected (C)").changed() {
+                act.follow = Some(follow);
             }
-            // Trails are the exception: `show_trails` lives in `UiState`
-            // (UI-only) and is toggled directly, not via `act`. The sim
-            // doesn't care.
-            let mut trails = st.show_trails;
-            if ui.checkbox(&mut trails, "trails").changed() {
-                st.show_trails = trails;
-                act.trails = Some(trails);
-            }
+            ui.checkbox(&mut st.show_labels, "labels (L)");
+            ui.checkbox(&mut st.units_si, "physical units (U)");
             let mut diag_vis = st.diag.visible;
             if ui.checkbox(&mut diag_vis, "diagnostics (G)").changed() {
                 st.diag.visible = diag_vis;
                 act.diag_visible = Some(diag_vis);
             }
-            // NOTE: the line above is a deliberate place to flag — `diag_vis`
-            // is a direct field, so the action `diag_visible` is redundant
-            // here. The current code does write `act.diag_visible`, which
-            // `apply_actions` then writes back to `ui_state.diag.visible`.
-            // No bug, just a round-trip that could be a one-liner.
-            ui.checkbox(&mut st.show_labels, "labels (L)");
-            ui.checkbox(&mut st.units_si, "physical units (U)");
+            ui.toggle_value(&mut st.show_list, "Body list (B)");
+            ui.label(
+                RichText::new("Bodies are drawn at true size. Tiny ones get a minimum of a few pixels so they stay visible.")
+                    .small()
+                    .color(theme().colors.dim()),
+            );
+        });
+}
+
+fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
+    egui::CollapsingHeader::new(RichText::new("Advanced").strong())
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut debris = view.show_debris_orbits;
+            if ui.checkbox(&mut debris, "debris orbits (;)").changed() {
+                act.debris_orbits = Some(debris);
+            }
+            let mut trails = st.show_trails;
+            if ui.checkbox(&mut trails, "trails").changed() {
+                st.show_trails = trails;
+                act.trails = Some(trails);
+            }
             let mut vsync = view.vsync;
             if ui
                 .checkbox(&mut vsync, "vsync (V)")
@@ -1266,19 +1471,6 @@ fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut 
             {
                 act.vsync = Some(vsync);
             }
-            let mut follow = view.follow;
-            if ui.checkbox(&mut follow, "follow selected (C)").changed() {
-                act.follow = Some(follow);
-            }
-            ui.horizontal(|ui| {
-                ui.toggle_value(&mut st.show_list, "Body list (B)");
-                ui.toggle_value(&mut st.show_help, "Help (?)");
-            });
-            ui.label(
-                RichText::new("Bodies are drawn at true size. Tiny ones get a minimum of a few pixels so they stay visible.")
-                    .small()
-                    .color(theme().colors.dim()),
-            );
         });
 }
 
@@ -1390,8 +1582,8 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
                     ui.label("seed");
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.pending_seed_text)
-                            .char_limit(6)
-                            .desired_width(60.0),
+                            .char_limit(ph::SEED_LEN)
+                            .desired_width(150.0),
                     );
                     if r.changed() && ph::seed_from_base62(&st.pending_seed_text).is_none() {
                         // Hold the old value: `commit_seed_text` uses
@@ -1406,22 +1598,20 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
                                 .color(Color32::from_rgb(220, 60, 60)),
                         );
                     }
-                    if ui.button("Random").clicked() {
-                        let d = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default();
-                        let mut x = (d.subsec_nanos() as u64)
-                            ^ d.as_secs().wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                            ^ (view.seed as u64).wrapping_mul(2_654_435_761);
-                        st.pending_seed_text = (0..6)
-                            .map(|_| {
-                                x = x
-                                    .wrapping_mul(6_364_136_223_846_793_005)
-                                    .wrapping_add(1_442_695_040_888_963_407);
-                                ph::SEED_ALPHABET[((x >> 33) % 62) as usize] as char
-                            })
-                            .collect();
+                    if ui
+                        .button("Random")
+                        .on_hover_text("roll a new random seed")
+                        .clicked()
+                    {
+                        st.pending_seed_text = ph::seed_to_base62(random_seed());
                         st.seed_text_invalid = false;
+                    }
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("copy the seed of the current system")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(ph::seed_to_base62(view.seed));
                     }
                 });
                 // Status line. `body_count` is the per-system *target*;
@@ -1453,17 +1643,6 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
                         .small()
                         .color(theme().colors.dim()),
                 );
-                if ui
-                    .button("Reload (R)")
-                    .on_hover_text("reload this preset with fresh planet phases")
-                    .clicked()
-                {
-                    act.reset = true;
-                }
-            }
-
-            if ui.small_button("Browse presets…").clicked() {
-                st.preset_library_open = true;
             }
         });
 }
@@ -1485,12 +1664,34 @@ fn event_color(k: EventKind) -> Color32 {
     }
 }
 
-/// Event log: newest-first, capped at 60 entries. Clicking an entry sets
-/// `act.center_on`, which the render loop turns into a camera snap.
-fn section_events(ui: &mut egui::Ui, st: &UiState, b: &Bodies, act: &mut Actions) {
-    // `id_salt` is needed because two collapsing headers with the same
-    // title ("Events") would share state otherwise. `id_salt` gives them
-    // distinct egui ids.
+/// Bit for one event kind in `UiState::event_mask`.
+fn event_bit(k: EventKind) -> u16 {
+    match k {
+        EventKind::Merge => 1 << 0,
+        EventKind::Impact => 1 << 1,
+        EventKind::Tidal => 1 << 2,
+        EventKind::Escape => 1 << 3,
+        EventKind::User => 1 << 4,
+        EventKind::Evolve => 1 << 5,
+        EventKind::Comet => 1 << 6,
+        EventKind::Interstellar => 1 << 7,
+        EventKind::Eject => 1 << 8,
+    }
+}
+
+const EVENT_KINDS: [(EventKind, &str); 9] = [
+    (EventKind::Merge, "merge"),
+    (EventKind::Impact, "impact"),
+    (EventKind::Tidal, "tidal"),
+    (EventKind::Escape, "escape"),
+    (EventKind::Eject, "eject"),
+    (EventKind::Evolve, "evolve"),
+    (EventKind::Comet, "comet"),
+    (EventKind::Interstellar, "interstellar"),
+    (EventKind::User, "edit"),
+];
+
+fn section_events(ui: &mut egui::Ui, st: &mut UiState, b: &Bodies, act: &mut Actions) {
     egui::CollapsingHeader::new(RichText::new(format!("Events ({})", b.events.len())).strong())
         .id_salt("events_header")
         .default_open(true)
@@ -1499,14 +1700,32 @@ fn section_events(ui: &mut egui::Ui, st: &UiState, b: &Bodies, act: &mut Actions
                 ui.label(RichText::new("nothing has happened yet").color(theme().colors.dim()));
                 return;
             }
+            ui.horizontal_wrapped(|ui| {
+                for (k, name) in EVENT_KINDS {
+                    let bit = event_bit(k);
+                    let on = st.event_mask & bit != 0;
+                    let txt = RichText::new(name).small().color(if on {
+                        event_color(k)
+                    } else {
+                        theme().colors.dim()
+                    });
+                    if ui.selectable_label(on, txt).clicked() {
+                        st.event_mask ^= bit;
+                    }
+                }
+            });
+            let mask = st.event_mask;
             egui::ScrollArea::vertical()
                 .max_height(220.0)
                 .id_salt("events_scroll")
                 .show(ui, |ui| {
-                    // `.rev()` shows newest first; `.take(60)` caps the
-                    // cost so a system that has been running for hours
-                    // doesn't render 200 event rows every frame.
-                    for e in b.events.iter().rev().take(60) {
+                    for e in b
+                        .events
+                        .iter()
+                        .rev()
+                        .filter(|e| mask & event_bit(e.kind) != 0)
+                        .take(60)
+                    {
                         let resp = ui
                             .horizontal_wrapped(|ui| {
                                 ui.label(
@@ -1747,6 +1966,23 @@ fn selection_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize, parent: Opt
                 "temperature",
                 format!("{:.0} K", ph::temperature_of(b, i)),
             );
+            kv(
+                ui,
+                if kind == BodyKind::Star {
+                    "age"
+                } else {
+                    "cooling age"
+                },
+                format!("{:.3} Gyr", b.age_gyr[i]),
+            );
+            if b.m_init[i] > 0.0 && ((b.m_init[i] - m) / b.m_init[i]).abs() > 1e-6 {
+                kv(ui, "initial mass", fmt_mass(b.m_init[i], si));
+                kv(
+                    ui,
+                    "mass lost",
+                    format!("{:.2} %", 100.0 * (b.m_init[i] - m) / b.m_init[i]),
+                );
+            }
             if let Some(phase) = ph::phase_of(b, i) {
                 kv(
                     ui,
@@ -1835,6 +2071,30 @@ fn selection_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize, parent: Opt
         );
         kv(ui, "distance", fmt_len(o.dist, si));
         kv(ui, "speed", fmt_speed(o.speed_rel, si));
+        {
+            let rx = b.x[i] - b.x[p];
+            let ry = b.y[i] - b.y[p];
+            let rvx = b.vx[i] - b.vx[p];
+            let rvy = b.vy[i] - b.vy[p];
+            let h = rx * rvy - ry * rvx;
+            kv(
+                ui,
+                "direction",
+                if h >= 0.0 {
+                    "counter-clockwise"
+                } else {
+                    "clockwise"
+                },
+            );
+            if o.dist > 0.0 {
+                let vc = (ph::G * (b.m[p] + m) / o.dist).sqrt();
+                if vc > 0.0 {
+                    kv(ui, "speed / circular", format!("{:.3}", o.speed_rel / vc));
+                }
+            }
+            kv(ui, "specific ang. mom.", format!("{:.3e}", h.abs()));
+            kv(ui, "mass / parent", format!("{:.3e}", m / b.m[p]));
+        }
         if o.bound {
             kv(ui, "semi-major axis", fmt_len(o.semi_major, si));
             kv(ui, "eccentricity", format!("{:.4}", o.ecc));
@@ -1907,6 +2167,33 @@ fn selection_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize, parent: Opt
     // the body can't hit anything (so a fragment doesn't immediately
     // re-impact the surviving body). Showing it makes it clear why two
     // overlapping bodies don't immediately merge.
+    kv(ui, "momentum", format!("{:.3e}", m * v));
+    kv(ui, "kinetic energy", format!("{:.3e}", 0.5 * m * v * v));
+    if b.spin[i] != 0.0 {
+        kv(ui, "spin ang. momentum", format!("{:.3e}", b.spin[i]));
+    }
+    if let Some(prim) = ph::primary_index(b) {
+        if prim != i && parent != Some(prim) {
+            let dx = b.x[i] - b.x[prim];
+            let dy = b.y[i] - b.y[prim];
+            kv(
+                ui,
+                "distance from primary",
+                fmt_len((dx * dx + dy * dy).sqrt(), si),
+            );
+        }
+    }
+    let heavier = (0..b.len()).filter(|&k| b.m[k] > m).count();
+    kv(ui, "mass rank", format!("#{} of {}", heavier + 1, b.len()));
+    // find_parent is O(n), so counting children is O(n²): small systems only.
+    if b.len() <= 400 {
+        let kids = (0..b.len())
+            .filter(|&k| k != i && ph::find_parent(b, k) == Some(i))
+            .count();
+        if kids > 0 {
+            kv(ui, "bodies orbiting it", format!("{}", kids));
+        }
+    }
     if b.time < b.imm[i] {
         kv(ui, "collision immunity", fmt_time(b.imm[i] - b.time, si));
     }
@@ -1970,6 +2257,16 @@ fn refresh_rows(st: &mut UiState, b: &Bodies) {
     if st.sort_desc {
         idx.reverse();
     }
+    let q = st.list_query.trim().to_lowercase();
+    if !q.is_empty() {
+        idx.retain(|&i| {
+            let label = b.name[i]
+                .clone()
+                .unwrap_or_else(|| format!("#{}", b.id[i]))
+                .to_lowercase();
+            label.contains(&q) || ph::class_name(b, i).to_lowercase().contains(&q)
+        });
+    }
     idx.truncate(st.list_limit);
 
     st.list_rows = idx
@@ -2002,26 +2299,34 @@ fn list_window(
     b: &Bodies,
     act: &mut Actions,
 ) {
-    // Refresh cadence: 300 ms is a compromise between "the list is live"
-    // and "we don't rebuild the O(n²) snapshot every frame." The user
-    // can force a refresh by clicking a sort header.
     if st.list_time.elapsed() > Duration::from_millis(300) || st.list_rows.is_empty() {
         refresh_rows(st, b);
         st.list_time = Instant::now();
     }
+    // Bodies that merged or escaped since the last frame leave the ticked set.
+    st.multi.retain(|id| b.index_of_id(*id).is_some());
     let si = st.units_si;
     let mut open = st.show_list;
     egui::Window::new("Bodies")
         .open(&mut open)
         .default_pos([320.0, 60.0])
-        .default_width(560.0)
+        .default_width(600.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{} bodies", b.len())).color(theme().colors.dim()));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut st.list_query)
+                        .hint_text("search name or class")
+                        .desired_width(170.0),
+                );
+                if r.changed() {
+                    st.list_time = Instant::now() - Duration::from_secs(5);
+                }
+                if !st.list_query.is_empty() && ui.small_button("✕").clicked() {
+                    st.list_query.clear();
+                    st.list_time = Instant::now() - Duration::from_secs(5);
+                }
                 ui.label("show");
-                // The limit is a power-of-2-ish sequence: 50, 100, 250, 500,
-                // 1000. Not a log slider because the exact values matter to
-                // the user (they may want exactly 100 rows).
                 let mut lim = st.list_limit;
                 egui::ComboBox::from_id_salt("list_limit")
                     .selected_text(lim.to_string())
@@ -2032,13 +2337,56 @@ fn list_window(
                     });
                 if lim != st.list_limit {
                     st.list_limit = lim;
-                    // Force a refresh on the next frame.
                     st.list_time = Instant::now() - Duration::from_secs(5);
                 }
             });
-            // Header row: (label, sort key). The "class" column is not
-            // sortable; the `k == 1` branch below draws it as a plain
-            // label without a click handler.
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("tick all shown").clicked() {
+                    for r in &st.list_rows {
+                        st.multi.insert(r.id);
+                    }
+                }
+                if !st.multi.is_empty() {
+                    let ids: Vec<u64> = st.multi.iter().copied().collect();
+                    ui.label(
+                        RichText::new(format!("{} ticked", ids.len()))
+                            .color(theme().colors.accent()),
+                    );
+                    if ui.small_button("mass ÷2").clicked() {
+                        act.multi_edit = Some((ids.clone(), Edit::MassMul(0.5)));
+                    }
+                    if ui.small_button("mass ×2").clicked() {
+                        act.multi_edit = Some((ids.clone(), Edit::MassMul(2.0)));
+                    }
+                    if ui.small_button("circularize").clicked() {
+                        act.multi_edit = Some((ids.clone(), Edit::Circularize));
+                    }
+                    egui::ComboBox::from_id_salt("multi_kind")
+                        .selected_text("set type…")
+                        .show_ui(ui, |ui| {
+                            for (k, name) in [
+                                (BodyKind::Planet, "planet"),
+                                (BodyKind::DwarfPlanet, "dwarf planet"),
+                                (BodyKind::BrownDwarf, "brown dwarf"),
+                                (BodyKind::Star, "star"),
+                                (BodyKind::WhiteDwarf, "white dwarf"),
+                                (BodyKind::NeutronStar, "neutron star"),
+                                (BodyKind::BlackHole, "black hole"),
+                            ] {
+                                if ui.selectable_label(false, name).clicked() {
+                                    act.multi_edit = Some((ids.clone(), Edit::SetKind(k)));
+                                }
+                            }
+                        });
+                    if ui.small_button("delete").clicked() {
+                        act.multi_edit = Some((ids.clone(), Edit::Delete));
+                        st.multi.clear();
+                    }
+                    if ui.small_button("clear ticks").clicked() {
+                        st.multi.clear();
+                    }
+                }
+            });
             let headers = [
                 ("name", SortKey::Id),
                 ("class", SortKey::Id),
@@ -2052,15 +2400,12 @@ fn list_window(
                 .max_height(420.0)
                 .show(ui, |ui| {
                     egui::Grid::new("list_grid")
-                        .num_columns(7)
+                        .num_columns(8)
                         .spacing([12.0, 3.0])
                         .striped(true)
                         .show(ui, |ui| {
+                            ui.label("");
                             for (k, (name, key)) in headers.iter().enumerate() {
-                                // The `class` header has `k == 1`; it never
-                                // shows an arrow because it's not sortable
-                                // (well — it *is*, see the note above, but
-                                // the arrow is suppressed to hide that fact).
                                 let active = st.sort == *key && k != 1;
                                 let arrow = if active {
                                     if st.sort_desc {
@@ -2078,10 +2423,6 @@ fn list_window(
                                     } else {
                                         Color32::WHITE
                                     });
-                                // Headers are made clickable via `Sense::click()`
-                                // on a plain label. This is more flexible than
-                                // `selectable_label` because we want to show
-                                // the sort arrow only on the active column.
                                 if k == 1 {
                                     ui.label(txt);
                                 } else if ui
@@ -2092,20 +2433,22 @@ fn list_window(
                                         st.sort_desc = !st.sort_desc;
                                     } else {
                                         st.sort = *key;
-                                        // New column starts descending, except
-                                        // Id where ascending (smallest id
-                                        // first) is the natural order.
                                         st.sort_desc = *key != SortKey::Id;
                                     }
-                                    // Force a refresh next frame.
                                     st.list_time = Instant::now() - Duration::from_secs(5);
                                 }
                             }
                             ui.end_row();
                             for row in &st.list_rows {
+                                let mut ticked = st.multi.contains(&row.id);
+                                if ui.checkbox(&mut ticked, "").changed() {
+                                    if ticked {
+                                        st.multi.insert(row.id);
+                                    } else {
+                                        st.multi.remove(&row.id);
+                                    }
+                                }
                                 let selected = view.selected == Some(row.id);
-                                // `selectable_label` shows a highlight if
-                                // selected; clicking emits an action.
                                 if ui.selectable_label(selected, &row.label).clicked() {
                                     act.select = Some(Some(row.id));
                                 }
@@ -2121,14 +2464,14 @@ fn list_window(
                 });
             ui.label(
                 RichText::new(
-                    "Distance, speed and period are relative to the body's parent, \
+                    "Click a name to select it. Tick boxes to edit many bodies at once. \
+                     Distance, speed and period are relative to the body's parent, \
                      or to the primary star for bodies without one (belts, debris).",
                 )
                 .small()
                 .color(theme().colors.dim()),
             );
         });
-    // Persist the open/close state through the window's X button.
     st.show_list = open;
 }
 
@@ -2136,110 +2479,6 @@ fn list_window(
 // Help
 // ---------------------------------------------------------------------------
 
-/// Static keyboard/mouse reference. The key labels here are *duplicated* in
-/// `main.rs`'s `WindowEvent::KeyboardInput` handler — if you add a shortcut,
-/// add it in both places. (There's no test that catches a mismatch.)
-/// The preset library: a grid of cards. A click asks `main` to load it.
-fn preset_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
-    egui::Window::new("Preset library")
-        .open(&mut st.preset_library_open)
-        .default_width(600.0)
-        .default_pos([280.0, 80.0])
-        .resizable(true)
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("preset_cards")
-                    .num_columns(2)
-                    .spacing([10.0, 10.0])
-                    .show(ui, |ui| {
-                        let lib = ph::load_presets();
-                        for (idx, (slug, preset)) in lib.iter().enumerate() {
-                            let selected = st.loaded_preset_slug.as_deref() == Some(slug.as_str());
-                            let fill = if selected {
-                                theme().colors.accent().gamma_multiply(0.15)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            let resp = ui.add(
-                                egui::Button::new(preset_card_text(preset))
-                                    .fill(fill)
-                                    .min_size(egui::vec2(270.0, 110.0)),
-                            );
-                            if resp.clicked() {
-                                if slug == "solar_system" {
-                                    act.preset = Some(crate::Preset::SolarSystem);
-                                } else {
-                                    act.load_preset = Some(slug.clone());
-                                }
-                            }
-                            if idx % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            });
-            ui.label(
-                RichText::new(
-                    "Presets overwrite the current system. Press R to reload the \
-                     same preset with fresh phases.",
-                )
-                .small()
-                .color(theme().colors.dim()),
-            );
-        });
-}
-
-/// Four lines of text for one preset card.
-fn preset_card_text(preset: &ph::SystemPreset) -> String {
-    let m_sun = preset.star.mass_earth / ph::M_SUN_ME;
-    let star_desc = match preset.star.kind.as_deref() {
-        Some("white_dwarf") => format!("white dwarf ({:.2} M☉)", m_sun),
-        Some("neutron_star") => format!("neutron star ({:.2} M☉)", m_sun),
-        Some("black_hole") => format!("black hole ({:.2} M☉)", m_sun),
-        Some("brown_dwarf") => format!("brown dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 0.5 => format!("M dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 0.8 => format!("K dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 1.2 => format!("G dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 1.5 => format!("F dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 2.5 => format!("A dwarf ({:.2} M☉)", m_sun),
-        _ if m_sun < 8.0 => format!("B dwarf ({:.2} M☉)", m_sun),
-        _ => format!("O supergiant ({:.2} M☉)", m_sun),
-    };
-    let n_comp = preset.companions.len();
-    let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
-    let mut inner = format!(
-        "{} planet{}",
-        preset.planets.len(),
-        if preset.planets.len() == 1 { "" } else { "s" },
-    );
-    if n_moons > 0 {
-        inner += &format!(", {} moon{}", n_moons, if n_moons == 1 { "" } else { "s" });
-    }
-    let multi = if n_comp > 0 {
-        format!(
-            "  +{} companion{}",
-            n_comp,
-            if n_comp == 1 { "" } else { "s" }
-        )
-    } else {
-        String::new()
-    };
-    let belt_line = if preset.belts.is_some() {
-        "with belts"
-    } else {
-        "no belts"
-    };
-    format!(
-        "{}\n{}{}\n{}  •  {}\n{:.2} Gyr  •  [Fe/H] {:+.2}",
-        preset.name,
-        star_desc,
-        multi,
-        inner,
-        belt_line,
-        preset.star.age_gyr,
-        preset.star.metallicity,
-    )
-}
 fn help_window(ctx: &egui::Context, st: &mut UiState) {
     let mut open = st.show_help;
     egui::Window::new("Help")
@@ -2263,10 +2502,10 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                     ("L", "labels"),
                     ("U", "physical / simulation units"),
                     ("B", "body list"),
+                    ("G", "diagnostics"),
+                    ("V", "vsync"),
                     ("`", "show / hide the control panel"),
                     ("Delete", "delete the selected body"),
-                    ("I", "spawn an interstellar object inbound"),
-                    ("T", "spawn a gas-giant rogue planet inbound"),
                     ("Esc", "deselect"),
                     ("? or H", "this help"),
                 ] {
@@ -2294,219 +2533,198 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-/// Allocate a plot rectangle of the full available width and a given height,
-/// returning the rect and a painter scoped to it. The painter's clip rect is
-/// set to the rect so drawing can't bleed into neighboring widgets.
-fn plot_rect(ui: &mut egui::Ui, height: f32) -> (egui::Rect, egui::Painter) {
-    let (rect, _) = ui.allocate_exact_size(
+/// Allocate a plot rectangle of the full available width. The painter is
+/// clipped to the rectangle so drawing cannot spill into other widgets.
+fn plot_rect(ui: &mut egui::Ui, height: f32) -> (egui::Rect, egui::Painter, egui::Response) {
+    let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    // Background fill so the plot is distinguishable from the panel fill.
     painter.rect_filled(rect, egui::Rounding::same(2.0), Color32::from_gray(20));
-    (rect, painter)
+    (rect, painter, resp)
 }
 
-/// L-shaped axes: left edge and bottom edge of the plot rect.
 fn draw_axes(rect: egui::Rect, painter: &egui::Painter) {
     let s = Stroke::new(1.0_f32, Color32::from_gray(60));
     painter.line_segment([rect.left_bottom(), rect.right_bottom()], s);
     painter.line_segment([rect.left_bottom(), rect.left_top()], s);
 }
 
-/// Y-range for the N(t) plot. Pads around `[min_n, max_n]` so a flat line
-/// isn't glued to the top of the plot. Public for testing.
-fn n_plot_range(samples: &std::collections::VecDeque<DiagSample>) -> (f64, f64) {
-    let min_n = samples.iter().map(|s| s.n).min().unwrap_or(1);
-    let max_n = samples.iter().map(|s| s.n).max().unwrap_or(1);
-    let span = (max_n as f64) - (min_n as f64);
-    let pad = (span * 0.1).max(1.0);
-    let y0 = (min_n as f64 - pad).max(0.0);
-    let y1 = (max_n as f64 + pad).max(y0 + 1.0);
-    (y0, y1)
+/// Y range with 10 % padding. A flat series gets a range of at least 1.
+fn padded_range(lo: f64, hi: f64) -> (f64, f64) {
+    let pad = (hi - lo) * 0.1;
+    let pad = if pad > 0.0 {
+        pad
+    } else {
+        (hi.abs() * 0.05).max(1.0)
+    };
+    (lo - pad, hi + pad)
 }
 
-/// N(t) plot: body count over time. The y-range is padded to at least 1
-/// so a plot of a constant-count system doesn't divide by zero.
-fn plot_n(ui: &mut egui::Ui, diag: &DiagHistory) {
-    let (rect, painter) = plot_rect(ui, 100.0);
+fn fmt_int(v: f64) -> String {
+    format!("{}", v.round() as i64)
+}
+
+fn fmt_pct_value(v: f64) -> String {
+    fmt_pct(Some(v))
+}
+
+/// Look of one time-series plot.
+struct PlotSpec<'a> {
+    title: &'a str,
+    empty: &'a str,
+    color: Color32,
+    /// Use the warning colour when the latest value is larger than this.
+    warn_at: f64,
+    /// Centre the y axis on zero (for drift values).
+    symmetric: bool,
+    fmt: fn(f64) -> String,
+}
+
+/// Draw one line plot of `get` over the sample history. Hover shows the
+/// time and value of the nearest sample.
+fn plot_series(
+    ui: &mut egui::Ui,
+    diag: &DiagHistory,
+    si: bool,
+    spec: &PlotSpec,
+    get: impl Fn(&DiagSample) -> Option<f64>,
+) {
+    let (rect, painter, resp) = plot_rect(ui, 80.0);
     draw_axes(rect, &painter);
 
-    if diag.samples.is_empty() {
+    let vals: Vec<Option<f64>> = diag
+        .samples
+        .iter()
+        .map(|s| get(s).filter(|v| v.is_finite()))
+        .collect();
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for v in vals.iter().flatten() {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    if !lo.is_finite() {
+        let msg = if diag.samples.is_empty() {
+            "collecting…"
+        } else {
+            spec.empty
+        };
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "collecting…",
+            msg,
             FontId::monospace(10.0),
             theme().colors.dim(),
         );
         return;
     }
 
-    let (y0, y1) = n_plot_range(&diag.samples);
-    let min_n = diag.samples.iter().map(|s| s.n).min().unwrap_or(1);
-    let max_n = diag.samples.iter().map(|s| s.n).max().unwrap_or(1);
-
-    let t0 = diag.samples.front().unwrap().t;
-    let t1 = diag.samples.back().unwrap().t;
+    let (y0, y1) = if spec.symmetric {
+        let m = lo.abs().max(hi.abs()).max(1e-12) * 1.1;
+        (-m, m)
+    } else {
+        padded_range(lo, hi)
+    };
+    let t0 = diag.samples.front().map(|s| s.t).unwrap_or(0.0);
+    let t1 = diag.samples.back().map(|s| s.t).unwrap_or(0.0);
     let t_span = (t1 - t0).max(1e-9);
-
-    let map = |t: f64, n: usize| -> egui::Pos2 {
+    let map = |t: f64, v: f64| -> egui::Pos2 {
         let fx = ((t - t0) / t_span).clamp(0.0, 1.0) as f32;
-        let fy = ((n as f64 - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32;
+        let fy = ((v - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32;
         egui::pos2(
             rect.left() + fx * rect.width(),
             rect.bottom() - fy * rect.height(),
         )
     };
 
-    // Connect consecutive samples with line segments. `prev` is reset to
-    // `None` at any gap (there are none in this plot, but the pattern
-    // matches `plot_drift`, which has gaps).
-    let mut prev: Option<egui::Pos2> = None;
-    for s in &diag.samples {
-        let p = map(s.t, s.n);
-        if let Some(q) = prev {
-            painter.line_segment([q, p], Stroke::new(1.0_f32, theme().colors.good()));
-        }
-        prev = Some(p);
-    }
-
-    painter.text(
-        rect.left_top() + egui::vec2(4.0, 2.0),
-        Align2::LEFT_TOP,
-        format!("N(t)  {}..{}", min_n, max_n),
-        FontId::monospace(10.0),
-        theme().colors.dim(),
-    );
-    painter.text(
-        rect.left_bottom() + egui::vec2(2.0, -2.0),
-        Align2::LEFT_BOTTOM,
-        fmt_time(t0, true),
-        FontId::monospace(9.0),
-        theme().colors.dim(),
-    );
-    painter.text(
-        rect.right_bottom() + egui::vec2(-2.0, -2.0),
-        Align2::RIGHT_BOTTOM,
-        fmt_time(t1, true),
-        FontId::monospace(9.0),
-        theme().colors.dim(),
-    );
-}
-
-/// Energy drift plot: drift over time, centered on zero. The y-axis is
-/// symmetric so a +2 % excursion is visually the same size as a −2 % one.
-fn plot_drift(ui: &mut egui::Ui, diag: &DiagHistory) {
-    let (rect, painter) = plot_rect(ui, 100.0);
-    draw_axes(rect, &painter);
-
-    let has_data = diag.samples.iter().any(|s| s.drift.is_some());
-    if !has_data {
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "collecting…",
-            FontId::monospace(10.0),
-            theme().colors.dim(),
+    if spec.symmetric {
+        let zy = rect.center().y;
+        painter.line_segment(
+            [egui::pos2(rect.left(), zy), egui::pos2(rect.right(), zy)],
+            Stroke::new(1.0_f32, Color32::from_gray(50)),
         );
-        return;
     }
 
-    // Symmetric y-range from the largest |drift|. The `.max(0.001)` floor
-    // prevents division by zero on a perfectly-conserving sim, and keeps
-    // the axis from being "0 to 0" visually.
-    let max_abs = diag
-        .samples
-        .iter()
-        .filter_map(|s| s.drift.map(|d| d.abs()))
-        .fold(0.0_f64, f64::max)
-        .max(0.001);
-
-    let t0 = diag.samples.front().unwrap().t;
-    let t1 = diag.samples.back().unwrap().t;
-    let t_span = (t1 - t0).max(1e-9);
-
-    let map = |t: f64, d: f64| -> egui::Pos2 {
-        let fx = ((t - t0) / t_span).clamp(0.0, 1.0) as f32;
-        let fy = ((d + max_abs) / (2.0 * max_abs)).clamp(0.0, 1.0) as f32;
-        egui::pos2(
-            rect.left() + fx * rect.width(),
-            rect.bottom() - fy * rect.height(),
-        )
-    };
-
-    // Zero line: the "perfect conservation" reference.
-    let zero_y = rect.center().y;
-    painter.line_segment(
-        [
-            egui::pos2(rect.left(), zero_y),
-            egui::pos2(rect.right(), zero_y),
-        ],
-        Stroke::new(1.0_f32, Color32::from_gray(50)),
-    );
-
-    // Line color depends on the *current* drift: green-ish (theme().colors.accent()) for
-    // good runs, orange for > 1 % drift. This makes the whole history
-    // change color when the current state is bad, drawing the eye to it.
-    let current = diag
-        .samples
-        .iter()
-        .rev()
-        .find_map(|s| s.drift)
-        .unwrap_or(0.0);
-    let line_col = if current.abs() > 1.0 {
+    let current = vals.iter().rev().flatten().next().copied().unwrap_or(0.0);
+    let line_col = if current.abs() > spec.warn_at {
         theme().colors.warn()
     } else {
-        theme().colors.accent()
+        spec.color
     };
 
-    // Gaps in the data (drift is None above ENERGY_MAX_N) break the line,
-    // so a system that grew past the threshold doesn't draw a misleading
-    // line across the gap.
     let mut prev: Option<egui::Pos2> = None;
-    for s in &diag.samples {
-        match s.drift {
-            Some(d) => {
-                let p = map(s.t, d);
+    for (s, v) in diag.samples.iter().zip(vals.iter()) {
+        match v {
+            Some(v) => {
+                let p = map(s.t, *v);
                 if let Some(q) = prev {
                     painter.line_segment([q, p], Stroke::new(1.0_f32, line_col));
                 }
                 prev = Some(p);
             }
+            // A gap (value not available) breaks the line.
             None => prev = None,
         }
+    }
+    if let Some(p) = prev {
+        painter.circle_filled(p, 2.0, line_col);
     }
 
     painter.text(
         rect.left_top() + egui::vec2(4.0, 2.0),
         Align2::LEFT_TOP,
-        format!("E drift ±{:.3}%", max_abs),
+        format!("{}  {}", spec.title, (spec.fmt)(current)),
         FontId::monospace(10.0),
         theme().colors.dim(),
     );
     painter.text(
         rect.left_bottom() + egui::vec2(2.0, -2.0),
         Align2::LEFT_BOTTOM,
-        fmt_time(t0, true),
+        fmt_time(t0, si),
         FontId::monospace(9.0),
         theme().colors.dim(),
     );
     painter.text(
         rect.right_bottom() + egui::vec2(-2.0, -2.0),
         Align2::RIGHT_BOTTOM,
-        fmt_time(t1, true),
+        fmt_time(t1, si),
         FontId::monospace(9.0),
         theme().colors.dim(),
     );
+
+    if let Some(pos) = resp.hover_pos() {
+        let fx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+        let th = t0 + fx * t_span;
+        let nearest = diag.samples.iter().enumerate().min_by(|p, q| {
+            (p.1.t - th)
+                .abs()
+                .partial_cmp(&(q.1.t - th).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some((k, s)) = nearest {
+            if let Some(v) = vals[k] {
+                let p = map(s.t, v);
+                painter.line_segment(
+                    [egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())],
+                    Stroke::new(1.0_f32, Color32::from_gray(90)),
+                );
+                painter.circle_filled(p, 3.0, spec.color);
+                painter.text(
+                    rect.right_top() + egui::vec2(-4.0, 2.0),
+                    Align2::RIGHT_TOP,
+                    format!("{}  {}", fmt_time(s.t, si), (spec.fmt)(v)),
+                    FontId::monospace(10.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+    }
 }
 
-/// Eccentricity histogram: bin counts of the current eccentricity
-/// distribution of bound planets. Only updated on `maybe_sample`, so
-/// this is a "current snapshot" not a "history" — it doesn't scroll.
 fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
-    let (rect, painter) = plot_rect(ui, 100.0);
+    let (rect, painter, resp) = plot_rect(ui, 80.0);
     draw_axes(rect, &painter);
 
     if diag.eccs.is_empty() {
@@ -2520,8 +2738,6 @@ fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
         return;
     }
 
-    // Bar chart: 20 bins of width 0.05 from e=0 to e=1. The peak count
-    // determines the y-scale so a single outlier doesn't flatten the bars.
     let max_count = diag.ecc_bins.iter().copied().max().unwrap_or(1).max(1);
     let n = diag.ecc_bin_count;
     let w = rect.width() / n as f32;
@@ -2530,12 +2746,13 @@ fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
             continue;
         }
         let x0 = rect.left() + k as f32 * w;
-        // 0.9 leaves a 10 % gap between bars so the bins are visually distinct.
         let x1 = x0 + w * 0.9;
         let h = (cnt as f32 / max_count as f32) * rect.height();
-        let y0 = rect.bottom() - h;
         painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, rect.bottom())),
+            egui::Rect::from_min_max(
+                egui::pos2(x0, rect.bottom() - h),
+                egui::pos2(x1, rect.bottom()),
+            ),
             egui::Rounding::ZERO,
             theme().colors.accent(),
         );
@@ -2562,36 +2779,180 @@ fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
         FontId::monospace(9.0),
         theme().colors.dim(),
     );
+    if let Some(pos) = resp.hover_pos() {
+        let k = (((pos.x - rect.left()) / w) as usize).min(n - 1);
+        let lo = k as f64 * diag.ecc_bin_width;
+        painter.text(
+            rect.right_top() + egui::vec2(-4.0, 2.0),
+            Align2::RIGHT_TOP,
+            format!(
+                "e {:.2}–{:.2}  {} planets",
+                lo,
+                lo + diag.ecc_bin_width,
+                diag.ecc_bins[k]
+            ),
+            FontId::monospace(10.0),
+            Color32::WHITE,
+        );
+    }
 }
 
-/// The diagnostics window: three stacked plots and a clear button.
 fn diag_window(
     ctx: &egui::Context,
     st: &mut UiState,
-    _view: &ViewInfo,
-    _b: &Bodies,
+    view: &ViewInfo,
+    b: &Bodies,
     _act: &mut Actions,
 ) {
+    let si = st.units_si;
     let mut open = st.diag.visible;
     egui::Window::new("Diagnostics")
         .open(&mut open)
         .default_pos([640.0, 60.0])
-        .default_width(360.0)
+        .default_width(380.0)
         .resizable(true)
         .show(ctx, |ui| {
-            if ui.button("clear").clicked() {
-                // Clear both the history and the eccentricity snapshot,
-                // so the next sample starts from an empty plot instead of
-                // a discontinuous jump.
-                st.diag.samples.clear();
-                st.diag.eccs.clear();
-                st.diag.ecc_bins.fill(0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("clear")
+                    .on_hover_text("forget the history and the angular-momentum baseline")
+                    .clicked()
+                {
+                    st.diag.clear();
+                }
+                if ui
+                    .button("copy CSV")
+                    .on_hover_text("copy the sample history to the clipboard")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(st.diag.to_csv());
+                }
+                ui.label("history");
+                let mut maxs = st.diag.max_samples;
+                egui::ComboBox::from_id_salt("diag_history")
+                    .selected_text(format!("{} min", maxs / 60))
+                    .show_ui(ui, |ui| {
+                        for (v, name) in [(300usize, "5 min"), (900, "15 min"), (1800, "30 min")] {
+                            ui.selectable_value(&mut maxs, v, name);
+                        }
+                    });
+                st.diag.max_samples = maxs;
+            });
+
+            let last = st.diag.samples.back();
+            egui::Grid::new("diag_summary")
+                .num_columns(2)
+                .spacing([14.0, 2.0])
+                .show(ui, |ui| {
+                    kv(ui, "bodies", format!("{}", b.len()));
+                    kv(ui, "energy drift", fmt_pct(last.and_then(|s| s.drift)));
+                    kv(
+                        ui,
+                        "energy dissipated",
+                        fmt_pct(last.and_then(|s| s.dissipated)),
+                    );
+                    kv(
+                        ui,
+                        "ang. momentum change",
+                        fmt_pct(last.and_then(|s| s.l_drift)),
+                    );
+                    kv(ui, "steps / s", format!("{:.0}", view.steps_per_sec));
+                    kv(ui, "fine steps", format!("{}", b.stats.last_nsub));
+                    kv(ui, "events logged", format!("{}", b.events.len()));
+                });
+            if b.len() > ph::ENERGY_MAX_N {
+                ui.label(
+                    RichText::new(format!(
+                        "Energy values are off above {} bodies (too slow to compute).",
+                        ph::ENERGY_MAX_N
+                    ))
+                    .small()
+                    .color(theme().colors.warn()),
+                );
             }
-            plot_n(ui, &st.diag);
-            ui.add_space(4.0);
-            plot_drift(ui, &st.diag);
-            ui.add_space(4.0);
-            plot_ecc(ui, &st.diag);
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .max_height((ctx.screen_rect().height() - 220.0).max(160.0))
+                .show(ui, |ui| {
+                    let d = &st.diag;
+                    plot_series(
+                        ui,
+                        d,
+                        si,
+                        &PlotSpec {
+                            title: "bodies",
+                            empty: "no data",
+                            color: theme().colors.good(),
+                            warn_at: f64::INFINITY,
+                            symmetric: false,
+                            fmt: fmt_int,
+                        },
+                        |s| Some(s.n as f64),
+                    );
+                    ui.add_space(4.0);
+                    plot_series(
+                        ui,
+                        d,
+                        si,
+                        &PlotSpec {
+                            title: "energy drift",
+                            empty: "n/a (system too large)",
+                            color: theme().colors.accent(),
+                            warn_at: 1.0,
+                            symmetric: true,
+                            fmt: fmt_pct_value,
+                        },
+                        |s| s.drift,
+                    );
+                    ui.add_space(4.0);
+                    plot_series(
+                        ui,
+                        d,
+                        si,
+                        &PlotSpec {
+                            title: "energy dissipated",
+                            empty: "n/a (system too large)",
+                            color: Color32::from_rgb(255, 170, 90),
+                            warn_at: f64::INFINITY,
+                            symmetric: false,
+                            fmt: fmt_pct_value,
+                        },
+                        |s| s.dissipated,
+                    );
+                    ui.add_space(4.0);
+                    plot_series(
+                        ui,
+                        d,
+                        si,
+                        &PlotSpec {
+                            title: "angular momentum change",
+                            empty: "no baseline",
+                            color: Color32::from_rgb(220, 130, 255),
+                            warn_at: 1.0,
+                            symmetric: true,
+                            fmt: fmt_pct_value,
+                        },
+                        |s| s.l_drift,
+                    );
+                    ui.add_space(4.0);
+                    plot_series(
+                        ui,
+                        d,
+                        si,
+                        &PlotSpec {
+                            title: "fine steps (close encounters)",
+                            empty: "no data",
+                            color: Color32::from_rgb(150, 220, 255),
+                            warn_at: f64::INFINITY,
+                            symmetric: false,
+                            fmt: fmt_int,
+                        },
+                        |s| Some(s.nsub as f64),
+                    );
+                    ui.add_space(4.0);
+                    plot_ecc(ui, d);
+                });
         });
     st.diag.visible = open;
 }
@@ -2599,27 +2960,31 @@ fn diag_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
 
-    fn sample(t: f64, n: usize) -> DiagSample {
-        DiagSample { t, n, drift: None }
+    #[test]
+    fn padded_range_pads_both_sides() {
+        let (y0, y1) = padded_range(100.0, 150.0);
+        assert!(y0 < 100.0, "y0={y0} should pad below min 100");
+        assert!(y1 > 150.0, "y1={y1} should pad above max 150");
+        let (y0, y1) = padded_range(200.0, 200.0);
+        assert!(y1 - y0 >= 1.0, "flat range too small: {y0}..{y1}");
     }
 
     #[test]
-    fn plot_n_range_tracks_min_max() {
-        let mut samples = VecDeque::new();
-        samples.push_back(sample(0.0, 100));
-        samples.push_back(sample(1.0, 150));
-        samples.push_back(sample(2.0, 120));
-        let (y0, y1) = n_plot_range(&samples);
-        assert!(y0 < 100.0, "y0={y0} should pad below min 100");
-        assert!(y1 > 150.0, "y1={y1} should pad above max 150");
-        assert!(y0 >= 0.0);
-        // Flat signal: still non-degenerate.
-        let mut flat = VecDeque::new();
-        flat.push_back(sample(0.0, 200));
-        flat.push_back(sample(1.0, 200));
-        let (y0, y1) = n_plot_range(&flat);
-        assert!(y1 - y0 >= 1.0, "flat range too small: {y0}..{y1}");
+    fn random_seed_fits_the_seed_space() {
+        let s = random_seed();
+        assert!(s < ph::SEED_SPACE);
+        assert_eq!(ph::seed_to_base62(s).len(), ph::SEED_LEN);
+    }
+
+    #[test]
+    fn event_bits_are_distinct() {
+        let mut mask = 0u16;
+        for (k, _) in EVENT_KINDS {
+            let bit = event_bit(k);
+            assert_eq!(mask & bit, 0);
+            mask |= bit;
+        }
+        assert_eq!(mask, 0x1FF);
     }
 }

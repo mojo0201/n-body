@@ -323,6 +323,33 @@ pub(super) fn find_collisions_hot(
     pairs
 }
 
+/// Hot bodies against cold ones. `find_collisions_hot` only pairs hot with
+/// hot, but every body drifts each sub-tick, so hot-vs-cold hits must be
+/// tested too.
+fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
+    let t_now = b.time;
+    let mut in_hot = vec![false; b.len()];
+    for &i in hot {
+        in_hot[i] = true;
+    }
+    let mut out = Vec::new();
+    for &i in hot {
+        if b.dead[i] || t_now < b.imm[i] {
+            continue;
+        }
+        let ri = b.contact_r(i);
+        for j in 0..b.len() {
+            if in_hot[j] || b.dead[j] || t_now < b.imm[j] {
+                continue;
+            }
+            if pair_hit_rr(b, i, j, ri + b.contact_r(j), true) {
+                out.push((i.min(j), i.max(j)));
+            }
+        }
+    }
+    out
+}
+
 /// One detection pass and one resolution pass per call.
 ///
 /// Every body involved in a resolved pair becomes immune for
@@ -338,7 +365,17 @@ pub(super) fn collision_pass(b: &mut Bodies, dt: f64, hot: Option<&[usize]>) {
     }
     let mut spawns: Vec<Spawn> = Vec::new();
     let pairs = match hot {
-        Some(h) => find_collisions_hot(b, h, true, dt),
+        Some(h) => {
+            let mut p = find_collisions_hot(b, h, true, dt);
+            // Brute force is fine while hot × n stays small; above that
+            // it falls back to hot-vs-hot only.
+            if h.len() * b.len() <= 2_000_000 {
+                p.extend(hot_vs_cold(b, h));
+                p.sort_unstable();
+                p.dedup();
+            }
+            p
+        }
         None => find_collisions(b, true, dt),
     };
     for (i, j) in pairs {

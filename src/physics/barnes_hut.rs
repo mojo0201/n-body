@@ -123,6 +123,11 @@ impl Tree {
         while sp > 0 {
             sp -= 1;
             let n = &self.nodes[stack[sp] as usize];
+            // Empty quadrants carry zero mass: skip them so they neither
+            // cost traversal nor feed (m_i + 0)/d³ into the timestep limit.
+            if n.m == 0.0 {
+                continue;
+            }
 
             // Leaves point to a real body position; internal nodes use the
             // aggregated center of mass.

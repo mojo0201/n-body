@@ -30,7 +30,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
 
 /// Fields the dust centre uniform can hold. Must match `DustFields` in the WGSL.
-pub const MAX_DUST_FIELDS: usize = 128;
+pub const MAX_DUST_FIELDS: usize = 256;
 /// Cap on grains drawn per frame, summed over fields (subsampled above it).
 const MAX_DUST_POINTS: usize = 2_000_000;
 /// A field whose extent is smaller than this on screen is not drawn.
@@ -507,11 +507,6 @@ impl Renderer {
         };
         let camera_bg = mk_bg("camera-bg", &camera_buf);
         let orbit_camera_bg = mk_bg("orbit-camera-bg", &orbit_camera_buf);
-        let _pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline-layout"),
-            bind_group_layouts: &[&camera_layout],
-            push_constant_ranges: &[],
-        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
@@ -957,17 +952,17 @@ impl Renderer {
         });
         // Glow is one instance per luminous body, so a few hundred slots
         // is plenty at every realistic n. Grown on demand if exceeded.
-        let glow_capacity = 256;
+        let glow_capacity: u64 = 256 * std::mem::size_of::<GlowInstance>() as u64;
         let glow_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("glow"),
-            size: glow_capacity * std::mem::size_of::<GlowInstance>() as u64,
+            size: glow_capacity,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let blackhole_capacity = 64;
+        let blackhole_capacity: u64 = 64 * std::mem::size_of::<BlackHoleInstance>() as u64;
         let blackhole_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blackhole"),
-            size: blackhole_capacity * std::mem::size_of::<BlackHoleInstance>() as u64,
+            size: blackhole_capacity,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

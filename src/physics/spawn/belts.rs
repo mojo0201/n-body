@@ -26,9 +26,11 @@ pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-4;
 /// from producing body-scale collisions that dominate the dynamics.
 pub(in crate::physics) const BELT_MAX_TRACER_MASS: f64 = 0.1;
 
-/// Hilda mass as a fraction of `spec.total_mass`, added on top of the
-/// main belt.
-pub(in crate::physics) const HILDA_MASS_FRAC: f64 = 0.05;
+/// Hilda mass as a fraction of `spec.total_mass`. Real Hildas total
+/// ~10⁻⁶ M⊕ — ~0.04% of the asteroid belt — so 0.05% is the right
+/// order of magnitude and leaves room for the dominant body to be a
+/// realistic ~150 km object.
+pub(in crate::physics) const HILDA_MASS_FRAC: f64 = 0.0005;
 
 /// Intrinsic probability that a star of mass `m_sun` hosts a leftover
 /// planetesimal belt. This is an occurrence rate, not a detection rate:

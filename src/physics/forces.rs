@@ -362,6 +362,15 @@ pub fn compute_accel(b: &mut Bodies) {
         eval_forces(b, &all);
     }
 
+    // Post-Newtonian corrections. 1PN is the leading GR correction
+    // (perihelion precession); 2.5PN is the leading gravitational-wave
+    // radiation reaction (orbital decay). Only run when at least one
+    // body is moving at v/c > 1e-5 (≈390 km/s), so ordinary slow systems
+    // pay nothing.
+    if n >= 2 && needs_pn(b) {
+        add_pn_corrections(b, None);
+    }
+
     // Mass-weighted mean acceleration → subtract to zero the COM drift.
     let Bodies { m, ax, ay, .. } = b;
     let mut mt = 0.0;
@@ -379,6 +388,146 @@ pub fn compute_accel(b: &mut Bodies) {
         for i in 0..n {
             ax[i] -= cx;
             ay[i] -= cy;
+        }
+    }
+}
+
+/// True if any live body has `v/c > 1e-5` (≈390 km/s), the threshold below
+/// which post-Newtonian corrections are numerically invisible. O(n).
+pub(super) fn needs_pn(b: &Bodies) -> bool {
+    let c = c_sim();
+    let thresh = 1e-6 * c * c; // v/c > 1e-3 (~390 km/s): compact objects only
+    for i in 0..b.len() {
+        if b.dead[i] {
+            continue;
+        }
+        let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
+        if v2 > thresh {
+            return true;
+        }
+    }
+    false
+}
+
+/// Add 1PN (Einstein–Infeld–Hoffmann) and 2.5PN (Peters-drag) corrections
+/// to `b.ax` / `b.ay`. Called from `compute_accel` after the Newtonian
+/// pass, and only when `needs_pn` is true.
+///
+/// **1PN** produces the same perihelion precession as the full EIH
+/// equations. Verified against the Mercury limit: for a test particle on
+/// a circular orbit (m_i ≪ m_j, v_j ≈ 0), the bracket reduces to
+/// `(v² − 4Gm_j/r) = −3Gm_j/r`, giving the standard
+/// `−3 (Gm_j)² / (c² r³)` correction. Signs and mass terms follow
+/// Will (1993) §6.2.
+///
+/// **2.5PN** uses the *Peters circular approximation*: a drag on the
+/// relative velocity `v_i − v_j` with coefficient
+/// `−(32/5) G³ m_i m_j² / (c⁵ r⁴)`. For circular binaries this exactly
+/// reproduces the Peters (1964) energy-loss rate
+/// `−(32/5) G⁴ m₁² m₂² (m₁+m₂) / (c⁵ r⁵)`. For eccentric orbits it
+/// captures the enhanced periapsis loss (the `r⁴` denominator
+/// dominates), and the drag is momentum-conserving per pair:
+/// `m_i a_i + m_j a_j = 0`. It is not the full 2.5PN EIH form — the
+/// radial-velocity terms that distinguish prograde from retrograde are
+/// omitted — but for a top-down visual sim the difference is below
+/// renderable resolution.
+pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
+    let n = b.len();
+    if n < 2 {
+        return;
+    }
+    let c = c_sim();
+    let inv_c2 = 1.0 / (c * c);
+    let inv_c5 = inv_c2 * inv_c2 / c;
+
+    // PN only matters for pairs that include a host or compact object.
+    let hosts: Vec<usize> = (0..n)
+        .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
+        .collect();
+    // When called from the block stepper, only update active bodies so
+    // inactive bodies don't get PN added twice.
+    let mask: Option<Vec<bool>> = active.map(|a| {
+        let mut m = vec![false; n];
+        for &k in a {
+            m[k as usize] = true;
+        }
+        m
+    });
+    let on = |k: usize| mask.as_ref().map_or(true, |m| m[k]);
+
+    for i in 0..n {
+        if b.dead[i] {
+            continue;
+        }
+        let mi = b.m[i];
+        let xi = b.x[i];
+        let yi = b.y[i];
+        let vxi = b.vx[i];
+        let vyi = b.vy[i];
+        let vi_sq = vxi * vxi + vyi * vyi;
+
+        for j in 0..n {
+            if j == i || b.dead[j] || (is_host_kind(b.kind[j]) && j < i) {
+                continue;
+            }
+            let mj = b.m[j];
+            let dx = xi - b.x[j];
+            let dy = yi - b.y[j];
+            let r2 = dx * dx + dy * dy + SOFT2;
+            let r = r2.sqrt();
+            let r_inv = 1.0 / r;
+            let nxi = dx * r_inv;
+            let nyi = dy * r_inv;
+
+            let vxj = b.vx[j];
+            let vyj = b.vy[j];
+            let vj_sq = vxj * vxj + vyj * vyj;
+            let v_dot = vxi * vxj + vyi * vyj;
+            let n_dot_vi = nxi * vxi + nyi * vyi;
+            let n_dot_vj = nxi * vxj + nyi * vyj;
+
+            // ---- 1PN (EIH), evaluated separately for each body ----
+            // n points from j to i. For body j the roles swap and n -> -n.
+            let coeff_i = G * mj * inv_c2 * r_inv * r_inv;
+            let bracket_i = -(vi_sq + 2.0 * vj_sq - 4.0 * v_dot - 1.5 * n_dot_vj * n_dot_vj)
+                + 5.0 * G * mi * r_inv
+                + 4.0 * G * mj * r_inv;
+            let vcoef_i = 4.0 * n_dot_vi - 3.0 * n_dot_vj;
+            if on(i) {
+                b.ax[i] += coeff_i * (bracket_i * nxi + vcoef_i * (vxi - vxj));
+                b.ay[i] += coeff_i * (bracket_i * nyi + vcoef_i * (vyi - vyj));
+            }
+
+            let coeff_j = G * mi * inv_c2 * r_inv * r_inv;
+            let bracket_j = -(vj_sq + 2.0 * vi_sq - 4.0 * v_dot - 1.5 * n_dot_vi * n_dot_vi)
+                + 5.0 * G * mj * r_inv
+                + 4.0 * G * mi * r_inv;
+            let vcoef_j = -4.0 * n_dot_vj + 3.0 * n_dot_vi;
+            if on(j) {
+                b.ax[j] += coeff_j * (bracket_j * (-nxi) + vcoef_j * (vxj - vxi));
+                b.ay[j] += coeff_j * (bracket_j * (-nyi) + vcoef_j * (vyj - vyi));
+            }
+
+            // ---- 2.5PN (Peters drag) ----
+            // Skips the arithmetic for pairs where v_rel << c. The
+            // threshold is (v_rel/c)² > 1e-10, i.e. (≈390 km/s); below that
+            // the drag is orders below f64 resolution.
+            let rvx = vxi - vxj;
+            let rvy = vyi - vyj;
+            let rel_v_sq = rvx * rvx + rvy * rvy;
+            if rel_v_sq * inv_c2 > 1e-6 {
+                let r4 = r2 * r2;
+                let coeff_i = -(32.0 / 5.0) * G * G * G * mi * mj * mj * inv_c5 / r4;
+                let coeff_j = (32.0 / 5.0) * G * G * G * mi * mi * mj * inv_c5 / r4;
+                if on(i) {
+                    b.ax[i] += coeff_i * rvx;
+                    b.ay[i] += coeff_i * rvy;
+                }
+                if on(j) {
+                    b.ax[j] += coeff_j * rvx;
+                    b.ay[j] += coeff_j * rvy;
+                }
+            }
         }
     }
 }

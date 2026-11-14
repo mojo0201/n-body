@@ -2,25 +2,27 @@
     "name": "Alpha Centauri",
     "dust_boost": 0.5,
     "star": {
-        "name": "Alpha Cen A",
-        "mass_earth": 368070.0,
-        "age_gyr": 5.3,
-        "metallicity": 0.2
+        "name": "α Centauri A",
+        "mass_earth": 359182.0,
+        "age_gyr": 6.22,
+        "metallicity": 0.26
     },
     "companions": [
         {
-            "name": "Alpha Cen B",
-            "mass_earth": 312070.0,
+            "name": "α Centauri B",
+            "mass_earth": 302714.0,
             "a_au": 23.30,
             "e": 0.5195,
-            "phase": 0.892
+            "phase": 0.892,
+            "age_gyr": 6.22
         },
         {
             "name": "Proxima Centauri",
-            "mass_earth": 40654.0,
+            "mass_earth": 40652.0,
             "a_au": 8700.0,
             "e": 0.5,
-            "phase": 0.5
+            "phase": 0.5,
+            "age_gyr": 4.85
         }
     ],
     "planets": []

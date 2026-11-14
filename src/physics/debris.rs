@@ -509,7 +509,7 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     // Deferred operations, so the borrow checker stays happy across
     // the `dust::deposit` calls below.
     let mut mass_updates: Vec<(usize, f64)> = Vec::new();
-    let mut to_deposit: Vec<(f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut to_deposit: Vec<(usize, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
     let mut to_kill: Vec<usize> = Vec::new();
 
     for i in 0..n {
@@ -560,7 +560,7 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
         let r = dx.hypot(dy).max(1e-9);
         let (ux, uy) = (dx / r, dy / r);
 
-        to_deposit.push((x, y, vx, vy, dm, ux, uy));
+        to_deposit.push((i, x, y, vx, vy, dm, ux, uy));
         let new_m = b.m[i] - dm;
         if new_m < COMET_DEAD_MASS {
             to_kill.push(i);
@@ -572,11 +572,12 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     for (i, m) in mass_updates {
         b.set_mass(i, m);
     }
-    for (x, y, vx, vy, dm, ux, uy) in to_deposit {
-        // Drop to 0.005 (about 22 m/s). The dust gently leaves the
-        // nucleus and is carried into a curved tail purely by solar
-        // radiation pressure.
-        dust::deposit(b, x, y, vx, vy, dm, Some((ux, uy)), 0.005);
+    for (i, x, y, vx, vy, dm, ux, uy) in to_deposit {
+        if b.comet_grains[i] as usize >= COMET_GRAIN_CAP {
+            continue;
+        }
+        let added = dust::deposit(b, x, y, vx, vy, dm, Some((ux, uy)), 0.005);
+        b.comet_grains[i] = b.comet_grains[i].saturating_add(added as u32);
     }
 
     let any_killed = !to_kill.is_empty();
