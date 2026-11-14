@@ -923,10 +923,6 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
                 "luhman_16",
                 include_str!("../../assets/presets/luhman_16.json"),
             ),
-            (
-                "nice_model",
-                include_str!("../../assets/presets/nice_model.json"),
-            ),
             ("pds_70", include_str!("../../assets/presets/pds_70.json")),
             (
                 "psr_b1257_plus_12",

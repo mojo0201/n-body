@@ -27,6 +27,7 @@ pub mod rng;
 pub mod spawn;
 #[cfg(test)]
 mod tests;
+pub mod tides;
 
 pub use barnes_hut::*;
 // `collisions` has no public items, so a plain `use` re-exports it to siblings.
@@ -44,6 +45,7 @@ pub use orbits::*;
 pub use presets::*;
 pub use rng::*;
 pub use spawn::*;
+pub use tides::*;
 
 use rayon::prelude::*;
 use std::collections::VecDeque;
