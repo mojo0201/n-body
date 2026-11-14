@@ -1100,9 +1100,11 @@ pub(super) fn spawn_from_preset_bodies(
         b.bulk_density[idx] = rho;
         b.r[idx] = b.radius_now(idx);
 
+        let mut group = vec![idx];
         for moon in &p.moons {
             let mangle = b.rng.next_f64() * std::f64::consts::TAU;
-            let mi = push_orbit(b, idx, moon.a_au, moon.e, moon.m_earth, mangle);
+            let mi = push_orbit_group(b, &group, moon.a_au, moon.e, moon.m_earth, mangle);
+            group.push(mi);
             b.name[mi] = Some(moon.name.clone());
             if moon.is_dwarf {
                 apply_dwarf_flag(b, mi, &mut warnings);
@@ -1218,6 +1220,32 @@ pub(super) fn push_orbit(
     let (x, y, vx, vy) = kepler_state(mu, a, e, nu, 0.0);
     let (sx, sy, svx, svy) = (b.x[sun], b.y[sun], b.vx[sun], b.vy[sun]);
     b.push(sx + x, sy + y, svx + vx, svy + vy, m_me, BodyKind::Planet)
+}
+
+/// Push a moon on an orbit about the centre of mass of `group`
+/// (a planet plus its inner moons). The orbit speed uses the total
+/// mass of the group, so outer moons see inner moons as part of the host.
+pub(super) fn push_orbit_group(
+    b: &mut Bodies,
+    group: &[usize],
+    a_au: f64,
+    e: f64,
+    m_me: f64,
+    mean_anomaly: f64,
+) -> usize {
+    let mt: f64 = group.iter().map(|&k| b.m[k]).sum();
+    let (mut cx, mut cy, mut cvx, mut cvy) = (0.0, 0.0, 0.0, 0.0);
+    for &k in group {
+        cx += b.m[k] * b.x[k];
+        cy += b.m[k] * b.y[k];
+        cvx += b.m[k] * b.vx[k];
+        cvy += b.m[k] * b.vy[k];
+    }
+    let (cx, cy, cvx, cvy) = (cx / mt, cy / mt, cvx / mt, cvy / mt);
+    let a = a_au * au_in_gm();
+    let nu = true_anomaly(solve_kepler(mean_anomaly, e), e);
+    let (x, y, vx, vy) = kepler_state(G * (mt + m_me), a, e, nu, 0.0);
+    b.push(cx + x, cy + y, cvx + vx, cvy + vy, m_me, BodyKind::Planet)
 }
 
 /// Most Solar Systems the UI slider can ask for.
