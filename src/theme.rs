@@ -28,9 +28,22 @@ pub fn embedded_fonts() -> EmbeddedFonts {
     }
 }
 
-/// Register the fonts. JetBrains Mono leads the Monospace family and Inter
-/// leads the Proportional family. egui's built-in fonts stay behind them.
-/// DejaVu Sans goes last in both families. egui tries the fonts in order
+/// Named family for Inter Medium (section headings).
+pub fn medium() -> egui::FontFamily {
+    egui::FontFamily::Name("inter-medium".into())
+}
+
+/// Named family for JetBrains Mono Bold (panel title).
+pub fn bold_mono() -> egui::FontFamily {
+    egui::FontFamily::Name("jbm-bold".into())
+}
+
+/// Register the fonts. JetBrains Mono Regular leads the Monospace family and
+/// Inter Regular leads the Proportional family. egui's built-in fonts stay
+/// behind them. Bold and Medium are separate named families (`bold_mono()`,
+/// `medium()`): egui picks a font by family, not by weight, so putting them in
+/// the default families would only make them unused fallbacks.
+/// DejaVu Sans goes last in every family. egui tries the fonts in order
 /// and uses the first one that has the glyph, so DejaVu only draws the
 /// symbols that no other font has (★ ☾ ✦ ✹ ● ⊕ ☉ ♃ ☰ ⚠ ▲ ▼ ▶ → ≥ ∞ and more).
 pub fn install_fonts(ctx: &egui::Context) {
@@ -60,17 +73,32 @@ pub fn install_fonts(ctx: &egui::Context) {
     );
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "jbm-regular".to_owned());
-        mono.insert(1, "jbm-bold".to_owned());
     }
     if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         prop.insert(0, "inter-regular".to_owned());
-        prop.insert(1, "inter-medium".to_owned());
     }
     for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&family) {
             list.push("dejavu-symbols".to_owned());
         }
     }
+    // Weighted faces as their own families, with the same symbol fallback.
+    fonts.families.insert(
+        medium(),
+        vec![
+            "inter-medium".to_owned(),
+            "inter-regular".to_owned(),
+            "dejavu-symbols".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        bold_mono(),
+        vec![
+            "jbm-bold".to_owned(),
+            "jbm-regular".to_owned(),
+            "dejavu-symbols".to_owned(),
+        ],
+    );
     ctx.set_fonts(fonts);
 }
 
@@ -113,11 +141,11 @@ pub struct ThemeFonts {
 impl ThemeColors {
     pub fn panel_fill(&self) -> Color32 {
         let c = self.panel_fill;
-        Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3])
+        Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
     }
     pub fn window_fill(&self) -> Color32 {
         let c = self.window_fill;
-        Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3])
+        Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
     }
     pub fn accent(&self) -> Color32 {
         Color32::from_rgb(self.accent[0], self.accent[1], self.accent[2])

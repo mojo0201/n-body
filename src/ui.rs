@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use egui::{Align2, Color32, FontId, RichText, Stroke};
 
 use crate::physics::{self as ph, Bodies, BodyKind, BodyOrigin, EventKind};
-use crate::theme::{install_fonts, theme};
+use crate::theme::{bold_mono, install_fonts, medium, theme};
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -118,8 +118,8 @@ pub fn fmt_speed(v: f64, si: bool) -> String {
     }
     // The conversion: 1 sim length unit = 1e6 km, 1 sim time unit ≈ 50 days.
     // So `v * LEN_KM / time_unit_s()` gives km/s. (LEN_KM = 1e6, so
-    // `v * 1e6 / 4.3e6 ≈ v * 0.23` — a body moving at `v = 1` sim unit per
-    // sim time unit is moving at ~0.2(≈390 km/s).)
+    // `v * 1e6 / 4.3e6 ≈ v * 0.23`: a body moving at `v = 1` sim length unit
+    // per sim time unit moves at about 0.23 km/s.)
     let kms = v * ph::LEN_KM / ph::time_unit_s();
     if kms >= 1000.0 {
         format!("{:.0} km/s", kms)
@@ -273,6 +273,15 @@ pub struct StatsSnapshot {
     pub oldest_star_gyr: Option<f64>,
 }
 
+/// Parent of body `i`: from the parent cache when it is valid, else `find_parent`.
+fn parent_of(b: &Bodies, i: usize) -> Option<usize> {
+    if b.parent_cache_valid && b.parent_cache.len() == b.len() {
+        b.parent_cache[i]
+    } else {
+        ph::find_parent(b, i)
+    }
+}
+
 /// One pass over `Bodies` to count everything the stats panel needs.
 ///
 /// Cost is O(n) for the class counts plus O(n²) for the moon count (each
@@ -330,7 +339,7 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
             if matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet)
                 && b.origin[i] == BodyOrigin::Spawned
             {
-                if let Some(p) = ph::find_parent(b, i) {
+                if let Some(p) = parent_of(b, i) {
                     if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet)
                         && b.origin[p] == BodyOrigin::Spawned
                     {
@@ -541,17 +550,17 @@ impl DiagHistory {
         }
 
         self.eccs.clear();
-        for i in 0..b.len() {
-            if self.eccs.len() >= 500 {
-                break;
-            }
-            if b.origin[i] != BodyOrigin::Spawned {
-                continue;
-            }
-            if !matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
-                continue;
-            }
-            if let Some(p) = ph::find_parent(b, i) {
+        // Every k-th candidate, so a large run is sampled across all systems
+        // instead of only the first 500 bodies by index.
+        let candidates: Vec<usize> = (0..b.len())
+            .filter(|&i| {
+                b.origin[i] == BodyOrigin::Spawned
+                    && matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet)
+            })
+            .collect();
+        let step = candidates.len().div_ceil(500).max(1);
+        for &i in candidates.iter().step_by(step) {
+            if let Some(p) = parent_of(b, i) {
                 let o = ph::orbit_info(b, i, p);
                 // Hyperbolic bodies (e > 1) have no bin: only bound orbits count.
                 if o.bound && o.ecc.is_finite() {
@@ -606,7 +615,6 @@ pub struct UiState {
     pub show_list: bool,
     pub show_help: bool,
     pub show_dock: bool,
-    pub show_trails: bool,
     /// System list window (beside the body list).
     pub show_systems: bool,
     /// Event log window.
@@ -626,11 +634,27 @@ pub struct UiState {
     pub edit_ring: usize,
     pub edit_name: String,
     pub edit_name_for: Option<u64>,
+    /// Delete needs a second click. Holds the body id and the time of the first click.
+    pub edit_confirm_delete: Option<(u64, Instant)>,
+    /// The Saves window is open.
+    pub show_saves: bool,
+    /// Text in the save-name box.
+    pub save_name: String,
+    /// Cached list of files in the save folder.
+    pub save_list: Vec<ph::SaveEntry>,
+    pub save_list_time: Instant,
+    /// Last save or load result: text, success, time.
+    pub save_msg: Option<(String, bool, Instant)>,
+    /// First click of an overwrite or delete: name, action, time.
+    pub save_confirm: Option<(String, SaveConfirm, Instant)>,
     /// Sort order of the system list.
     pub sys_sort: SysSort,
     pub sys_sort_desc: bool,
     /// Slug of the preset that is loaded now, if any.
     pub loaded_preset_slug: Option<String>,
+    /// Cached (slug, display name) pairs of the preset library.
+    preset_names: Vec<(String, String)>,
+    preset_names_time: Instant,
     pub diag: DiagHistory,
     pub pending_count: usize,
     /// Seed text in base62 (6 chars max). Parse with `commit_seed_text`.
@@ -700,6 +724,61 @@ impl UiState {
         commit_seed_text(&self.pending_seed_text, fallback)
     }
 
+    /// Show a result line in the Saves window and in the toast.
+    pub fn set_save_msg(&mut self, text: impl Into<String>, ok: bool) {
+        self.save_msg = Some((text.into(), ok, Instant::now()));
+    }
+
+    /// Preset library as (slug, name), re-read at most every 5 s instead of
+    /// on every frame.
+    fn preset_names(&mut self) -> &[(String, String)] {
+        if self.preset_names.is_empty() || self.preset_names_time.elapsed() > Duration::from_secs(5)
+        {
+            self.preset_names = ph::load_presets()
+                .iter()
+                .map(|(slug, p)| (slug.clone(), p.name.clone()))
+                .collect();
+            self.preset_names_time = Instant::now();
+        }
+        &self.preset_names
+    }
+
+    /// Read the save folder again now.
+    pub fn refresh_saves(&mut self) {
+        self.save_list = ph::list_saves();
+        self.save_list_time = Instant::now();
+    }
+
+    /// Clear every cache that belongs to the old system. Call after a load.
+    pub fn reset_after_load(
+        &mut self,
+        body_count: usize,
+        seed: u128,
+        systems: usize,
+        slug: Option<String>,
+    ) {
+        let old = Instant::now() - Duration::from_secs(10);
+        self.pending_count = body_count;
+        self.set_pending_seed(seed);
+        self.seed_text_invalid = false;
+        self.pending_systems = systems;
+        self.loaded_preset_slug = slug;
+        self.multi.clear();
+        self.kids = None;
+        self.edit_mass = 1.0;
+        self.edit_vel = 1.0;
+        self.edit_name_for = None;
+        self.edit_confirm_delete = None;
+        self.system_filter = None;
+        self.systems.clear();
+        self.stats_time = old;
+        self.systems_time = old;
+        self.list_time = old;
+        let visible = self.diag.visible;
+        self.diag = DiagHistory::new();
+        self.diag.visible = visible;
+    }
+
     pub fn new(body_count: usize, seed: u128) -> Self {
         let old = Instant::now() - Duration::from_secs(10);
         Self {
@@ -708,7 +787,6 @@ impl UiState {
             show_list: false,
             show_help: false,
             show_dock: true,
-            show_trails: true,
             show_systems: false,
             show_events: false,
             stats_sections: [true, true, false, true, false],
@@ -720,9 +798,18 @@ impl UiState {
             edit_ring: 25,
             edit_name: String::new(),
             edit_name_for: None,
+            edit_confirm_delete: None,
+            show_saves: false,
+            save_name: String::from("my save"),
+            save_list: Vec::new(),
+            save_list_time: Instant::now() - Duration::from_secs(10),
+            save_msg: None,
+            save_confirm: None,
             sys_sort: SysSort::Index,
             sys_sort_desc: false,
             loaded_preset_slug: None,
+            preset_names: Vec::new(),
+            preset_names_time: Instant::now() - Duration::from_secs(60),
             diag: DiagHistory::new(),
             pending_count: body_count,
             pending_seed_text: ph::seed_to_base62(seed),
@@ -782,6 +869,7 @@ pub struct ViewInfo {
     pub behind: bool,
     /// Pause the simulation when a merger, impact or tidal break-up happens.
     pub pause_on_event: bool,
+    pub trails_enabled: bool,
     pub trail_age: f64,
     pub trail_bodies: usize,
     pub trail_non_rubble: bool,
@@ -790,6 +878,17 @@ pub struct ViewInfo {
     /// Stellar aging speed relative to real time.
     pub aging_mult: f64,
 }
+
+/// Body types offered by the single-body and multi-body edit menus.
+const KIND_CHOICES: [(BodyKind, &str); 7] = [
+    (BodyKind::Planet, "planet"),
+    (BodyKind::DwarfPlanet, "dwarf planet"),
+    (BodyKind::BrownDwarf, "brown dwarf"),
+    (BodyKind::Star, "star"),
+    (BodyKind::WhiteDwarf, "white dwarf"),
+    (BodyKind::NeutronStar, "neutron star"),
+    (BodyKind::BlackHole, "black hole"),
+];
 
 /// A single body edit requested by the UI. Applied by `SimState::apply_actions`
 /// in `main.rs`. `MassMul` is a *factor* so the same enum variant can serve
@@ -844,6 +943,10 @@ pub struct Actions {
     pub pause_on_event: Option<bool>,
     /// One edit applied to many bodies (ids from the body list), committed once.
     pub multi_edit: Option<(Vec<u64>, Edit)>,
+    /// Save the whole state under this (clean) name.
+    pub save: Option<String>,
+    /// Load the save with this name.
+    pub load: Option<String>,
     /// Move the camera to (x, y) and zoom to show `radius` (Gm): x, y, radius.
     pub focus: Option<[f64; 3]>,
     /// Slug of a preset from the library to load.
@@ -914,7 +1017,7 @@ pub fn setup_style(ctx: &egui::Context) {
     // Hover tooltips (the "i" explanations) appear after a one second pause.
     style.interaction.tooltip_delay = 1.0;
     // Thin scroll bars that float over the content instead of taking a column.
-    style.spacing.scroll = egui::style::ScrollStyle::solid();
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
     ctx.set_style(style);
 }
 fn panel_frame() -> egui::Frame {
@@ -975,9 +1078,14 @@ fn info_icon(ui: &mut egui::Ui, k: &str) {
     let Some(text) = info_text(k) else {
         return;
     };
-    let id = info_id(k);
+    // Salted by the widget position, so rows that share a label (for
+    // example "white dwarfs" in two sections) keep separate open state.
+    let id = ui.auto_id_with(("stat_info", k.trim()));
     let open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
     let (rect, mut r) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::click());
+    if r.clicked() {
+        ui.data_mut(|d| d.insert_temp(id, !open));
+    }
     let col = if open || r.hovered() {
         theme().colors.accent()
     } else {
@@ -1015,10 +1123,6 @@ fn info_icon(ui: &mut egui::Ui, k: &str) {
             ui.data_mut(|d| d.insert_temp(id, false));
         }
     }
-}
-
-fn info_id(k: &str) -> egui::Id {
-    egui::Id::new(("stat_info", k.trim()))
 }
 
 /// Label cell of a key-value row. Rows that have an explanation get a
@@ -1163,7 +1267,11 @@ fn info_text(k: &str) -> Option<&'static str> {
 /// doesn't collapse to a single column for the header row.
 fn heading_row(ui: &mut egui::Ui, text: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(text).strong().color(theme().colors.accent()));
+        ui.label(
+            RichText::new(text)
+                .family(medium())
+                .color(theme().colors.accent()),
+        );
         info_icon(ui, text);
     });
     ui.label("");
@@ -1203,6 +1311,7 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
 
     draw_overlays(ctx, ui_state, view, b);
     status_bar(ctx, ui_state, view, b);
+    save_toast(ctx, ui_state);
     if ui_state.show_dock {
         dock(ctx, ui_state, view, b, &mut act);
     }
@@ -1227,6 +1336,9 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
     }
     if ui_state.show_events {
         events_window(ctx, ui_state, b, &mut act);
+    }
+    if ui_state.show_saves {
+        saves_window(ctx, ui_state, &mut act);
     }
     if ui_state.show_help {
         help_window(ctx, ui_state);
@@ -1450,7 +1562,11 @@ fn dock(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies, act:
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Orbital N-Body").strong().size(15.0));
+                ui.label(
+                    RichText::new("Orbital N-Body")
+                        .family(bold_mono())
+                        .size(15.0),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("hide")
@@ -1769,6 +1885,7 @@ fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut 
             ui.toggle_value(&mut st.show_list, "Body list (B)");
             ui.toggle_value(&mut st.show_systems, "System list (Y)");
             ui.toggle_value(&mut st.show_events, "Events (E)");
+            ui.toggle_value(&mut st.show_saves, "Saves (K)");
         });
     });
 }
@@ -1800,9 +1917,8 @@ fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
                 .small()
                 .color(theme().colors.accent()),
         );
-        let mut trails = st.show_trails;
+        let mut trails = view.trails_enabled;
         if ui.checkbox(&mut trails, "trails").changed() {
-            st.show_trails = trails;
             act.trails = Some(trails);
         }
         let mut age = view.trail_age;
@@ -1886,11 +2002,12 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
         let random_selected =
             view.preset == crate::Preset::Random && st.loaded_preset_slug.is_none();
 
+        let names: Vec<(String, String)> = st.preset_names().to_vec();
         let current_name = if let Some(slug) = &st.loaded_preset_slug {
-            ph::load_presets()
+            names
                 .iter()
                 .find(|(s, _)| s == slug)
-                .map(|(_, p)| p.name.clone())
+                .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| slug.clone())
         } else {
             match view.preset {
@@ -1915,14 +2032,15 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
                     if ui.selectable_label(random_selected, "Random").clicked() {
                         choice = Some(Choice::Random);
                     }
-                    for (slug, preset) in ph::load_presets() {
+                    for (slug, name) in &names {
+                        let slug: &String = slug;
                         let selected = if slug == "solar_system" {
                             view.preset == crate::Preset::SolarSystem
                                 && st.loaded_preset_slug.is_none()
                         } else {
                             st.loaded_preset_slug.as_deref() == Some(slug.as_str())
                         };
-                        if ui.selectable_label(selected, &preset.name).clicked() {
+                        if ui.selectable_label(selected, name).clicked() {
                             choice = Some(if slug == "solar_system" {
                                 Choice::SolarSystem
                             } else {
@@ -2047,9 +2165,8 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
     });
 }
 
-/// Map an event kind to a text color. Matches the color-coding in the
-/// 3D scene (merges are white-ish, impacts orange, tidal purple, escapes
-/// gray, user edits green).
+/// Map an event kind to a text color: merges are white-ish blue, impacts
+/// orange, tidal purple, escapes gray, user edits green.
 fn event_color(k: EventKind) -> Color32 {
     match k {
         EventKind::Merge => Color32::from_rgb(160, 200, 255),
@@ -2475,6 +2592,7 @@ fn selection_window(
         st.edit_name = b.name[i].clone().unwrap_or_default();
         st.edit_mass = 1.0;
         st.edit_vel = 1.0;
+        st.edit_confirm_delete = None;
     }
     let kind = b.kind[i];
     let stellar = matches!(
@@ -2545,7 +2663,7 @@ fn selection_window(
                 st.sel_sections[4],
                 st.sel_sections[5],
             ];
-            // Height is capped to "screen height minus 190 points", so the
+            // Height is capped to "screen height minus 300 points", so the
             // window never overflows on small screens.
             egui::ScrollArea::vertical()
                 .id_salt(("sel_scroll", b.id[i]))
@@ -2639,131 +2757,436 @@ fn selection_window(
                 });
             // ---- Edit menu, pinned under the list, closed by default ----
             ui.separator();
-            {
-                {
-                    egui::CollapsingHeader::new(RichText::new("Edit").strong())
-                        .id_salt("edit_header")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            // Sliders show a preview and apply when released.
-                            ui.label(
-                                RichText::new(format!(
-                                    "mass: {} → {}",
-                                    fmt_mass(b.m[i], si),
-                                    fmt_mass(b.m[i] * st.edit_mass, si)
-                                ))
-                                .small()
-                                .color(theme().colors.dim()),
-                            );
-                            let r = ui.add(
-                                egui::Slider::new(&mut st.edit_mass, 0.1..=10.0)
-                                    .logarithmic(true)
-                                    .text("mass ×"),
-                            );
-                            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                                if (st.edit_mass - 1.0).abs() > 1e-6 {
-                                    act.edit = Some(Edit::MassMul(st.edit_mass));
-                                }
-                                st.edit_mass = 1.0;
-                            }
-                            if parent.is_some() {
-                                let r = ui
-                                    .add(
-                                        egui::Slider::new(&mut st.edit_vel, 0.25..=2.0)
-                                            .logarithmic(true)
-                                            .text("speed ×"),
-                                    )
-                                    .on_hover_text(
-                                        "scale the speed relative to the parent when released",
-                                    );
-                                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                                    if (st.edit_vel - 1.0).abs() > 1e-6 {
-                                        act.edit = Some(Edit::VelMul(st.edit_vel));
-                                    }
-                                    st.edit_vel = 1.0;
-                                }
-                            }
-                            if planetish && parent.is_some() {
-                                if ui
-                                    .button("circularize")
-                                    .on_hover_text("set the speed for a circular orbit")
-                                    .clicked()
-                                {
-                                    act.edit = Some(Edit::Circularize);
-                                }
-                            }
-                            if planetish && b.m[i] >= 0.1 {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Slider::new(&mut st.edit_moons, 1..=8).text("moons"),
-                                    );
-                                    if ui.button("add").clicked() {
-                                        act.edit = Some(Edit::SpawnMoon(st.edit_moons));
-                                    }
-                                });
-                            }
-                            if planetish && b.m[i] >= 10.0 {
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Slider::new(&mut st.edit_ring, 5..=200)
-                                            .text("ring bodies"),
-                                    );
-                                    if ui.button("add").clicked() {
-                                        act.edit = Some(Edit::AddRing(st.edit_ring));
-                                    }
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut st.edit_name)
-                                        .hint_text("name")
-                                        .desired_width(140.0),
-                                );
-                                if ui.button("rename").clicked() {
-                                    act.edit = Some(Edit::Rename(st.edit_name.clone()));
-                                }
-                            });
-                            ui.label(RichText::new("type").color(theme().colors.dim()));
-                            ui.horizontal_wrapped(|ui| {
-                                // Clicking the current type does nothing, so it
-                                // is not reset.
-                                for (k, name) in [
-                                    (BodyKind::Planet, "planet"),
-                                    (BodyKind::DwarfPlanet, "dwarf planet"),
-                                    (BodyKind::BrownDwarf, "brown dwarf"),
-                                    (BodyKind::Star, "star"),
-                                    (BodyKind::WhiteDwarf, "white dwarf"),
-                                    (BodyKind::NeutronStar, "neutron star"),
-                                    (BodyKind::BlackHole, "black hole"),
-                                ] {
-                                    if ui.selectable_label(b.kind[i] == k, name).clicked()
-                                        && b.kind[i] != k
-                                    {
-                                        act.edit = Some(Edit::SetKind(k));
-                                    }
-                                }
-                            });
-                            if ui
-                                .button(
-                                    RichText::new("delete").color(Color32::from_rgb(220, 90, 90)),
-                                )
-                                .clicked()
-                            {
-                                act.edit = Some(Edit::Delete);
-                            }
-                            ui.label(
-                                RichText::new("Edits start a new energy baseline.")
-                                    .small()
-                                    .color(theme().colors.dim()),
-                            );
-                        });
-                }
-            }
+            edit_menu(ui, st, b, i, parent, planetish, act);
         });
     // If the user closed the window (the little X), clear the selection.
     if !open {
         act.select = Some(None);
     }
+}
+
+/// What the second click of a two-click button in the Saves window will do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveConfirm {
+    Overwrite,
+    Delete,
+}
+
+fn saves_fmt_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else if b >= KB {
+        format!("{:.0} kB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn saves_fmt_age(t: Option<SystemTime>) -> String {
+    let Some(secs) = t
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs())
+    else {
+        return "–".to_string();
+    };
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
+/// The Saves window: save under a name, load, delete. Files live in
+/// `physics::SAVE_DIR`. Overwrite and delete need a second click.
+fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
+    let mut open = st.show_saves;
+    let dim = theme().colors.dim();
+    let red = Color32::from_rgb(220, 90, 90);
+    let confirm_time = Duration::from_secs(4);
+    egui::Window::new("Saves")
+        .id(egui::Id::new("saves_window"))
+        .open(&mut open)
+        .default_width(360.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            if st.save_list_time.elapsed() > Duration::from_secs(3) {
+                st.refresh_saves();
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Folder: {}/    F5 quick save, F9 quick load",
+                    ph::SAVE_DIR
+                ))
+                .small()
+                .color(dim),
+            );
+
+            // ---- Save box ----
+            let clean = ph::sanitize_save_name(&st.save_name);
+            let exists = clean.as_deref().is_some_and(ph::save_exists);
+            let armed = matches!(
+                &st.save_confirm,
+                Some((n, SaveConfirm::Overwrite, t))
+                    if Some(n.as_str()) == clean.as_deref() && t.elapsed() < confirm_time
+            );
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut st.save_name)
+                        .hint_text("save name")
+                        .desired_width(180.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let label = match (exists, armed) {
+                    (true, true) => "confirm overwrite",
+                    (true, false) => "save…",
+                    _ => "save",
+                };
+                let clicked = ui
+                    .add_enabled(clean.is_some(), egui::Button::new(label))
+                    .on_disabled_hover_text("Use letters, digits, space, - or _.")
+                    .clicked();
+                if (clicked || enter) && clean.is_some() {
+                    if let Some(name) = clean.clone() {
+                        if exists && !armed {
+                            st.save_confirm = Some((name, SaveConfirm::Overwrite, Instant::now()));
+                        } else {
+                            act.save = Some(name);
+                            st.save_confirm = None;
+                        }
+                    }
+                }
+            });
+            if !st.save_name.trim().is_empty() && clean.as_deref() != Some(st.save_name.trim()) {
+                let shown = clean.as_deref().unwrap_or("(no valid name)");
+                ui.label(
+                    RichText::new(format!("Name will be: {shown}"))
+                        .small()
+                        .color(dim),
+                );
+            }
+            if exists && armed {
+                ui.label(
+                    RichText::new("A save with this name exists. Click again to replace it.")
+                        .small()
+                        .color(theme().colors.warn()),
+                );
+            }
+
+            ui.separator();
+
+            // ---- List ----
+            if st.save_list.is_empty() {
+                ui.label(RichText::new("No saves yet.").color(dim));
+            } else {
+                let entries = st.save_list.clone();
+                egui::ScrollArea::vertical()
+                    .id_salt("saves_scroll")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("saves_grid")
+                            .num_columns(4)
+                            .spacing([10.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for e in &entries {
+                                    if ui
+                                        .selectable_label(false, &e.name)
+                                        .on_hover_text("Click to copy the name to the box.")
+                                        .clicked()
+                                    {
+                                        st.save_name = e.name.clone();
+                                    }
+                                    ui.label(
+                                        RichText::new(saves_fmt_size(e.bytes))
+                                            .small()
+                                            .monospace()
+                                            .color(dim),
+                                    );
+                                    ui.label(
+                                        RichText::new(saves_fmt_age(e.modified)).small().color(dim),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("load").clicked() {
+                                            act.load = Some(e.name.clone());
+                                        }
+                                        let del_armed = matches!(
+                                            &st.save_confirm,
+                                            Some((n, SaveConfirm::Delete, t))
+                                                if *n == e.name && t.elapsed() < confirm_time
+                                        );
+                                        if del_armed {
+                                            if ui
+                                                .small_button(RichText::new("confirm").color(red))
+                                                .clicked()
+                                            {
+                                                match ph::delete_save(&e.name) {
+                                                    Ok(()) => st.set_save_msg(
+                                                        format!("Deleted {}", e.name),
+                                                        true,
+                                                    ),
+                                                    Err(er) => st.set_save_msg(
+                                                        format!("Delete failed: {er}"),
+                                                        false,
+                                                    ),
+                                                }
+                                                st.save_confirm = None;
+                                                st.refresh_saves();
+                                            }
+                                        } else if ui.small_button("delete…").clicked() {
+                                            st.save_confirm = Some((
+                                                e.name.clone(),
+                                                SaveConfirm::Delete,
+                                                Instant::now(),
+                                            ));
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+
+            // ---- Message ----
+            if let Some((text, ok, t)) = &st.save_msg {
+                if t.elapsed() < Duration::from_secs(10) {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(text).small().color(if *ok {
+                        theme().colors.good()
+                    } else {
+                        theme().colors.warn()
+                    }));
+                }
+            }
+            if st.save_confirm.is_some() {
+                // Redraw so a confirm button goes away when its time ends.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+        });
+    st.show_saves = open;
+}
+
+/// A short message at the bottom of the screen after F5 or F9, when the
+/// Saves window is closed and the user would see nothing otherwise.
+fn save_toast(ctx: &egui::Context, st: &UiState) {
+    if st.show_saves {
+        return;
+    }
+    let Some((text, ok, t)) = &st.save_msg else {
+        return;
+    };
+    let left = Duration::from_secs(4).saturating_sub(t.elapsed());
+    if left.is_zero() {
+        return;
+    }
+    egui::Area::new(egui::Id::new("save_toast"))
+        .anchor(Align2::CENTER_BOTTOM, [0.0, -48.0])
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(text).color(if *ok {
+                    theme().colors.good()
+                } else {
+                    theme().colors.warn()
+                }));
+            });
+        });
+    ctx.request_repaint_after(left.min(Duration::from_millis(250)));
+}
+
+/// The Edit menu of the selected-body window.
+///
+/// Groups: Mass, Orbit, Satellites, Name, Type, Delete. A control that does
+/// not apply to this body is greyed out with a hover text that gives the
+/// reason, so the user can still find it. Sliders apply on release.
+/// Delete needs a second click within four seconds.
+fn edit_menu(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    b: &Bodies,
+    i: usize,
+    parent: Option<usize>,
+    planetish: bool,
+    act: &mut Actions,
+) {
+    let si = st.units_si;
+    let dim = theme().colors.dim();
+    let id = b.id[i];
+    let red = Color32::from_rgb(220, 90, 90);
+
+    egui::CollapsingHeader::new(RichText::new("Edit").strong())
+        .id_salt("edit_header")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("Sliders apply when you release them.")
+                    .small()
+                    .color(dim),
+            );
+
+            // ---- Mass ----
+            ui.add_space(4.0);
+            ui.label(RichText::new("Mass").strong());
+            ui.label(
+                RichText::new(format!(
+                    "{} → {}",
+                    fmt_mass(b.m[i], si),
+                    fmt_mass(b.m[i] * st.edit_mass, si)
+                ))
+                .small()
+                .monospace()
+                .color(dim),
+            );
+            let r = ui.add(
+                egui::Slider::new(&mut st.edit_mass, 0.1..=10.0)
+                    .logarithmic(true)
+                    .text("×"),
+            );
+            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                if (st.edit_mass - 1.0).abs() > 1e-6 {
+                    act.edit = Some(Edit::MassMul(st.edit_mass));
+                }
+                st.edit_mass = 1.0;
+            }
+            ui.horizontal(|ui| {
+                for (label, f) in [("÷10", 0.1), ("÷2", 0.5), ("×2", 2.0), ("×10", 10.0)] {
+                    if ui.small_button(label).clicked() {
+                        act.edit = Some(Edit::MassMul(f));
+                    }
+                }
+            });
+
+            // ---- Orbit ----
+            ui.add_space(4.0);
+            ui.label(RichText::new("Orbit").strong());
+            let has_parent = parent.is_some();
+            ui.add_enabled_ui(has_parent, |ui| {
+                let r = ui
+                    .add(
+                        egui::Slider::new(&mut st.edit_vel, 0.25..=2.0)
+                            .logarithmic(true)
+                            .text("speed ×"),
+                    )
+                    .on_hover_text("Scale the speed relative to the parent when released.")
+                    .on_disabled_hover_text("This body has no parent.");
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    if (st.edit_vel - 1.0).abs() > 1e-6 {
+                        act.edit = Some(Edit::VelMul(st.edit_vel));
+                    }
+                    st.edit_vel = 1.0;
+                }
+            });
+            let can_circ = planetish && has_parent;
+            if ui
+                .add_enabled(can_circ, egui::Button::new("circularize"))
+                .on_hover_text("Set the speed for a circular orbit.")
+                .on_disabled_hover_text("Only a planet or dwarf planet with a parent can do this.")
+                .clicked()
+            {
+                act.edit = Some(Edit::Circularize);
+            }
+
+            // ---- Satellites ----
+            ui.add_space(4.0);
+            ui.label(RichText::new("Satellites").strong());
+            let can_moon = planetish && b.m[i] >= 0.1;
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    can_moon,
+                    egui::Slider::new(&mut st.edit_moons, 1..=8).text("moons"),
+                );
+                if ui
+                    .add_enabled(can_moon, egui::Button::new("add"))
+                    .on_disabled_hover_text("Needs a planet with mass of 0.1 or more.")
+                    .clicked()
+                {
+                    act.edit = Some(Edit::SpawnMoon(st.edit_moons));
+                }
+            });
+            let can_ring = planetish && b.m[i] >= 10.0;
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    can_ring,
+                    egui::Slider::new(&mut st.edit_ring, 5..=200).text("ring bodies"),
+                );
+                if ui
+                    .add_enabled(can_ring, egui::Button::new("add"))
+                    .on_disabled_hover_text("Needs a planet with mass of 10 or more.")
+                    .clicked()
+                {
+                    act.edit = Some(Edit::AddRing(st.edit_ring));
+                }
+            });
+
+            // ---- Name ----
+            ui.add_space(4.0);
+            ui.label(RichText::new("Name").strong());
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut st.edit_name)
+                        .hint_text("name")
+                        .desired_width(140.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                let current = b.name[i].as_deref().unwrap_or("");
+                let changed = st.edit_name.trim() != current;
+                let clicked = ui
+                    .add_enabled(changed, egui::Button::new("rename"))
+                    .on_disabled_hover_text("The name is the same.")
+                    .clicked();
+                if (clicked || (enter && changed)) && act.edit.is_none() {
+                    act.edit = Some(Edit::Rename(st.edit_name.clone()));
+                }
+            });
+
+            // ---- Type ----
+            ui.add_space(4.0);
+            ui.label(RichText::new("Type").strong());
+            ui.horizontal_wrapped(|ui| {
+                // A click on the current type does nothing.
+                for (k, name) in KIND_CHOICES {
+                    if ui.selectable_label(b.kind[i] == k, name).clicked() && b.kind[i] != k {
+                        act.edit = Some(Edit::SetKind(k));
+                    }
+                }
+            });
+
+            // ---- Delete (two clicks) ----
+            ui.add_space(6.0);
+            ui.separator();
+            let armed = matches!(
+                st.edit_confirm_delete,
+                Some((cid, t)) if cid == id && t.elapsed() < Duration::from_secs(4)
+            );
+            if armed {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("confirm delete").color(red))
+                        .clicked()
+                    {
+                        act.edit = Some(Edit::Delete);
+                        st.edit_confirm_delete = None;
+                    }
+                    if ui.button("cancel").clicked() {
+                        st.edit_confirm_delete = None;
+                    }
+                });
+                // Redraw so the confirm button goes away when the time ends.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            } else {
+                st.edit_confirm_delete = None;
+                if ui.button(RichText::new("delete…").color(red)).clicked() {
+                    st.edit_confirm_delete = Some((id, Instant::now()));
+                }
+            }
+            ui.label(
+                RichText::new("Edits start a new energy baseline.")
+                    .small()
+                    .color(dim),
+            );
+        });
 }
 
 /// Rows for the selection grid. Split out from `selection_window` so that
@@ -3068,10 +3491,6 @@ fn selection_rows(
         // relative speed if the body has a parent.
         let v = (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i]).sqrt();
         kv(ui, "speed (frame)", fmt_speed(v, si));
-        // Collision immunity: a short post-collision grace period during which
-        // the body can't hit anything (so a fragment doesn't immediately
-        // re-impact the surviving body). Showing it makes it clear why two
-        // overlapping bodies don't immediately merge.
         kv(ui, "momentum", format!("{:.3e}", m * v));
         kv(ui, "kinetic energy", format!("{:.3e}", 0.5 * m * v * v));
         if b.spin[i] != 0.0 {
@@ -3090,6 +3509,10 @@ fn selection_rows(
         }
         let heavier = (0..b.len()).filter(|&k| b.m[k] > m).count();
         kv(ui, "mass rank", format!("#{} of {}", heavier + 1, b.len()));
+        // Collision immunity: a short post-collision grace period during which
+        // the body can't hit anything (so a fragment doesn't immediately
+        // re-impact the surviving body). Showing it makes it clear why two
+        // overlapping bodies don't immediately merge.
         if b.time < b.imm[i] {
             kv(ui, "collision immunity", fmt_time(b.imm[i] - b.time, si));
         }
@@ -3287,11 +3710,12 @@ fn refresh_systems(st: &mut UiState, b: &Bodies) {
     }
 }
 
-/// The heavier star that star `k` is bound to, if any.
-fn host_parent(b: &Bodies, k: usize) -> Option<usize> {
+/// The heavier star that star `k` is bound to, if any. `hosts` lists every
+/// host-kind body, so the search is O(hosts) instead of O(n).
+fn host_parent(b: &Bodies, hosts: &[usize], k: usize) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
-    for h in 0..b.len() {
-        if h == k || !ph::is_host_kind(b.kind[h]) {
+    for &h in hosts {
+        if h == k {
             continue;
         }
         if b.m[h] < b.m[k] || (b.m[h] == b.m[k] && h > k) {
@@ -3323,12 +3747,19 @@ fn compute_kids(b: &Bodies, i: usize) -> Option<Vec<KidRow>> {
         return None;
     }
     let mut rows = Vec::new();
+    let hosts: Vec<usize> = (0..n).filter(|&h| ph::is_host_kind(b.kind[h])).collect();
+    // Binary search among stars is O(hosts²); skip it in huge clusters.
+    let search_hosts = hosts.len() <= 2000;
     for k in 0..n {
         if k == i {
             continue;
         }
         let parent = if ph::is_host_kind(b.kind[k]) {
-            host_parent(b, k)
+            if search_hosts {
+                host_parent(b, &hosts, k)
+            } else {
+                None
+            }
         } else if cached {
             b.parent_cache[k]
         } else {
@@ -3394,11 +3825,11 @@ fn refresh_rows(st: &mut UiState, b: &Bodies) {
             SortKey::Period => orbital(i).2,
         }
     };
-    idx.sort_by(|&a, &c| {
-        val(a)
-            .partial_cmp(&val(c))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort keys once per body: `val` can call `orbit_info`, which is too slow
+    // to repeat inside the comparator.
+    let mut keyed: Vec<(f64, usize)> = idx.iter().map(|&i| (val(i), i)).collect();
+    keyed.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
+    idx = keyed.into_iter().map(|(_, i)| i).collect();
     if st.sort_desc {
         idx.reverse();
     }
@@ -3525,15 +3956,7 @@ fn list_window(
                     egui::ComboBox::from_id_salt("multi_kind")
                         .selected_text("set type…")
                         .show_ui(ui, |ui| {
-                            for (k, name) in [
-                                (BodyKind::Planet, "planet"),
-                                (BodyKind::DwarfPlanet, "dwarf planet"),
-                                (BodyKind::BrownDwarf, "brown dwarf"),
-                                (BodyKind::Star, "star"),
-                                (BodyKind::WhiteDwarf, "white dwarf"),
-                                (BodyKind::NeutronStar, "neutron star"),
-                                (BodyKind::BlackHole, "black hole"),
-                            ] {
+                            for (k, name) in KIND_CHOICES {
                                 if ui.selectable_label(false, name).clicked() {
                                     act.multi_edit = Some((ids.clone(), Edit::SetKind(k)));
                                 }
@@ -3665,6 +4088,8 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                     ("B", "body list"),
                     ("Y", "system list"),
                     ("E", "events"),
+                    ("K", "saves window"),
+                    ("F5 / F9", "quick save / quick load"),
                     ("G", "diagnostics"),
                     ("V", "vsync"),
                     ("`", "show / hide the control panel"),
@@ -4121,42 +4546,6 @@ fn diag_window(
                 });
         });
     st.diag.visible = open;
-}
-
-fn section(ui: &mut egui::Ui, label: &str, tip: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).strong());
-        ui.label(RichText::new("ⓘ").weak().small())
-            .on_hover_text(tip);
-    });
-}
-
-fn section_with_total(
-    ui: &mut egui::Ui,
-    label: &str,
-    tip: &str,
-    total: impl Into<egui::WidgetText>,
-) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).strong());
-        ui.label(RichText::new("ⓘ").weak().small())
-            .on_hover_text(tip);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(total);
-        });
-    });
-}
-
-fn sub_row(ui: &mut egui::Ui, label: &str, tip: &str, value: impl Into<egui::WidgetText>) {
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(RichText::new(label).weak());
-        ui.label(RichText::new("ⓘ").weak().small())
-            .on_hover_text(tip);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(value);
-        });
-    });
 }
 
 #[cfg(test)]

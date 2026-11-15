@@ -6,11 +6,13 @@
 //   OrbitVertex    <-> struct OrbitIn
 //   FlashInstance  <-> struct FlashIn
 //   DustVertex     <-> struct DustIn
+//   GlowInstance   <-> struct GlowIn
+//   BlackHoleInstance <-> struct BlackHoleIn
 //   dust centres   <-> struct DustFields (256 x vec4)
 //
-// Bind groups: group 0 is one camera uniform. Bodies, flashes and dust use
-// the "relative" camera (pos = 0, positions pre-subtracted on the CPU);
-// orbits and trails use the "world" camera. Dust also reads group 1, the
+// Bind groups: group 0 is one camera uniform. Bodies, flashes, dust, glow,
+// black holes and trails use the "relative" camera (pos = 0, positions
+// pre-subtracted on the CPU in f64); orbit lines use the "world" camera. Dust also reads group 1, the
 // per-field centres (camera-relative, rewritten every frame).
  
 struct Camera {

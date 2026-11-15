@@ -24,6 +24,7 @@ pub mod orbit_lines;
 pub mod orbits;
 pub mod presets;
 pub mod rng;
+pub mod save;
 pub mod spawn;
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,7 @@ pub use orbit_lines::*;
 pub use orbits::*;
 pub use presets::*;
 pub use rng::*;
+pub use save::*;
 pub use spawn::*;
 pub use tides::*;
 

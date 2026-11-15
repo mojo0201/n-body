@@ -1,6 +1,7 @@
 //! wgpu renderer for the 2D scene: instanced quads for bodies, a line-list
-//! for orbit and trail vertices, instanced quads for collision flashes, and
-//! instanced soft points for dust grains.
+//! for orbit and trail vertices, instanced quads for collision flashes,
+//! instanced soft points for dust grains, additive glow halos around luminous
+//! bodies, and a ray-traced quad per black hole.
 //!
 //! Layout contract
 //! ---------------
@@ -16,12 +17,20 @@
 //!   * `flash_pipeline` - instanced triangle strip, one ring per flash.
 //!   * `dust_pipeline`  - instanced triangle strip, one ~1 px soft point per
 //!     tracer grain, additive blending.
+//!   * `glow_pipeline`  - instanced triangle strip, one additive halo per
+//!     luminous body (stars, brown/white dwarfs, neutron stars).
+//!   * `blackhole_pipeline` - instanced triangle strip, one quad per black
+//!     hole; the fragment shader traces rays through Schwarzschild spacetime.
+//!   * `comet_pipeline` - additive triangle list for comet tails. Reserved:
+//!     `main.rs` currently uploads no tail vertices, so it never draws.
 //!
 //! Cameras
 //! -------
-//! `camera_bg` is the *relative* camera (pos = 0): bodies, flashes and dust
-//! are pre-subtracted by the camera on the CPU, which keeps f32 precision
-//! when zoomed in. `orbit_camera_bg` is the *world* camera (orbits, trails).
+//! `camera_bg` is the *relative* camera (pos = 0): bodies, flashes, dust,
+//! glow, black holes and trails are pre-subtracted by the camera on the CPU
+//! in f64, which keeps f32 precision when zoomed in. `orbit_camera_bg` is the
+//! *world* camera, used only by orbit lines and comet tails (their vertices
+//! are built elsewhere in absolute f32 coordinates).
 
 use std::time::{Duration, Instant};
 
@@ -398,6 +407,8 @@ pub struct Renderer {
     // luminosity. Kept between frames to avoid new allocations.
     light_scratch: Vec<(f64, f64, f64)>,
     lum_scratch: Vec<f64>,
+    // Body colour computed once per frame (shared by bodies and glow).
+    color_scratch: Vec<[f32; 3]>,
 
     // Orbit lines.
     orbit_pipeline: wgpu::RenderPipeline,
@@ -975,6 +986,7 @@ impl Renderer {
             instance_scratch: Vec::new(),
             light_scratch: Vec::new(),
             lum_scratch: Vec::new(),
+            color_scratch: Vec::new(),
             orbit_pipeline,
             orbit_buf,
             orbit_capacity,
@@ -1021,8 +1033,8 @@ impl Renderer {
         }
     }
 
-    /// Upload both camera uniforms: relative (pos = 0) for bodies, flashes and
-    /// dust; world (pos = cam) for orbits and trails.
+    /// Upload both camera uniforms: relative (pos = 0) for bodies, flashes,
+    /// dust, glow, black holes and trails; world (pos = cam) for orbit lines.
     pub fn update_camera(&self, queue: &wgpu::Queue, cam: [f64; 2], zoom: f32, viewport: [f32; 2]) {
         let rel = CameraUniform {
             pos: [0.0, 0.0],
@@ -1054,6 +1066,8 @@ impl Renderer {
         self.lum_scratch.clear();
         self.lum_scratch.resize(n, 0.0);
         self.light_scratch.clear();
+        self.color_scratch.clear();
+        self.color_scratch.resize(n, [0.0; 3]);
         for i in 0..n {
             if !matches!(
                 b.kind[i],
@@ -1093,10 +1107,12 @@ impl Renderer {
                 Some((idx, [x, y])) if idx == i => (x, y),
                 _ => (b.x[i], b.y[i]),
             };
+            let color = body_color(b, i);
+            self.color_scratch[i] = color;
             let mut inst = BodyInstance::new(
                 b.kind[i],
                 b.origin[i],
-                body_color(b, i),
+                color,
                 bx - cam[0],
                 by - cam[1],
                 b.r[i],
@@ -1178,7 +1194,7 @@ impl Renderer {
             // one, so a luminous star at wide zoom has a bigger glare.
             let floor_px = 6.0 * lum_factor.sqrt();
             let r_world = (b.r[i] * halo_mult).max(floor_px / zoom.max(1e-6) as f64);
-            let color = body_color(b, i);
+            let color = self.color_scratch[i];
             self.glow_scratch.push(GlowInstance {
                 pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
                 radius: r_world as f32,
@@ -1408,7 +1424,8 @@ impl Renderer {
     }
 
     /// Upload a pre-built trail-vertex buffer (same pipeline as orbits, own
-    /// buffer so the two update cadences do not interfere).
+    /// buffer so the two update cadences do not interfere). Positions must be
+    /// camera-relative: trails are drawn with the relative camera.
     pub fn set_trail_vertices(
         &mut self,
         device: &wgpu::Device,
@@ -1465,9 +1482,9 @@ impl Renderer {
         self.trail_vert_count
     }
 
-    /// Record the draw calls. Order, bottom to top: dust, trails, orbits,
-    /// flashes, bodies. `pass` is `'static` because the caller erased the
-    /// encoder borrow with `forget_lifetime()`.
+    /// Record the draw calls. Order, bottom to top: glow, dust, trails,
+    /// comet tails, orbits, black holes, flashes, bodies. `pass` is `'static`
+    /// because the caller erased the encoder borrow with `forget_lifetime()`.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'static>) {
         // Glow first: halos read as background scatter, so bodies, trails
         // and flashes all draw on top of them. Additive blending means
@@ -1487,8 +1504,9 @@ impl Renderer {
             pass.draw(0..4, 0..self.dust_count);
         }
         if self.trail_vert_count > 0 {
+            // Trail vertices are camera-relative (see `TrailState::build_vertices`).
             pass.set_pipeline(&self.orbit_pipeline);
-            pass.set_bind_group(0, &self.orbit_camera_bg, &[]);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
             pass.set_vertex_buffer(0, self.trail_buf.slice(..));
             pass.draw(0..self.trail_vert_count, 0..1);
         }

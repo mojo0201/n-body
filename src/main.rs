@@ -31,8 +31,8 @@ use nbody_rust::Preset;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use egui_wgpu::ScreenDescriptor;
@@ -270,10 +270,13 @@ impl Default for TrailConfig {
     }
 }
 
-type TrailSample = (u64, f64, f32, f32, [u8; 4], f64, Option<(f32, f32)>);
+/// (id, sim_time, x, y, rgba, period, parent_pos). Positions stay f64 so
+/// deep zoom does not jitter; they become camera-relative f32 only in
+/// `build_vertices`.
+type TrailSample = (u64, f64, f64, f64, [u8; 4], f64, Option<(f64, f64)>);
 
 struct Trail {
-    history: VecDeque<(f64, f32, f32)>,
+    history: VecDeque<(f64, f64, f64)>,
     color: [u8; 4],
 }
 
@@ -328,12 +331,12 @@ impl TrailState {
                 .filter(|&p| p != i)
                 .map(|p| {
                     let o = crate::physics::orbit_info(b, i, p);
-                    (o.period, Some((b.x[p] as f32, b.y[p] as f32)))
+                    (o.period, Some((b.x[p], b.y[p])))
                 })
                 .unwrap_or((f64::INFINITY, None));
             let (bx, by) = match override_pos {
-                Some((id, pos)) if b.id[i] == id => (pos[0] as f32, pos[1] as f32),
-                _ => (b.x[i] as f32, b.y[i] as f32),
+                Some((id, pos)) if b.id[i] == id => (pos[0], pos[1]),
+                _ => (b.x[i], b.y[i]),
             };
             out.push((b.id[i], b.time, bx, by, color, period, parent_pos));
         }
@@ -372,24 +375,24 @@ impl TrailState {
                             let a0 = dy0.atan2(dx0);
                             let a1 = dy1.atan2(dx1);
                             let mut da = a1 - a0;
-                            if da > std::f32::consts::PI {
-                                da -= 2.0 * std::f32::consts::PI;
-                            } else if da < -std::f32::consts::PI {
-                                da += 2.0 * std::f32::consts::PI;
+                            if da > std::f64::consts::PI {
+                                da -= 2.0 * std::f64::consts::PI;
+                            } else if da < -std::f64::consts::PI {
+                                da += 2.0 * std::f64::consts::PI;
                             }
-                            ((da.abs() / 0.035).ceil() as usize).min(256).max(1)
+                            ((da.abs() / 0.035).ceil() as usize).clamp(1, 256)
                         } else {
                             let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
-                            ((d / 0.01).ceil() as usize).min(256).max(1)
+                            ((d / 0.01).ceil() as usize).clamp(1, 256)
                         }
                     } else {
                         let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
-                        ((d / 0.01).ceil() as usize).min(256).max(1)
+                        ((d / 0.01).ceil() as usize).clamp(1, 256)
                     };
 
                     if steps > 1 {
                         for s in 1..steps {
-                            let frac = s as f32 / steps as f32;
+                            let frac = s as f64 / steps as f64;
                             let (ix, iy) = if let Some((px, py)) = parent_pos {
                                 // Circular arc around the parent for round trails.
                                 let dx0 = x_last - px;
@@ -405,10 +408,10 @@ impl TrailState {
                                     let a1 = dy1.atan2(dx1);
                                     let mut da = a1 - a0;
                                     // Shortest arc to avoid the trail looping backward
-                                    if da > std::f32::consts::PI {
-                                        da -= 2.0 * std::f32::consts::PI;
-                                    } else if da < -std::f32::consts::PI {
-                                        da += 2.0 * std::f32::consts::PI;
+                                    if da > std::f64::consts::PI {
+                                        da -= 2.0 * std::f64::consts::PI;
+                                    } else if da < -std::f64::consts::PI {
+                                        da += 2.0 * std::f64::consts::PI;
                                     }
                                     let r = r0 + (r1 - r0) * frac;
                                     let a = a0 + da * frac;
@@ -418,7 +421,7 @@ impl TrailState {
                                 // Fallback to linear interpolation (stars)
                                 (x_last + (x - x_last) * frac, y_last + (y - y_last) * frac)
                             };
-                            trail.history.push_back((t_last + dt * frac as f64, ix, iy));
+                            trail.history.push_back((t_last + dt * frac, ix, iy));
                         }
                     }
                 }
@@ -447,10 +450,23 @@ impl TrailState {
     }
 
     /// Heavy; runs without the lock. Turns the per-body history into
-    /// line-list vertices with alpha fading toward the tail.
-    fn build_vertices(&self) -> Vec<OrbitVertex> {
-        let mut out = Vec::new();
-        'outer: for trail in self.history.values() {
+    /// line-list vertices with alpha fading toward the tail. Positions are
+    /// made relative to `cam` in f64 before the cast to f32, and the renderer
+    /// draws trails with the relative camera. Trails are visited in id order
+    /// and, when the vertex budget is exceeded, every trail is decimated by
+    /// the same stride, so the result does not depend on hash order.
+    fn build_vertices(&self, cam: [f64; 2]) -> Vec<OrbitVertex> {
+        let mut ids: Vec<u64> = self.history.keys().copied().collect();
+        ids.sort_unstable();
+        let total_segs: usize = self
+            .history
+            .values()
+            .map(|t| t.history.len().saturating_sub(1))
+            .sum();
+        let stride = (total_segs * 2).div_ceil(TRAIL_MAX_VERTS).max(1);
+        let mut out = Vec::with_capacity((total_segs * 2 / stride).min(TRAIL_MAX_VERTS) + 2);
+        'outer: for id in ids {
+            let trail = &self.history[&id];
             let n = trail.history.len();
             if n < 2 {
                 continue;
@@ -461,26 +477,27 @@ impl TrailState {
             // Fade over the actual span of this trail, not the config max_age.
             let span = (t_last - t_first).max(1e-9);
             let rgb = [trail.color[0], trail.color[1], trail.color[2]];
-            for k in 0..n - 1 {
-                let (t0, x0, y0) = trail.history[k];
-                let (t1, x1, y1) = trail.history[k + 1];
-
+            let alpha = |t: f64| -> u8 {
                 // 30% alpha floor at the tail so the trail doesn't vanish.
-                let a0 =
-                    ((((1.0 - (t_last - t0) / span) * 0.7 + 0.3).clamp(0.0, 1.0)) * 200.0) as u8;
-                let a1 =
-                    ((((1.0 - (t_last - t1) / span) * 0.7 + 0.3).clamp(0.0, 1.0)) * 200.0) as u8;
+                ((((1.0 - (t_last - t) / span) * 0.7 + 0.3).clamp(0.0, 1.0)) * 200.0) as u8
+            };
+            let mut k = 0;
+            while k < n - 1 {
+                let k1 = (k + stride).min(n - 1);
+                let (t0, x0, y0) = trail.history[k];
+                let (t1, x1, y1) = trail.history[k1];
                 out.push(OrbitVertex {
-                    pos: [x0, y0],
-                    color: [rgb[0], rgb[1], rgb[2], a0],
+                    pos: [(x0 - cam[0]) as f32, (y0 - cam[1]) as f32],
+                    color: [rgb[0], rgb[1], rgb[2], alpha(t0)],
                 });
                 out.push(OrbitVertex {
-                    pos: [x1, y1],
-                    color: [rgb[0], rgb[1], rgb[2], a1],
+                    pos: [(x1 - cam[0]) as f32, (y1 - cam[1]) as f32],
+                    color: [rgb[0], rgb[1], rgb[2], alpha(t1)],
                 });
                 if out.len() >= TRAIL_MAX_VERTS {
                     break 'outer;
                 }
+                k = k1;
             }
         }
         out
@@ -519,7 +536,6 @@ struct SimState {
     preset: Preset,
     systems: usize,
     vsync: bool,
-    scene_dirty: bool,
     t_window_start: Instant,
     t_window_frames: u32,
     t_frame_accum: f64,
@@ -542,6 +558,10 @@ struct SimState {
     last_pause_events: u64,
     /// Slug of the library preset that `R` reloads. `None`: random seed.
     last_loaded_preset: Option<String>,
+    /// Disk work queued while the bodies lock was held; runs after it is released.
+    deferred_io: Option<Box<dyn FnOnce(&mut UiState)>>,
+    /// Name of a save to load once the bodies lock is released.
+    pending_load: Option<String>,
 }
 
 impl SimState {
@@ -578,7 +598,6 @@ impl SimState {
             preset: Preset::SolarSystem,
             systems: 1,
             vsync: true,
-            scene_dirty: true,
             t_window_start: Instant::now(),
             t_window_frames: 0,
             t_frame_accum: 0.0,
@@ -599,6 +618,8 @@ impl SimState {
             pause_on_event: false,
             last_pause_events: 0,
             last_loaded_preset: None,
+            deferred_io: None,
+            pending_load: None,
         }
     }
 
@@ -629,7 +650,6 @@ impl SimState {
         b.mass_transfer = self.mass_transfer;
 
         self.orbit_buf_valid = false;
-        self.scene_dirty = true;
         self.selected = None;
         self.follow = false;
         shared.clear_accum.store(true, Ordering::Release);
@@ -647,7 +667,6 @@ impl SimState {
                 b.mass_transfer = self.mass_transfer;
                 self.body_count = b.len();
                 self.orbit_buf_valid = false;
-                self.scene_dirty = true;
                 self.selected = None;
                 self.follow = false;
                 shared.clear_accum.store(true, Ordering::Release);
@@ -658,6 +677,117 @@ impl SimState {
         let seed = self.seed.wrapping_add(1);
         let count = self.body_count;
         self.reset_with(b, shared, count, seed);
+    }
+
+    /// Camera, speed and selection, for a save file.
+    fn app_save(&self, body_count: usize) -> physics::AppSave {
+        physics::AppSave {
+            cam: self.cam,
+            zoom: self.zoom,
+            speed: self.speed,
+            paused: self.paused,
+            seed: physics::seed_to_base62(self.seed),
+            body_count,
+            preset: match self.preset {
+                Preset::Random => "random".to_string(),
+                Preset::SolarSystem => "solar".to_string(),
+            },
+            systems: self.systems,
+            library_preset: self.last_loaded_preset.clone(),
+            selected: self.selected,
+            follow: self.follow,
+            show_orbits: self.show_orbits,
+            show_debris_orbits: self.show_debris_orbits,
+            aging_mult: self.aging_mult,
+        }
+    }
+
+    /// Capture the whole state for `saves/<name>.nbody.json`. Reads `b` only.
+    /// The disk write is queued in `deferred_io` and runs after the bodies
+    /// lock is released (see `App::flush_io`); its result goes to the UI
+    /// message line.
+    fn save_game(&mut self, b: &Bodies, name: &str, ui_state: &mut UiState) {
+        let Some(clean) = physics::sanitize_save_name(name) else {
+            ui_state.set_save_msg("The name needs a letter or a digit.", false);
+            return;
+        };
+        let captured = physics::capture_save(b, self.app_save(b.len()));
+        self.deferred_io = Some(Box::new(move |ui_state: &mut UiState| {
+            let result = captured.and_then(|file| physics::write_save(&clean, &file));
+            match result {
+                Ok(path) => ui_state.set_save_msg(format!("Saved to {}", path.display()), true),
+                Err(e) => ui_state.set_save_msg(format!("Save failed: {e}"), false),
+            }
+            ui_state.refresh_saves();
+        }));
+    }
+
+    /// Replace the running state with `saves/<name>.nbody.json`.
+    /// If the file is bad, nothing changes and the UI shows the reason.
+    ///
+    /// The file is read and parsed *before* the bodies lock is taken, so a slow
+    /// disk never stalls the physics thread. The caller must NOT hold the lock.
+    fn load_game(&mut self, name: &str, ui_state: &mut UiState, shared: &Shared) {
+        // Only a plain save name may reach the file system.
+        if physics::sanitize_save_name(name).as_deref() != Some(name) {
+            ui_state.set_save_msg("Load failed: invalid save name.", false);
+            return;
+        }
+        let file = match physics::read_save(name) {
+            Ok(f) => f,
+            Err(e) => {
+                ui_state.set_save_msg(format!("Load failed: {e}"), false);
+                return;
+            }
+        };
+        let mut b = shared.lock_for_render();
+        let b = &mut *b;
+        if let Err(e) = physics::restore_save(b, &file) {
+            ui_state.set_save_msg(format!("Load failed: {e}"), false);
+            return;
+        }
+        let a = &file.app;
+        self.cam = a.cam;
+        self.zoom = a.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.speed = a.speed.clamp(0.01, 100.0);
+        self.paused = a.paused;
+        if let Some(seed) = physics::seed_from_base62(&a.seed) {
+            self.seed = seed;
+        }
+        self.body_count = b.len();
+        self.preset = if a.preset == "solar" {
+            Preset::SolarSystem
+        } else {
+            Preset::Random
+        };
+        self.systems = a.systems.clamp(1, physics::MAX_SOLAR_SYSTEMS);
+        self.last_loaded_preset = a.library_preset.clone();
+        self.show_orbits = a.show_orbits;
+        self.show_debris_orbits = a.show_debris_orbits;
+        self.aging_mult = a.aging_mult.max(1.0);
+        // The bodies carry the true values for these three.
+        self.evolution_rate = b.evolution_rate;
+        self.sn_kicks = b.sn_kicks;
+        self.mass_transfer = b.mass_transfer;
+        self.selected = a.selected.filter(|&id| b.index_of_id(id).is_some());
+        self.follow = a.follow && self.selected.is_some();
+        self.follow_smooth = None;
+        // Do not fire "pause on event" for events that are already counted.
+        self.last_pause_events = b
+            .stats
+            .merges
+            .wrapping_add(b.stats.impacts)
+            .wrapping_add(b.stats.tidal);
+        self.orbit_buf_valid = false;
+        shared.clear_accum.store(true, Ordering::Release);
+        self.trail.clear();
+        ui_state.reset_after_load(
+            b.len(),
+            self.seed,
+            self.systems,
+            self.last_loaded_preset.clone(),
+        );
+        ui_state.set_save_msg(format!("Loaded {} ({} bodies)", name, b.len()), true);
     }
 
     fn screen_to_world(&self, p: [f32; 2], vp: [f32; 2]) -> [f64; 2] {
@@ -799,17 +929,6 @@ impl SimState {
         b: &mut Bodies,
         shared: &Shared,
     ) {
-        if act.edit.is_some()
-            || act.multi_edit.is_some()
-            || act.reset
-            || act.step_once
-            || act.preset.is_some()
-            || act.body_count.is_some()
-            || act.systems.is_some()
-        {
-            self.scene_dirty = true;
-        }
-
         // Systems slider: respawn immediately. Works for both presets, so
         // the user can go from 1 random system to N random systems in one
         // click without touching the preset selector.
@@ -842,7 +961,6 @@ impl SimState {
                 self.follow = false;
                 shared.clear_accum.store(true, Ordering::Release);
                 self.trail.clear();
-                self.scene_dirty = true;
             }
         }
 
@@ -871,6 +989,13 @@ impl SimState {
             self.reset(b, shared);
             self.fit(b, vp); // ← added
             ui_state.set_pending_seed(self.seed);
+        }
+        if let Some(name) = act.save {
+            self.save_game(b, &name, ui_state);
+        }
+        if let Some(name) = act.load {
+            // Read from disk after the lock is released (see `App::flush_io`).
+            self.pending_load = Some(name);
         }
         if act.toggle_pause {
             self.paused = !self.paused;
@@ -915,7 +1040,6 @@ impl SimState {
             self.follow = false;
             self.follow_smooth = None;
             self.orbit_buf_valid = false;
-            self.scene_dirty = true;
         }
         if let Some(f) = act.follow {
             self.follow = f && self.selected.is_some();
@@ -943,7 +1067,6 @@ impl SimState {
                         }
                         b.rng = rng;
                         self.orbit_buf_valid = false;
-                        self.scene_dirty = true;
                     }
                     Edit::VelMul(f) => {
                         // Scale the speed relative to the parent (or the
@@ -958,7 +1081,6 @@ impl SimState {
                         b.vy[i] = rvy + (b.vy[i] - rvy) * f;
                         b.parent_cache_valid = false;
                         self.orbit_buf_valid = false;
-                        self.scene_dirty = true;
                     }
                     Edit::Rename(name) => {
                         let t = name.trim();
@@ -973,7 +1095,6 @@ impl SimState {
                         physics::add_ring(b, i, n.clamp(5, 200), &mut rng);
                         b.rng = rng;
                         self.orbit_buf_valid = false;
-                        self.scene_dirty = true;
                     }
                 }
                 self.orbit_buf_valid = false;
@@ -997,7 +1118,7 @@ impl SimState {
                         physics::circularize_many(b, &idx);
                     }
                     Edit::Delete => {
-                        if self.selected.map_or(false, |s| ids.contains(&s)) {
+                        if self.selected.is_some_and(|s| ids.contains(&s)) {
                             self.selected = None;
                             self.follow = false;
                         }
@@ -1006,7 +1127,6 @@ impl SimState {
                     Edit::SpawnMoon(_) | Edit::AddRing(_) | Edit::VelMul(_) | Edit::Rename(_) => {}
                 }
                 self.orbit_buf_valid = false;
-                self.scene_dirty = true;
             }
         }
         if let Some(t) = act.trails {
@@ -1055,6 +1175,11 @@ struct App {
     phys: Option<JoinHandle<()>>,
     idle_frames: u32,
     timing_log: bool,
+    /// Keyboard modifiers, so Ctrl/Alt/Cmd + letter is not a shortcut.
+    mods: ModifiersState,
+    /// When egui wants a repaint with no input (tooltip delay, toast and
+    /// confirm-button expiry). Drives `about_to_wait` while the app is idle.
+    repaint_at: Option<Instant>,
 }
 
 impl App {
@@ -1075,6 +1200,20 @@ impl App {
             phys: None,
             idle_frames: 0,
             timing_log: std::env::var_os("NBODY_TIMING").is_some(),
+            mods: ModifiersState::default(),
+            repaint_at: None,
+        }
+    }
+
+    /// Run disk work that was queued while the bodies lock was held: the
+    /// save write and the save read. Must be called with the lock released.
+    fn flush_io(&mut self) {
+        if let Some(io) = self.sim.deferred_io.take() {
+            io(&mut self.ui);
+        }
+        if let Some(name) = self.sim.pending_load.take() {
+            self.sim.load_game(&name, &mut self.ui, &self.shared);
+            self.idle_frames = 0;
         }
     }
 
@@ -1127,7 +1266,14 @@ impl ApplicationHandler for App {
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats[0];
+        // The shaders blend and shade in gamma space and egui expects a
+        // non-sRGB target, so prefer a non-sRGB surface format.
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
@@ -1237,8 +1383,30 @@ impl ApplicationHandler for App {
                 gfx.msaa_view = view;
             }
 
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = m.state();
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed || gfx.egui_ctx.wants_keyboard_input() {
+                    return;
+                }
+                // Held keys repeat only for panning and zooming. Toggles,
+                // R (new system), F5 and the like fire once per press.
+                let repeatable = match event.logical_key.as_ref() {
+                    Key::Named(
+                        NamedKey::ArrowUp
+                        | NamedKey::ArrowDown
+                        | NamedKey::ArrowLeft
+                        | NamedKey::ArrowRight,
+                    ) => true,
+                    Key::Character(c) => matches!(
+                        c.to_lowercase().as_str(),
+                        "w" | "a" | "s" | "d" | "+" | "=" | "-" | "_"
+                    ),
+                    _ => false,
+                };
+                if event.repeat && !repeatable {
                     return;
                 }
                 let pan = 40.0 / self.sim.zoom as f64;
@@ -1275,79 +1443,95 @@ impl ApplicationHandler for App {
                             self.sim.selected = None;
                             self.sim.follow = false;
                             self.sim.orbit_buf_valid = false;
-                            self.sim.scene_dirty = true;
                         }
                     }
-                    Key::Character(c) => match c.to_lowercase().as_str() {
-                        "r" => {
-                            let mut b = self.shared.lock_for_render();
-                            self.sim.reset(&mut b, &self.shared);
-                            self.sim.fit(&b, vp); // ← added
-                            self.ui.set_pending_seed(self.sim.seed);
-                        }
-                        "+" | "=" => self.sim.zoom_at(1.25, [vp[0] * 0.5, vp[1] * 0.5], vp),
-                        "-" | "_" => self.sim.zoom_at(0.8, [vp[0] * 0.5, vp[1] * 0.5], vp),
-                        "w" => {
-                            self.sim.cam[1] -= pan;
-                            self.sim.follow = false;
-                            self.sim.follow_smooth = None;
-                        }
-                        "s" => {
-                            self.sim.cam[1] += pan;
-                            self.sim.follow = false;
-                            self.sim.follow_smooth = None;
-                        }
-                        "a" => {
-                            self.sim.cam[0] -= pan;
-                            self.sim.follow = false;
-                            self.sim.follow_smooth = None;
-                        }
-                        "d" => {
-                            self.sim.cam[0] += pan;
-                            self.sim.follow = false;
-                            self.sim.follow_smooth = None;
-                        }
-                        "`" => self.ui.show_dock = !self.ui.show_dock,
-                        "o" => {
-                            self.sim.show_orbits = !self.sim.show_orbits;
-                            self.sim.orbit_buf_valid = false;
-                        }
-                        ";" => {
-                            self.sim.show_debris_orbits = !self.sim.show_debris_orbits;
-                            self.sim.orbit_buf_valid = false;
-                        }
-                        "l" => self.ui.show_labels = !self.ui.show_labels,
-                        "u" => self.ui.units_si = !self.ui.units_si,
-                        "v" => self.sim.vsync = !self.sim.vsync,
-                        "b" => self.ui.show_list = !self.ui.show_list,
-                        "y" => self.ui.show_systems = !self.ui.show_systems,
-                        "e" => self.ui.show_events = !self.ui.show_events,
-                        "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
-                        "f" | "0" => {
+                    Key::Named(NamedKey::F5) => {
+                        {
                             let b = self.shared.lock_for_render();
-                            self.sim.fit(&b, vp);
+                            self.sim.save_game(&b, "quicksave", &mut self.ui);
                         }
-                        "g" => self.ui.diag.visible = !self.ui.diag.visible,
-                        "c" => {
-                            if self.sim.selected.is_some() {
-                                self.sim.follow = !self.sim.follow;
+                        self.flush_io();
+                    }
+                    Key::Named(NamedKey::F9) => {
+                        self.sim.pending_load = Some("quicksave".to_string());
+                        self.flush_io();
+                    }
+                    Key::Character(c)
+                        if !self.mods.control_key()
+                            && !self.mods.alt_key()
+                            && !self.mods.super_key() =>
+                    {
+                        match c.to_lowercase().as_str() {
+                            "r" => {
+                                let mut b = self.shared.lock_for_render();
+                                self.sim.reset(&mut b, &self.shared);
+                                self.sim.fit(&b, vp); // ← added
+                                self.ui.set_pending_seed(self.sim.seed);
                             }
+                            "+" | "=" => self.sim.zoom_at(1.25, [vp[0] * 0.5, vp[1] * 0.5], vp),
+                            "-" | "_" => self.sim.zoom_at(0.8, [vp[0] * 0.5, vp[1] * 0.5], vp),
+                            "w" => {
+                                self.sim.cam[1] -= pan;
+                                self.sim.follow = false;
+                                self.sim.follow_smooth = None;
+                            }
+                            "s" => {
+                                self.sim.cam[1] += pan;
+                                self.sim.follow = false;
+                                self.sim.follow_smooth = None;
+                            }
+                            "a" => {
+                                self.sim.cam[0] -= pan;
+                                self.sim.follow = false;
+                                self.sim.follow_smooth = None;
+                            }
+                            "d" => {
+                                self.sim.cam[0] += pan;
+                                self.sim.follow = false;
+                                self.sim.follow_smooth = None;
+                            }
+                            "`" => self.ui.show_dock = !self.ui.show_dock,
+                            "o" => {
+                                self.sim.show_orbits = !self.sim.show_orbits;
+                                self.sim.orbit_buf_valid = false;
+                            }
+                            ";" => {
+                                self.sim.show_debris_orbits = !self.sim.show_debris_orbits;
+                                self.sim.orbit_buf_valid = false;
+                            }
+                            "l" => self.ui.show_labels = !self.ui.show_labels,
+                            "u" => self.ui.units_si = !self.ui.units_si,
+                            "v" => self.sim.vsync = !self.sim.vsync,
+                            "b" => self.ui.show_list = !self.ui.show_list,
+                            "y" => self.ui.show_systems = !self.ui.show_systems,
+                            "e" => self.ui.show_events = !self.ui.show_events,
+                            "k" => self.ui.show_saves = !self.ui.show_saves,
+                            "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
+                            "f" | "0" => {
+                                let b = self.shared.lock_for_render();
+                                self.sim.fit(&b, vp);
+                            }
+                            "g" => self.ui.diag.visible = !self.ui.diag.visible,
+                            "c" => {
+                                if self.sim.selected.is_some() {
+                                    self.sim.follow = !self.sim.follow;
+                                }
+                            }
+                            "n" => {
+                                let b = self.shared.lock_for_render();
+                                self.sim.cycle_selection(&b, 1);
+                            }
+                            "p" => {
+                                let b = self.shared.lock_for_render();
+                                self.sim.cycle_selection(&b, -1);
+                            }
+                            "." => {
+                                let mut b = self.shared.lock_for_render();
+                                physics::advance(&mut b, physics::DT);
+                            }
+                            _ => {}
                         }
-                        "n" => {
-                            let b = self.shared.lock_for_render();
-                            self.sim.cycle_selection(&b, 1);
-                        }
-                        "p" => {
-                            let b = self.shared.lock_for_render();
-                            self.sim.cycle_selection(&b, -1);
-                        }
-                        "." => {
-                            let mut b = self.shared.lock_for_render();
-                            physics::advance(&mut b, physics::DT);
-                            self.sim.scene_dirty = true;
-                        }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -1546,6 +1730,7 @@ impl ApplicationHandler for App {
                         vsync: self.sim.vsync,
                         behind: self.shared.behind.load(Ordering::Relaxed),
                         pause_on_event: self.sim.pause_on_event,
+                        trails_enabled: self.sim.trail.cfg.enabled,
                         trail_age: self.sim.trail.cfg.max_age,
                         trail_bodies: self.sim.trail.cfg.max_bodies,
                         trail_non_rubble: self.sim.trail.cfg.non_rubble_only,
@@ -1632,7 +1817,6 @@ impl ApplicationHandler for App {
                         override_body,
                     );
                     self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
-                    let _ = std::mem::take(&mut self.sim.scene_dirty);
                     let t_comet0 = Instant::now();
                     comet_tail_verts = Vec::new();
                     self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
@@ -1647,6 +1831,15 @@ impl ApplicationHandler for App {
                 }
 
                 // ---- Everything below runs WITHOUT the bodies lock. ----
+                // Queued disk work (save write, save read). Inlined instead of
+                // `self.flush_io()` because `gfx` still borrows `self.gfx`.
+                if let Some(io) = self.sim.deferred_io.take() {
+                    io(&mut self.ui);
+                }
+                if let Some(name) = self.sim.pending_load.take() {
+                    self.sim.load_game(&name, &mut self.ui, &self.shared);
+                    self.idle_frames = 0;
+                }
                 if let Some((id, verts)) = orbit_out_taken {
                     gfx.renderer
                         .set_orbit_vertices(&gfx.device, &gfx.queue, &verts);
@@ -1659,7 +1852,7 @@ impl ApplicationHandler for App {
                     .set_comet_tail_vertices(&gfx.device, &gfx.queue, &comet_tail_verts);
                 if self.sim.trail.cfg.enabled {
                     self.sim.trail.update(&trail_snapshot);
-                    let verts = self.sim.trail.build_vertices();
+                    let verts = self.sim.trail.build_vertices(self.sim.cam);
                     gfx.renderer
                         .set_trail_vertices(&gfx.device, &gfx.queue, &verts);
                 } else if gfx.renderer.trail_count() > 0 {
@@ -1667,10 +1860,16 @@ impl ApplicationHandler for App {
                         .set_trail_vertices(&gfx.device, &gfx.queue, &[]);
                 }
 
-                let repaint_now = full_output
+                let repaint_delay = full_output
                     .viewport_output
                     .get(&egui::ViewportId::ROOT)
-                    .is_some_and(|v| v.repaint_delay.is_zero());
+                    .map(|v| v.repaint_delay);
+                let repaint_now = repaint_delay.is_some_and(|d| d.is_zero());
+                // A finite, non-zero delay (egui's `request_repaint_after`) must
+                // still wake an idle app. A huge delay means "no request".
+                self.repaint_at = repaint_delay
+                    .filter(|d| !d.is_zero() && *d < Duration::from_secs(3600))
+                    .map(|d| Instant::now() + d);
 
                 gfx.egui_state
                     .handle_platform_output(&gfx.window, full_output.platform_output);
@@ -1790,11 +1989,25 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.idle_frames < IDLE_FRAMES {
             if let Some(g) = &self.gfx {
                 g.window.request_redraw();
             }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        // Idle: sleep until input arrives, or until egui asked to repaint.
+        match self.repaint_at {
+            Some(t) if Instant::now() >= t => {
+                self.repaint_at = None;
+                if let Some(g) = &self.gfx {
+                    g.window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
