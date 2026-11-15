@@ -533,6 +533,8 @@ struct SimState {
     trail: TrailState,
     evolution_rate: f64,
     sn_kicks: bool,
+    /// Stellar aging speed relative to real time.
+    aging_mult: f64,
     mass_transfer: bool,
     /// Pause when a merger, impact or tidal break-up happens.
     pause_on_event: bool,
@@ -592,6 +594,7 @@ impl SimState {
             // happens to a star during a session.
             evolution_rate: physics::time_unit_s() / SECONDS_PER_GYR,
             sn_kicks: true,
+            aging_mult: 1.0,
             mass_transfer: true,
             pause_on_event: false,
             last_pause_events: 0,
@@ -905,6 +908,15 @@ impl SimState {
             self.cam = c;
             self.follow = false;
         }
+        if let Some([fx, fy, fr]) = act.focus {
+            self.cam = [fx, fy];
+            let half = 0.5 * vp[0].min(vp[1]) as f64;
+            self.zoom = ((half / (fr * 1.15).max(1.0)) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
+            self.follow = false;
+            self.follow_smooth = None;
+            self.orbit_buf_valid = false;
+            self.scene_dirty = true;
+        }
         if let Some(f) = act.follow {
             self.follow = f && self.selected.is_some();
         }
@@ -924,16 +936,41 @@ impl SimState {
                         self.selected = None;
                         self.follow = false;
                     }
-                    Edit::SpawnMoon => {
+                    Edit::SpawnMoon(n) => {
                         let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
-                        physics::spawn_moon(b, i, &mut rng);
+                        for _ in 0..n.clamp(1, 8) {
+                            physics::spawn_moon(b, i, &mut rng);
+                        }
                         b.rng = rng;
                         self.orbit_buf_valid = false;
                         self.scene_dirty = true;
                     }
-                    Edit::AddRing => {
+                    Edit::VelMul(f) => {
+                        // Scale the speed relative to the parent (or the
+                        // primary); with neither, scale the absolute speed.
+                        let refb = physics::find_parent(b, i)
+                            .or_else(|| physics::primary_index(b).filter(|&p| p != i));
+                        let (rvx, rvy) = match refb {
+                            Some(p) => (b.vx[p], b.vy[p]),
+                            None => (0.0, 0.0),
+                        };
+                        b.vx[i] = rvx + (b.vx[i] - rvx) * f;
+                        b.vy[i] = rvy + (b.vy[i] - rvy) * f;
+                        b.parent_cache_valid = false;
+                        self.orbit_buf_valid = false;
+                        self.scene_dirty = true;
+                    }
+                    Edit::Rename(name) => {
+                        let t = name.trim();
+                        b.name[i] = if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        };
+                    }
+                    Edit::AddRing(n) => {
                         let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
-                        physics::add_ring(b, i, 25, &mut rng);
+                        physics::add_ring(b, i, n.clamp(5, 200), &mut rng);
                         b.rng = rng;
                         self.orbit_buf_valid = false;
                         self.scene_dirty = true;
@@ -966,7 +1003,7 @@ impl SimState {
                         }
                         physics::delete_bodies(b, idx);
                     }
-                    Edit::SpawnMoon | Edit::AddRing => {}
+                    Edit::SpawnMoon(_) | Edit::AddRing(_) | Edit::VelMul(_) | Edit::Rename(_) => {}
                 }
                 self.orbit_buf_valid = false;
                 self.scene_dirty = true;
@@ -977,6 +1014,28 @@ impl SimState {
         }
         if let Some(v) = act.diag_visible {
             ui_state.diag.visible = v;
+        }
+        if let Some(v) = act.trail_age {
+            self.trail.cfg.max_age = v;
+        }
+        if let Some(v) = act.trail_bodies {
+            self.trail.cfg.max_bodies = v.max(1);
+        }
+        if let Some(v) = act.trail_non_rubble {
+            self.trail.cfg.non_rubble_only = v;
+        }
+        if let Some(v) = act.sn_kicks {
+            self.sn_kicks = v;
+            b.sn_kicks = v;
+        }
+        if let Some(v) = act.mass_transfer {
+            self.mass_transfer = v;
+            b.mass_transfer = v;
+        }
+        if let Some(v) = act.aging_mult {
+            self.aging_mult = v.max(1.0);
+            self.evolution_rate = physics::time_unit_s() / SECONDS_PER_GYR * self.aging_mult;
+            physics::set_evolution_rate(b, self.evolution_rate);
         }
         if let Some(p) = act.pause_on_event {
             self.pause_on_event = p;
@@ -1261,6 +1320,8 @@ impl ApplicationHandler for App {
                         "u" => self.ui.units_si = !self.ui.units_si,
                         "v" => self.sim.vsync = !self.sim.vsync,
                         "b" => self.ui.show_list = !self.ui.show_list,
+                        "y" => self.ui.show_systems = !self.ui.show_systems,
+                        "e" => self.ui.show_events = !self.ui.show_events,
                         "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
                         "f" | "0" => {
                             let b = self.shared.lock_for_render();
@@ -1485,6 +1546,12 @@ impl ApplicationHandler for App {
                         vsync: self.sim.vsync,
                         behind: self.shared.behind.load(Ordering::Relaxed),
                         pause_on_event: self.sim.pause_on_event,
+                        trail_age: self.sim.trail.cfg.max_age,
+                        trail_bodies: self.sim.trail.cfg.max_bodies,
+                        trail_non_rubble: self.sim.trail.cfg.non_rubble_only,
+                        sn_kicks: self.sim.sn_kicks,
+                        mass_transfer: self.sim.mass_transfer,
+                        aging_mult: self.sim.aging_mult,
                     };
                     full_output = gfx.egui_ctx.run(raw_input, |ctx| {
                         actions = ui::draw(ctx, &mut self.ui, &view_info, &b);

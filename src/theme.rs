@@ -5,28 +5,34 @@
 
 use egui::Color32;
 
-/// The four embedded font files.
+/// The embedded font files. `symbols` is a fallback that carries the
+/// astronomy and arrow glyphs that Inter and JetBrains Mono lack.
 pub struct EmbeddedFonts {
     pub mono_regular: &'static [u8],
     pub mono_bold: &'static [u8],
     pub sans_regular: &'static [u8],
     pub sans_medium: &'static [u8],
+    pub symbols: &'static [u8],
 }
 
 /// If a file is missing, `cargo build` fails with "couldn't read ...".
-/// That is the expected failure. Put the four .ttf files in `assets/fonts/`.
+/// That is the expected failure. Put the five .ttf files in `assets/fonts/`.
+/// `DejaVuSans.ttf` (free licence, see `LICENSE_DEJAVU`) is the symbol fallback.
 pub fn embedded_fonts() -> EmbeddedFonts {
     EmbeddedFonts {
         mono_regular: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
         mono_bold: include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"),
         sans_regular: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
         sans_medium: include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+        symbols: include_bytes!("../assets/fonts/DejaVuSans.ttf"),
     }
 }
 
 /// Register the fonts. JetBrains Mono leads the Monospace family and Inter
-/// leads the Proportional family. egui's built-in fonts stay behind them,
-/// so the symbols in the stats panel (★ ☾ ✦ ✹ ● ⊕ ☉ ☰) still render.
+/// leads the Proportional family. egui's built-in fonts stay behind them.
+/// DejaVu Sans goes last in both families. egui tries the fonts in order
+/// and uses the first one that has the glyph, so DejaVu only draws the
+/// symbols that no other font has (★ ☾ ✦ ✹ ● ⊕ ☉ ♃ ☰ ⚠ ▲ ▼ ▶ → ≥ ∞ and more).
 pub fn install_fonts(ctx: &egui::Context) {
     let f = embedded_fonts();
     let mut fonts = egui::FontDefinitions::default();
@@ -48,6 +54,10 @@ pub fn install_fonts(ctx: &egui::Context) {
         "inter-medium".to_owned(),
         egui::FontData::from_static(f.sans_medium),
     );
+    fonts.font_data.insert(
+        "dejavu-symbols".to_owned(),
+        egui::FontData::from_static(f.symbols),
+    );
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "jbm-regular".to_owned());
         mono.insert(1, "jbm-bold".to_owned());
@@ -55,6 +65,11 @@ pub fn install_fonts(ctx: &egui::Context) {
     if let Some(prop) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
         prop.insert(0, "inter-regular".to_owned());
         prop.insert(1, "inter-medium".to_owned());
+    }
+    for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.push("dejavu-symbols".to_owned());
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -151,5 +166,6 @@ mod tests {
         assert!(f.mono_bold.len() > 10_000);
         assert!(f.sans_regular.len() > 10_000);
         assert!(f.sans_medium.len() > 10_000);
+        assert!(f.symbols.len() > 10_000);
     }
 }

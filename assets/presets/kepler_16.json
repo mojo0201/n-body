@@ -19,6 +19,7 @@
     "planets": [
         {
             "name": "Kepler-16 b",
+            "host": "barycentre",
             "a_au": 0.7048,
             "e": 0.0069,
             "m_earth": 105.8,
@@ -26,6 +27,7 @@
         }
     ],
     "belts": {
+        "host": "barycentre",
         "belt_budget": 200,
         "total_mass_earth": 0.003,
         "outer": {

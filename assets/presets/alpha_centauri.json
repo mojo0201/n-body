@@ -25,5 +25,20 @@
             "age_gyr": 4.85
         }
     ],
-    "planets": []
+    "planets": [
+        {
+            "name": "Proxima d",
+            "host": "Proxima Centauri",
+            "a_au": 0.02885,
+            "e": 0.04,
+            "m_earth": 0.26
+        },
+        {
+            "name": "Proxima b",
+            "host": "Proxima Centauri",
+            "a_au": 0.0485,
+            "e": 0.02,
+            "m_earth": 1.07
+        }
+    ]
 }

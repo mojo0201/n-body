@@ -440,10 +440,6 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let inv_c2 = 1.0 / (c * c);
     let inv_c5 = inv_c2 * inv_c2 / c;
 
-    // PN only matters for pairs that include a host or compact object.
-    let hosts: Vec<usize> = (0..n)
-        .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
-        .collect();
     // When called from the block stepper, only update active bodies so
     // inactive bodies don't get PN added twice.
     let mask: Option<Vec<bool>> = active.map(|a| {

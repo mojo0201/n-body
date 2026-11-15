@@ -58,6 +58,7 @@
         }
     ],
     "belts": {
+        "host": "barycentre",
         "belt_budget": 80,
         "total_mass_earth": 1e-5,
         "outer": {

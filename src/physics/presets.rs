@@ -454,6 +454,7 @@ pub(super) fn default_dust_boost() -> f64 {
 /// concrete state via Kepler solves. The only non-declarative field is
 /// `dust_boost`, a display knob that scales the spawned dust cloud.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemPreset {
     pub name: String,
     /// Multiplies the initial dust density. Default 1.
@@ -477,9 +478,14 @@ pub(super) fn default_phase() -> f64 {
     0.5
 }
 
-/// A secondary star (or compact object) in a preset. Its `a_au` is the
-/// companion's semi-major axis about the primary, in the primary's frame.
+/// A secondary star (or compact object) in a preset.
+///
+/// Companions are placed in list order. Each `a_au` is the semi-major axis
+/// about the centre of mass of *everything already placed* (the primary plus
+/// earlier companions), so list inner companions first: Algol Aa2 (0.06 AU)
+/// before Algol Ab (2.7 AU), Alpha Cen B before Proxima.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompanionPreset {
     pub name: String,
     pub mass_earth: f64,
@@ -492,13 +498,21 @@ pub struct CompanionPreset {
     pub e: f64,
     #[serde(default = "default_phase")]
     pub phase: f64,
+    /// Argument of periapsis of the companion's orbit, degrees. Default 0.
+    #[serde(default)]
+    pub omega_deg: f64,
 }
 
 /// Belt definition inside a preset. The `mass_frac` fields inside `inner`
 /// and each outer population are *relative* to `total_mass_earth`; the
 /// spawner normalises them.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeltPreset {
+    /// Star the belt surrounds, by name, or "barycentre" for a circumbinary
+    /// belt. Absent = the primary (the old behaviour).
+    #[serde(default)]
+    pub host: Option<String>,
     pub total_mass_earth: f64,
     /// Number of belt bodies to spawn. Default is `PRESET_BELT_BUDGET`.
     #[serde(default)]
@@ -518,6 +532,7 @@ pub struct BeltPreset {
 /// are filled in by `BeltPreset::to_spec` with main-belt-typical values so
 /// that hand-edited JSON stays short.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InnerBeltPreset {
     pub a_lo_au: f64,
     pub a_hi_au: f64,
@@ -525,6 +540,7 @@ pub struct InnerBeltPreset {
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OuterBeltPreset {
     pub populations: Vec<PopulationPreset>,
 }
@@ -534,6 +550,7 @@ pub struct OuterBeltPreset {
 /// silently fall back to `cold_classical` so a typo doesn't abort the whole
 /// preset library load.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PopulationPreset {
     pub kind: String,
     pub a_lo_au: f64,
@@ -587,7 +604,7 @@ pub(super) fn parse_body_kind(s: Option<&str>, mass: f64) -> BodyKind {
 /// m_companion)`. This reproduces the two-body solution exactly and keeps
 /// any pre-existing planets glued to the primary's new position, since
 /// their offsets relative to the primary are unchanged.
-pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: f64) {
+pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: f64) -> usize {
     let n = b.len();
     let (mut mt, mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for i in 0..n {
@@ -602,7 +619,7 @@ pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: 
     let a_gm = c.a_au * au_in_gm();
     let m_anom = c.phase * std::f64::consts::TAU;
     let nu = true_anomaly(solve_kepler(m_anom, c.e), c.e);
-    let (rx, ry, rvx, rvy) = kepler_state(G * mt_total, a_gm, c.e, nu, 0.0);
+    let (rx, ry, rvx, rvy) = kepler_state(G * mt_total, a_gm, c.e, nu, c.omega_deg.to_radians());
     let f_in = c.mass_earth / mt_total;
     let f_out = mt / mt_total;
     for i in 0..n {
@@ -625,6 +642,74 @@ pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: 
     b.name[idx] = Some(c.name.clone());
     b.age_gyr[idx] = c.age_gyr.unwrap_or(default_age);
     b.set_mass(idx, c.mass_earth);
+    idx
+}
+
+/// Holman-Wiegert S-type limit (AU) for a planet around a preset star.
+/// `host` is `None` for the primary, `Some(k)` for `companions[k]`.
+fn s_type_limit_au(preset: &SystemPreset, host: Option<usize>) -> Option<f64> {
+    let m_star = preset.star.mass_earth;
+    let (c, m_host, m_other) = match host {
+        None => {
+            let c = preset.companions.first()?;
+            (c, m_star, c.mass_earth)
+        }
+        Some(k) => {
+            let c = preset.companions.get(k)?;
+            let inner = m_star
+                + preset.companions[..k]
+                    .iter()
+                    .map(|x| x.mass_earth)
+                    .sum::<f64>();
+            (c, c.mass_earth, inner)
+        }
+    };
+    Some(hw_critical_s(c.a_au, c.e, m_other / (m_host + m_other)))
+}
+
+/// Snow line (AU) for a host. Remnants use a fixed 3 AU, like
+/// `spawn_evolved_system`, since their geometric snow line is far too small.
+fn snow_line_for(b: &Bodies, host: usize) -> f64 {
+    match b.kind[host] {
+        BodyKind::WhiteDwarf | BodyKind::NeutronStar | BodyKind::BlackHole => 3.0,
+        _ => 2.7 * luminosity_of(b, host).max(1e-6).sqrt(),
+    }
+}
+
+/// Holman-Wiegert P-type limit (AU) about the first companion's binary.
+fn p_type_limit_au(preset: &SystemPreset) -> Option<f64> {
+    let c = preset.companions.first()?;
+    let mu = c.mass_earth / (preset.star.mass_earth + c.mass_earth);
+    Some(hw_critical_p(c.a_au, c.e, mu))
+}
+
+/// Innermost and outermost radius a belt preset spans, in AU.
+fn belt_extent_au(bp: &BeltPreset) -> Option<(f64, f64)> {
+    let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
+    if let Some(i) = &bp.inner {
+        lo = lo.min(i.a_lo_au);
+        hi = hi.max(i.a_hi_au);
+    }
+    if let Some(o) = &bp.outer {
+        for p in &o.populations {
+            lo = lo.min(p.a_lo_au);
+            hi = hi.max(p.a_hi_au);
+        }
+    }
+    (hi > 0.0).then_some((lo, hi))
+}
+
+/// Mass-weighted centre (x, y, vx, vy, total mass) of the given stars.
+fn host_barycentre(b: &Bodies, stars: &[usize]) -> (f64, f64, f64, f64, f64) {
+    let (mut mt, mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &i in stars {
+        mt += b.m[i];
+        cx += b.m[i] * b.x[i];
+        cy += b.m[i] * b.y[i];
+        vx += b.m[i] * b.vx[i];
+        vy += b.m[i] * b.vy[i];
+    }
+    (cx / mt, cy / mt, vx / mt, vy / mt, mt)
 }
 
 /// Push a planet that orbits the *barycentre* of the stellar hosts rather
@@ -671,12 +756,14 @@ pub(super) fn push_circumbinary(
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrojanPreset {
     pub giant_a_au: f64,
     pub mass_frac: f64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GapPreset {
     pub a_au: f64,
     pub width_au: f64,
@@ -715,7 +802,7 @@ impl BeltPreset {
                         "hot_classical" => BodyOrigin::KuiperHot,
                         "resonant" => BodyOrigin::KuiperResonant,
                         "scattered" => BodyOrigin::KuiperScattered,
-                        _ => BodyOrigin::KuiperCold,
+                        other => panic!("unknown belt population kind in preset: {other}"),
                     };
                     OuterPopulation {
                         kind,
@@ -761,6 +848,7 @@ impl BeltPreset {
 /// The primary of a preset system. `kind` is optional so simple presets
 /// (a plain Sun-like star) can just specify mass, age and metallicity.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StarPreset {
     #[serde(default)]
     pub name: Option<String>,
@@ -778,8 +866,16 @@ pub struct StarPreset {
 /// A planet in a preset. Orbits are expressed relative to the primary (or,
 /// for P-type planets, the binary barycentre).
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanetPreset {
     pub name: String,
+    /// Star this planet orbits, by name. "barycentre" forces a P-type orbit.
+    /// Absent = old behaviour (primary, or barycentre past the cutoff).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Argument of periapsis in degrees, counter-clockwise from +x. Default 0.
+    #[serde(default)]
+    pub omega_deg: f64,
     pub a_au: f64,
     pub e: f64,
     pub m_earth: f64,
@@ -808,6 +904,7 @@ pub struct PlanetPreset {
 /// Solar System moons are near-circular and a nonzero default would
 /// surprise anyone editing the JSON by hand.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoonPreset {
     pub name: String,
     /// Semi-major axis about the *planet*, in AU.
@@ -985,8 +1082,11 @@ pub fn load_presets() -> &'static [(String, SystemPreset)] {
         sources
             .iter()
             .map(|(name, json)| {
-                let preset = serde_json::from_str(json)
+                let preset: SystemPreset = serde_json::from_str(json)
                     .unwrap_or_else(|e| panic!("failed to parse preset {name}: {e}"));
+                if let Some(bp) = &preset.belts {
+                    let _ = bp.to_spec(); // panics on an unknown belt kind
+                }
                 ((*name).to_string(), preset)
             })
             .collect()
@@ -1065,8 +1165,22 @@ pub(super) fn spawn_from_preset_bodies(
     b.age_gyr[star] = preset.star.age_gyr;
     b.set_mass(star, preset.star.mass_earth);
 
-    for comp in &preset.companions {
-        place_companion(b, comp, preset.star.age_gyr);
+    // (name, body index, companion slot); slot is None for the primary.
+    let mut hosts: Vec<(String, usize, Option<usize>)> = Vec::with_capacity(n_stars);
+    let mut star_idxs: Vec<usize> = vec![star];
+    if let Some(n) = &preset.star.name {
+        hosts.push((n.clone(), star, None));
+    }
+    for (k, comp) in preset.companions.iter().enumerate() {
+        if k > 0 && comp.a_au < preset.companions[k - 1].a_au {
+            warnings.push(format!(
+                "preset: companion {} (a = {} AU) is listed after a wider one; list inner companions first",
+                comp.name, comp.a_au
+            ));
+        }
+        let ci = place_companion(b, comp, preset.star.age_gyr);
+        hosts.push((comp.name.clone(), ci, Some(k)));
+        star_idxs.push(ci);
     }
 
     // Planets farther than this from the primary are treated as
@@ -1078,7 +1192,7 @@ pub(super) fn spawn_from_preset_bodies(
         .first()
         .map(|c| c.a_au * HW_MARGIN_P)
         .unwrap_or(f64::INFINITY);
-    let snow_line = 2.7 * luminosity_of(b, star).max(1e-6).sqrt();
+    let snow_line = snow_line_for(b, star);
 
     for p in &preset.planets {
         // `phase: Some(..)` pins the mean anomaly without consuming an
@@ -1090,10 +1204,51 @@ pub(super) fn spawn_from_preset_bodies(
         } else {
             b.rng.next_f64() * std::f64::consts::TAU
         };
-        let idx = if p.a_au > p_type_cutoff {
+        let mut host_idx = star;
+        let mut host_slot: Option<usize> = None;
+        let mut forced_p = false;
+        match p.host.as_deref() {
+            None => {}
+            Some("barycentre") | Some("barycenter") => forced_p = true,
+            Some(name) => match hosts.iter().find(|(n, _, _)| n == name) {
+                Some(&(_, i, slot)) => {
+                    host_idx = i;
+                    host_slot = slot;
+                }
+                None => warnings.push(format!(
+                    "preset: planet {} names unknown host '{name}'; using the primary",
+                    p.name
+                )),
+            },
+        }
+        if p.host.is_some() && !forced_p {
+            if let Some(limit) = s_type_limit_au(preset, host_slot) {
+                if p.a_au > limit {
+                    warnings.push(format!(
+                        "preset: {} (a = {:.3} AU) is beyond the S-type stability limit of {:.3} AU for its host",
+                        p.name, p.a_au, limit
+                    ));
+                }
+            }
+        }
+        let circumbinary = forced_p || (p.host.is_none() && p.a_au > p_type_cutoff);
+        let idx = if circumbinary {
             push_circumbinary(b, p.a_au, p.e, p.m_earth, angle)
         } else {
-            push_orbit(b, star, p.a_au, p.e, p.m_earth, angle)
+            push_orbit_omega(
+                b,
+                host_idx,
+                p.a_au,
+                p.e,
+                p.m_earth,
+                angle,
+                p.omega_deg.to_radians(),
+            )
+        };
+        let planet_snow_line = if circumbinary || host_idx == star {
+            snow_line
+        } else {
+            snow_line_for(b, host_idx)
         };
         b.name[idx] = Some(p.name.clone());
         if p.is_dwarf {
@@ -1107,7 +1262,13 @@ pub(super) fn spawn_from_preset_bodies(
         b.origin[idx] = origin;
         // Class comes from the body's position relative to the snow line,
         // except comets which are always Icy regardless of where they sit.
-        b.class[idx] = class_for(origin, p.a_au, snow_line);
+        b.class[idx] = if p.m_earth >= GIANT_DENSITY_M_MIN && matches!(origin, BodyOrigin::Spawned)
+        {
+            // Same rule as `spawn_planet`: gas giants are Icy wherever they sit.
+            BodyClass::Icy
+        } else {
+            class_for(origin, p.a_au, planet_snow_line)
+        };
         let cls = b.class[idx];
         let rho = p
             .density_gcc
@@ -1140,12 +1301,47 @@ pub(super) fn spawn_from_preset_bodies(
     if let Some(belt_preset) = &preset.belts {
         let spec = belt_preset.to_spec();
         let belt_budget = belt_preset.belt_budget.unwrap_or(PRESET_BELT_BUDGET);
-        let centre = (b.x[star], b.y[star], b.vx[star], b.vy[star], b.m[star]);
+        let primary_centre = (b.x[star], b.y[star], b.vx[star], b.vy[star], b.m[star]);
+        let extent = belt_extent_au(belt_preset);
+        let (centre, belt_snow_line) = match belt_preset.host.as_deref() {
+            None => (primary_centre, snow_line),
+            Some("barycentre") | Some("barycenter") => {
+                if let (Some((lo, _)), Some(limit)) = (extent, p_type_limit_au(preset)) {
+                    if lo < limit {
+                        warnings.push(format!(
+                            "preset: circumbinary belt starts at {lo:.1} AU, inside the P-type limit of {limit:.1} AU"
+                        ));
+                    }
+                }
+                (host_barycentre(b, &star_idxs), snow_line)
+            }
+            Some(name) => match hosts.iter().find(|(n, _, _)| n == name) {
+                Some(&(_, i, slot)) => {
+                    if let (Some((_, hi)), Some(limit)) = (extent, s_type_limit_au(preset, slot)) {
+                        if hi > limit {
+                            warnings.push(format!(
+                                "preset: belt reaches {hi:.1} AU, beyond the S-type limit of {limit:.1} AU for its host"
+                            ));
+                        }
+                    }
+                    (
+                        (b.x[i], b.y[i], b.vx[i], b.vy[i], b.m[i]),
+                        2.7 * luminosity_of(b, i).max(1e-6).sqrt(),
+                    )
+                }
+                None => {
+                    warnings.push(format!(
+                        "preset: belt names unknown host '{name}'; using the primary"
+                    ));
+                    (primary_centre, snow_line)
+                }
+            },
+        };
         // Swap the RNG out and back so belt draws do not perturb the
         // planet-draw sequence. Reproducibility of planet phases across
         // belt-presence changes is a hard requirement for preset tests.
         let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
-        spawn_belts(b, centre, &spec, snow_line, belt_budget, &mut rng);
+        spawn_belts(b, centre, &spec, belt_snow_line, belt_budget, &mut rng);
         b.rng = rng;
     }
 
@@ -1226,13 +1422,27 @@ pub(super) fn push_orbit(
     m_me: f64,
     mean_anomaly: f64,
 ) -> usize {
+    push_orbit_omega(b, sun, a_au, e, m_me, mean_anomaly, 0.0)
+}
+
+/// `push_orbit` with an argument of periapsis `omega` in radians,
+/// counter-clockwise from +x. `omega = 0.0` reproduces the old behaviour.
+pub(super) fn push_orbit_omega(
+    b: &mut Bodies,
+    sun: usize,
+    a_au: f64,
+    e: f64,
+    m_me: f64,
+    mean_anomaly: f64,
+    omega: f64,
+) -> usize {
     let a = a_au * au_in_gm();
     // Include the orbiter's mass so a close-in moon of a comparable-mass
     // planet (Charon about Pluto) gets the right period.
     let mu = G * (b.m[sun] + m_me);
     // The angle is a mean anomaly, so the phase is uniform in time.
     let nu = true_anomaly(solve_kepler(mean_anomaly, e), e);
-    let (x, y, vx, vy) = kepler_state(mu, a, e, nu, 0.0);
+    let (x, y, vx, vy) = kepler_state(mu, a, e, nu, omega);
     let (sx, sy, svx, svy) = (b.x[sun], b.y[sun], b.vx[sun], b.vy[sun]);
     b.push(sx + x, sy + y, svx + vx, svy + vy, m_me, BodyKind::Planet)
 }

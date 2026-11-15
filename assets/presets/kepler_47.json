@@ -19,6 +19,7 @@
     "planets": [
         {
             "name": "Kepler-47 b",
+            "host": "barycentre",
             "a_au": 0.2879,
             "e": 0.0,
             "m_earth": 8.0,

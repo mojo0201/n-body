@@ -328,22 +328,90 @@ pub(super) fn find_collisions_hot(
 /// tested too.
 fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
     let t_now = b.time;
-    let mut in_hot = vec![false; b.len()];
+    let n = b.len();
+    let mut in_hot = vec![false; n];
     for &i in hot {
         in_hot[i] = true;
     }
+    let live_hot: Vec<usize> = hot
+        .iter()
+        .copied()
+        .filter(|&i| !b.dead[i] && t_now >= b.imm[i])
+        .collect();
+    let cold: Vec<usize> = (0..n)
+        .filter(|&j| !in_hot[j] && !b.dead[j] && t_now >= b.imm[j])
+        .collect();
+    if live_hot.is_empty() || cold.is_empty() {
+        return Vec::new();
+    }
+
+    // Grid cell edge: static overlap (2 x largest contact radius) plus one
+    // sub-step of motion for both bodies, the same sizing rule as
+    // `find_collisions_hot`. Any pair that `pair_hit_rr` can accept lies
+    // within one cell of each other, so a 3x3 probe never misses a hit.
+    let mut max_cr = 0.0f64;
+    let mut max_disp_sq = 0.0f64;
+    for &i in live_hot.iter().chain(cold.iter()) {
+        max_cr = max_cr.max(b.contact_r(i));
+        let ddx = b.x[i] - b._px[i];
+        let ddy = b.y[i] - b._py[i];
+        max_disp_sq = max_disp_sq.max(ddx * ddx + ddy * ddy);
+    }
+    let cell = ((2.0 * max_cr + 2.0 * max_disp_sq.sqrt()) * 1.0001).max(1e-4);
+    let inv = 1.0 / cell;
+
+    let nc = cold.len();
+    let table = (2 * nc).next_power_of_two().max(16);
+    let shift = 64 - table.trailing_zeros();
+    let bucket = |cx: i64, cy: i64| (cell_key(cx, cy) >> shift) as usize;
+
+    // Counting-sort bucket table over the cold bodies (same scheme as
+    // `find_collisions_hot`): hash collisions only add a few extra distance
+    // checks, they never lose a pair.
+    let cells: Vec<(i64, i64)> = cold
+        .iter()
+        .map(|&j| ((b.x[j] * inv).floor() as i64, (b.y[j] * inv).floor() as i64))
+        .collect();
+    let radii: Vec<f64> = cold.iter().map(|&j| b.contact_r(j)).collect();
+    let mut start = vec![0u32; table + 1];
+    for &(cx, cy) in &cells {
+        start[bucket(cx, cy) + 1] += 1;
+    }
+    for k in 0..table {
+        start[k + 1] += start[k];
+    }
+    let mut fill: Vec<u32> = start[..table].to_vec();
+    let mut items = vec![0u32; nc];
+    for (p, &(cx, cy)) in cells.iter().enumerate() {
+        let k = bucket(cx, cy);
+        items[fill[k] as usize] = p as u32;
+        fill[k] += 1;
+    }
+
     let mut out = Vec::new();
-    for &i in hot {
-        if b.dead[i] || t_now < b.imm[i] {
-            continue;
-        }
+    for &i in &live_hot {
         let ri = b.contact_r(i);
-        for j in 0..b.len() {
-            if in_hot[j] || b.dead[j] || t_now < b.imm[j] {
-                continue;
-            }
-            if pair_hit_rr(b, i, j, ri + b.contact_r(j), true) {
-                out.push((i.min(j), i.max(j)));
+        let cx = (b.x[i] * inv).floor() as i64;
+        let cy = (b.y[i] * inv).floor() as i64;
+        // Several of the 9 neighbour cells can hash to one bucket: scan
+        // each bucket once per body.
+        let mut seen = [usize::MAX; 9];
+        let mut ns = 0;
+        for ddx in -1..=1i64 {
+            for ddy in -1..=1i64 {
+                let k = bucket(cx + ddx, cy + ddy);
+                if seen[..ns].contains(&k) {
+                    continue;
+                }
+                seen[ns] = k;
+                ns += 1;
+                for &q in &items[start[k] as usize..start[k + 1] as usize] {
+                    let q = q as usize;
+                    let j = cold[q];
+                    if pair_hit_rr(b, i, j, ri + radii[q], true) {
+                        out.push((i.min(j), i.max(j)));
+                    }
+                }
             }
         }
     }
@@ -817,8 +885,7 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
             merge(b, i, j);
             b.stats.coalesces += 1;
             return;
-        }
-        if ratio < RUBBLE_BOUNCE_VRATIO {
+        } else if ratio < RUBBLE_BOUNCE_VRATIO {
             rubble_bounce(b, i, j, rr);
             return;
         }
