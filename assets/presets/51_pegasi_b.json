@@ -1,73 +1,73 @@
 {
-    "name": "51 Pegasi b",
-    "dust_boost": 0.5,
-    "star": {
-        "mass_earth": 349593.0,
-        "age_gyr": 7.6,
-        "metallicity": 0.20
-    },
-    "planets": [
-        {
-            "name": "b",
-            "a_au": 0.0527,
-            "e": 0.013,
-            "m_earth": 149.4,
-            "density_gcc": 0.29
-        }
-    ],
-    "belts": {
-        "belt_budget": 2500,
-        "total_mass_earth": 0.01,
-        "inner": {
-            "a_lo_au": 0.075,
-            "a_hi_au": 0.25,
-            "mass_frac": 0.02
-        },
-        "outer": {
-            "populations": [
-                {
-                    "kind": "hot_classical",
-                    "a_lo_au": 0.5,
-                    "a_hi_au": 5.0,
-                    "mass_frac": 0.17,
-                    "e_sigma": 0.12
-                },
-                {
-                    "kind": "cold_classical",
-                    "a_lo_au": 5.0,
-                    "a_hi_au": 30.0,
-                    "mass_frac": 0.76,
-                    "e_sigma": 0.05
-                },
-                {
-                    "kind": "scattered",
-                    "a_lo_au": 30.0,
-                    "a_hi_au": 60.0,
-                    "mass_frac": 0.04,
-                    "e_sigma": 0.30,
-                    "q_frac": 25.0
-                }
-            ]
-        },
-        "trojans": [
-            {
-                "giant_a_au": 0.0527,
-                "mass_frac": 0.01
-            }
-        ],
-        "gaps": [
-            {
-                "a_au": 0.0837,
-                "width_au": 0.004
-            },
-            {
-                "a_au": 0.1096,
-                "width_au": 0.005
-            },
-            {
-                "a_au": 0.1328,
-                "width_au": 0.006
-            }
-        ]
+  "name": "51 Pegasi b",
+  "dust_boost": 0.5,
+  "star": {
+    "mass_earth": 362911.193083,
+    "age_gyr": 4.8,
+    "metallicity": 0.18
+  },
+  "planets": [
+    {
+      "name": "b",
+      "a_au": 0.0527,
+      "e": 0.013,
+      "m_earth": 193.87508,
+      "density_gcc": 0.29
     }
+  ],
+  "belts": {
+    "belt_budget": 2500,
+    "total_mass_earth": 0.01,
+    "inner": {
+      "a_lo_au": 0.075,
+      "a_hi_au": 0.25,
+      "mass_frac": 0.02
+    },
+    "outer": {
+      "populations": [
+        {
+          "kind": "hot_classical",
+          "a_lo_au": 0.5,
+          "a_hi_au": 5.0,
+          "mass_frac": 0.17,
+          "e_sigma": 0.12
+        },
+        {
+          "kind": "cold_classical",
+          "a_lo_au": 5.0,
+          "a_hi_au": 30.0,
+          "mass_frac": 0.76,
+          "e_sigma": 0.05
+        },
+        {
+          "kind": "scattered",
+          "a_lo_au": 30.0,
+          "a_hi_au": 60.0,
+          "mass_frac": 0.04,
+          "e_sigma": 0.3,
+          "q_frac": 25.0
+        }
+      ]
+    },
+    "trojans": [
+      {
+        "giant_a_au": 0.0527,
+        "mass_frac": 0.01
+      }
+    ],
+    "gaps": [
+      {
+        "a_au": 0.0837,
+        "width_au": 0.004
+      },
+      {
+        "a_au": 0.1096,
+        "width_au": 0.005
+      },
+      {
+        "a_au": 0.1328,
+        "width_au": 0.006
+      }
+    ]
+  }
 }

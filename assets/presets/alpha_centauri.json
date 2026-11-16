@@ -1,44 +1,44 @@
 {
-    "name": "Alpha Centauri",
-    "dust_boost": 0.5,
-    "star": {
-        "name": "α Centauri A",
-        "mass_earth": 359182.0,
-        "age_gyr": 6.22,
-        "metallicity": 0.26
+  "name": "Alpha Centauri",
+  "dust_boost": 0.5,
+  "star": {
+    "name": "α Centauri A",
+    "mass_earth": 359182.0,
+    "age_gyr": 6.22,
+    "metallicity": 0.26
+  },
+  "companions": [
+    {
+      "name": "α Centauri B",
+      "mass_earth": 302714.0,
+      "a_au": 23.3,
+      "e": 0.5195,
+      "phase": 0.892,
+      "age_gyr": 6.22
     },
-    "companions": [
-        {
-            "name": "α Centauri B",
-            "mass_earth": 302714.0,
-            "a_au": 23.30,
-            "e": 0.5195,
-            "phase": 0.892,
-            "age_gyr": 6.22
-        },
-        {
-            "name": "Proxima Centauri",
-            "mass_earth": 40652.0,
-            "a_au": 8700.0,
-            "e": 0.5,
-            "phase": 0.5,
-            "age_gyr": 4.85
-        }
-    ],
-    "planets": [
-        {
-            "name": "Proxima d",
-            "host": "Proxima Centauri",
-            "a_au": 0.02885,
-            "e": 0.04,
-            "m_earth": 0.26
-        },
-        {
-            "name": "Proxima b",
-            "host": "Proxima Centauri",
-            "a_au": 0.0485,
-            "e": 0.02,
-            "m_earth": 1.07
-        }
-    ]
+    {
+      "name": "Proxima Centauri",
+      "mass_earth": 40652.0,
+      "a_au": 8700.0,
+      "e": 0.5,
+      "phase": 0.5,
+      "age_gyr": 4.85
+    }
+  ],
+  "planets": [
+    {
+      "name": "Proxima d",
+      "host": "Proxima Centauri",
+      "a_au": 0.02881,
+      "e": 0.04,
+      "m_earth": 0.26
+    },
+    {
+      "name": "Proxima b",
+      "host": "Proxima Centauri",
+      "a_au": 0.04848,
+      "e": 0.02,
+      "m_earth": 1.055
+    }
+  ]
 }

@@ -1,27 +1,27 @@
 {
-    "name": "Algol",
-    "dust_boost": 0.3,
-    "star": {
-        "name": "Algol Aa1",
-        "mass_earth": 1055439.0,
-        "age_gyr": 0.5,
-        "metallicity": 0.0
+  "name": "Algol",
+  "dust_boost": 0.3,
+  "star": {
+    "name": "Algol Aa1",
+    "mass_earth": 1055438.974379,
+    "age_gyr": 0.57,
+    "metallicity": 0.0
+  },
+  "companions": [
+    {
+      "name": "Algol Aa2",
+      "mass_earth": 233062.23409,
+      "a_au": 0.062,
+      "e": 0.0,
+      "phase": 0.0
     },
-    "companions": [
-        {
-            "name": "Algol Aa2",
-            "mass_earth": 233062.0,
-            "a_au": 0.062,
-            "e": 0.0,
-            "phase": 0.0
-        },
-        {
-            "name": "Algol Ab",
-            "mass_earth": 585985.0,
-            "a_au": 2.69,
-            "e": 0.227,
-            "phase": 0.5
-        }
-    ],
-    "planets": []
+    {
+      "name": "Algol Ab",
+      "mass_earth": 585985.045712,
+      "a_au": 2.69,
+      "e": 0.227,
+      "phase": 0.5
+    }
+  ],
+  "planets": []
 }
