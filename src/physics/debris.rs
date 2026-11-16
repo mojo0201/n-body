@@ -614,6 +614,9 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
     let cd2 = CULL_DIST * CULL_DIST;
     let hcd2 = HARD_CULL_DIST * HARD_CULL_DIST;
     let v_esc_sq = 2.0 * G * prim_m;
+    let hosts: Vec<usize> = (0..n)
+        .filter(|&i| !b.dead[i] && is_host_kind(b.kind[i]))
+        .collect();
 
     let mut gone: Vec<usize> = Vec::new();
     let mut promoted: Vec<usize> = Vec::new();
@@ -623,6 +626,16 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
         }
         let d2 = b.x[i] * b.x[i] + b.y[i] * b.y[i];
         if d2 < cd2 {
+            continue;
+        }
+        // A planet near any host star is not an escapee, even if that
+        // star is far from the origin (wide companions, e.g. Proxima).
+        let near_host = hosts.iter().any(|&h| {
+            let dx = b.x[i] - b.x[h];
+            let dy = b.y[i] - b.y[h];
+            dx * dx + dy * dy < cd2
+        });
+        if near_host {
             continue;
         }
         let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];

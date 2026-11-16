@@ -1585,12 +1585,40 @@ impl ApplicationHandler for App {
                 if response.consumed || gfx.egui_ctx.is_pointer_over_area() {
                     return;
                 }
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 30.0,
+                let zoom_mod = self.mods.control_key()
+                    || self.mods.super_key()
+                    || self.mods.shift_key()
+                    || self.mods.alt_key();
+                // Convert to pixels. A mouse wheel sends whole lines on the
+                // y axis only. A touchpad sends fractions or sideways motion.
+                let (dx, dy, touchpad) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (x * 30.0, y * 30.0, x != 0.0 || y.fract() != 0.0)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
+                if zoom_mod || !touchpad {
+                    // Mouse wheel, or Ctrl/Cmd with scroll (a pinch on
+                    // Windows and Linux): zoom at the cursor.
+                    let cursor = self.sim.cursor;
+                    let dz = if dy.abs() >= dx.abs() { dy } else { dx };
+                    self.sim.zoom_at((dz / 30.0 * 0.15).exp(), cursor, vp);
+                } else {
+                    // Two-finger scroll: pan, like a phone.
+                    self.sim.cam[0] -= dx as f64 / self.sim.zoom as f64;
+                    self.sim.cam[1] -= dy as f64 / self.sim.zoom as f64;
+                    self.sim.follow = false;
+                    self.sim.follow_smooth = None;
+                }
+            }
+
+            // macOS pinch gesture. `delta` is the fractional change in scale.
+            WindowEvent::PinchGesture { delta, .. } => {
+                if response.consumed || gfx.egui_ctx.is_pointer_over_area() {
+                    return;
+                }
                 let cursor = self.sim.cursor;
-                self.sim.zoom_at((dy * 0.15).exp(), cursor, vp);
+                self.sim.zoom_at((delta as f32).exp(), cursor, vp);
             }
 
             WindowEvent::RedrawRequested => {
