@@ -467,6 +467,10 @@ fn bh_trace(p: vec2<f32>) -> vec4<f32> {
         if u >= 1.0 || u <= 0.0 {
             break; // fell in, or escaped
         }
+        // Moving outward and already past the disk edge: no more crossings.
+        if du < 0.0 && u < 1.0 / BH_R_OUT {
+            break;
+        }
     }
     return vec4<f32>(acc, acc_a);
 }

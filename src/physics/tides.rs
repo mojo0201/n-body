@@ -173,10 +173,16 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         let new_dvx = new_vr * ux - new_vt * uy;
         let new_dvy = new_vr * uy + new_vt * ux;
 
-        // For star–planet pairs m_p ≪ m_*, so the host's recoil velocity
-        // is negligible; only the planet's velocity is updated.
+        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
         b.vx[j] += new_dvx - dvx;
         b.vy[j] += new_dvy - dvy;
+        // Positions and masses do not change, so the energy change is the
+        // planet's kinetic-energy change. If a snapshot is pending,
+        // `settle_energy` already counts it. Do not count it twice.
+        if b.e_pre.is_none() {
+            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
+            b.stats.energy_offset += ke1 - ke0;
+        }
 
         // Orbital angular momentum about the pair's COM is μ_red·r·v_t.
         // Its change is μ_red·r·(new_vt − vt) = −½·frac·μ_red·r·v_t,

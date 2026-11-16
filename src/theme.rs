@@ -30,12 +30,16 @@ pub fn embedded_fonts() -> EmbeddedFonts {
 
 /// Named family for Inter Medium (section headings).
 pub fn medium() -> egui::FontFamily {
-    egui::FontFamily::Name("inter-medium".into())
+    static F: std::sync::OnceLock<egui::FontFamily> = std::sync::OnceLock::new();
+    F.get_or_init(|| egui::FontFamily::Name("inter-medium".into()))
+        .clone()
 }
 
 /// Named family for JetBrains Mono Bold (panel title).
 pub fn bold_mono() -> egui::FontFamily {
-    egui::FontFamily::Name("jbm-bold".into())
+    static F: std::sync::OnceLock<egui::FontFamily> = std::sync::OnceLock::new();
+    F.get_or_init(|| egui::FontFamily::Name("jbm-bold".into()))
+        .clone()
 }
 
 /// Register the fonts. JetBrains Mono Regular leads the Monospace family and

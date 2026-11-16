@@ -52,7 +52,7 @@ pub struct Tree {
     pub(super) nodes: Vec<Node>,
 }
 
-/// Stable partition of `idx` so that all elements satisfying `pred` come
+/// Unstable partition of `idx` so that all elements satisfying `pred` come
 /// first. Returns the split point. Works in place with a single pass.
 pub(super) fn partition_in_place(idx: &mut [u32], mut pred: impl FnMut(u32) -> bool) -> usize {
     let mut lo = 0;
@@ -222,19 +222,9 @@ pub(super) fn build_subtree(
 ) -> Vec<Node> {
     let n_here = indices.len();
 
-    // Empty quadrant: phantom zero-mass node so traversal cost/behaviour
-    // matches the serial baseline.
+    // Empty quadrant: no node. The parent keeps its child slot at -1.
     if n_here == 0 {
-        return vec![Node {
-            cx,
-            cy,
-            size,
-            m: 0.0,
-            com_x: cx,
-            com_y: cy,
-            body: -1,
-            children: [-1; 4],
-        }];
+        return Vec::new();
     }
 
     // Single body: leaf.

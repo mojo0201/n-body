@@ -1,4 +1,4 @@
-//! Seed encoding (base62) and the splitmix32 RNG core.
+//! Seed encoding (base62) and the mulberry32 RNG core.
 //!
 //! Seeds are 16 base62 characters, big-endian and zero-padded, giving
 //! `62^16 ≈ 4.77e28` distinct values — just under 2^96, so a `u128` holds
@@ -31,7 +31,7 @@ fn decode_byte(c: u8) -> Option<u64> {
 }
 
 /// Largest value expressible in `SEED_LEN` base62 chars.
-/// Formatting clamps to this so a caller that hands you any `u128`
+/// Formatting wraps modulo this so a caller that hands you any `u128`
 /// still gets a round-trippable string.
 pub const SEED_SPACE: u128 = 62u128.pow(SEED_LEN as u32); // 62^16
 
@@ -43,7 +43,7 @@ pub fn seed_to_base62(mut seed: u128) -> String {
         buf[k] = SEED_ALPHABET[(seed % 62) as usize];
         seed /= 62;
     }
-    unsafe { String::from_utf8_unchecked(buf.into()) }
+    buf.iter().map(|&c| c as char).collect()
 }
 
 /// Parse a base62 seed of 1 to `SEED_LEN` characters.

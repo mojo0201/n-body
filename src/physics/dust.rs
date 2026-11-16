@@ -22,7 +22,7 @@ use super::*;
 /// Tracers released per belt/rubble body at start-up (capped by the budget).
 pub const DUST_GRAINS_PER_BODY: usize = 60;
 /// Hard cap per field.
-pub const DUST_MAX_GRAINS: usize = 500_000;
+pub const DUST_MAX_GRAINS: usize = 256_000;
 /// Tracers emitted by one collision.
 pub const DUST_EMIT_GRAINS: usize = 80;
 /// Ejection speed of collision dust, as a fraction of local circular speed.
@@ -559,6 +559,7 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
         let dm = BELT_GRIND_CHUNK * m;
         let r = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).max(1e-6);
         let vc = (mu / r).sqrt();
+        mark_energy(b);
         b.set_mass(i, m - dm);
         f.emit(
             (b.x[i], b.y[i], b.vx[i], b.vy[i]),

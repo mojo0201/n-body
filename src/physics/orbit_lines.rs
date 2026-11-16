@@ -188,7 +188,8 @@ pub fn compute_orbit_segments(
     let svx = b.vx[si];
     let svy = b.vy[si];
     let sm = b.m[si];
-    let hosts = host_list(b);
+    let ctx = build_parent_context(b);
+    let hosts = &ctx.hosts;
 
     // First pass: count visible bodies so the stride and capacity below are
     // exact. Cheap — one branch and one counter per body.
@@ -249,7 +250,8 @@ pub fn compute_orbit_segments(
         }
 
         // Use the nearest host (or the primary) as the two-body focus.
-        let (rx, ry, rvx, rvy, rm) = orbit_reference(b, &hosts, i, (sx, sy, svx, svy, sm));
+        let (rx, ry, rvx, rvy, rm) =
+            orbit_reference_cached(b, hosts, &ctx.partners, i, (sx, sy, svx, svy, sm));
 
         let Some(el) = compute_orbit_ellipse(b, i, rx, ry, rvx, rvy, rm, zoom) else {
             continue;

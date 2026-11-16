@@ -32,37 +32,27 @@ pub(super) const DIRECT_CHUNK: usize = 2048;
 /// `j == i` branch through the hot loop. This is the canonical serial
 /// path: its fp order defines what the parallel variants must reproduce.
 pub(super) fn force_direct_on(b: &Bodies, i: usize) -> (f64, f64, f64) {
-    let n = b.len();
-    let (xs, ys, ms) = (&b.x[..n], &b.y[..n], &b.m[..n]);
-    let (vxs, vys) = (&b.vx[..n], &b.vy[..n]);
-    let xi = xs[i];
-    let yi = ys[i];
-    let mi = ms[i];
-    let vxi = vxs[i];
-    let vyi = vys[i];
-    let mut sx = 0.0;
-    let mut sy = 0.0;
-    let mut s_max = 0.0f64;
-    let mut w_max = 0.0f64;
-
-    for j in (0..i).chain((i + 1)..n) {
-        let mj = ms[j];
-        let dx = xs[j] - xi;
-        let dy = ys[j] - yi;
-        let d2 = dx * dx + dy * dy + SOFT2;
-        let d = d2.sqrt();
-        let inv = 1.0 / (d2 * d);
-        let f = G * mj * inv;
-        sx += f * dx;
-        sy += f * dy;
-        let s = (mi + mj) * inv;
-        let dvx = vxs[j] - vxi;
-        let dvy = vys[j] - vyi;
-        let w = (dvx * dvx + dvy * dvy) * inv * d;
-        s_max = s_max.max(s);
-        w_max = w_max.max(w);
+    let (mut sx, mut sy, mut s_max, mut w_max) = (0.0, 0.0, 0.0f64, 0.0f64);
+    for (lo, hi) in direct_bounds(i, b.len()) {
+        let c = force_direct_range(b, i, lo..hi);
+        sx += c.0;
+        sy += c.1;
+        s_max = s_max.max(c.2);
+        w_max = w_max.max(c.3);
     }
     (sx, sy, dt_limit(s_max, w_max))
+}
+
+/// Chunk bounds over `[0, n) \ {i}` in ascending order. The serial and
+/// parallel paths both use this, so both add partial sums in the same order.
+fn direct_bounds(i: usize, n: usize) -> impl Iterator<Item = (usize, usize)> {
+    let head = (0..i)
+        .step_by(DIRECT_CHUNK)
+        .map(move |lo| (lo, (lo + DIRECT_CHUNK).min(i)));
+    let tail = ((i + 1)..n)
+        .step_by(DIRECT_CHUNK)
+        .map(move |lo| (lo, (lo + DIRECT_CHUNK).min(n)));
+    head.chain(tail)
 }
 
 /// One contiguous slab of the j-loop, for `force_direct_on_parallel`.
@@ -117,20 +107,7 @@ pub(super) fn force_direct_range(
 pub(super) fn force_direct_on_parallel(b: &Bodies, i: usize) -> (f64, f64, f64) {
     let n = b.len();
 
-    // Emit chunk boundaries in ascending j order, skipping i itself.
-    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(n / DIRECT_CHUNK + 2);
-    let mut lo = 0;
-    while lo < i {
-        let hi = (lo + DIRECT_CHUNK).min(i);
-        bounds.push((lo, hi));
-        lo = hi;
-    }
-    lo = i + 1;
-    while lo < n {
-        let hi = (lo + DIRECT_CHUNK).min(n);
-        bounds.push((lo, hi));
-        lo = hi;
-    }
+    let bounds: Vec<(usize, usize)> = direct_bounds(i, n).collect();
 
     let chunks: Vec<(f64, f64, f64, f64)> = bounds
         .par_iter()

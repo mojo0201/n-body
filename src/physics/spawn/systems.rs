@@ -80,21 +80,6 @@ pub(in crate::physics) fn inner_edge_au(p0: f64, mass: f64, r_star_au: f64) -> f
     (a0_gm / au_in_gm()).max(5.0 * r_star_au).max(0.005)
 }
 
-/// Intersect `[lo, hi]` with the allowed `[a_lo, a_hi]`; if they miss,
-/// fall back to the nearest part of the allowed range. Currently unused
-/// (`#[allow(dead_code)]`) — kept as a utility for callers that need it.
-#[allow(dead_code)]
-pub(in crate::physics) fn fit_range(lo: f64, hi: f64, a_lo: f64, a_hi: f64) -> (f64, f64) {
-    let (l, h) = (lo.max(a_lo), hi.min(a_hi));
-    if l < h {
-        (l, h)
-    } else if hi < a_lo {
-        (a_lo, (a_lo * 1.6).min(a_hi))
-    } else {
-        ((a_hi * 0.5).max(a_lo), a_hi)
-    }
-}
-
 pub(in crate::physics) fn spawn_ms_frame(
     b: &mut Bodies,
     fr: &Frame,
@@ -110,10 +95,10 @@ pub(in crate::physics) fn spawn_ms_frame(
     // hot inner systems still get a physically distinct volatile zone.
     let snow_line_au = (2.7 * fr.lum.sqrt()).max(inner_au * 3.0);
 
-    // Giant occurrence scales as 10^(1.5 [Fe/H]) (Fischer & Valenti 2005).
+    // Giant occurrence scales as 10^(2.0 [Fe/H]) (Fischer & Valenti 2005).
     // Small planets show no such trend (Buchhave 2012) — apply to giants
     // only, never to the compact chain.
-    let giant_occ = fr.occ_scale * 10f64.powf(1.5 * b.metallicity);
+    let giant_occ = fr.occ_scale * 10f64.powf(2.0 * b.metallicity);
 
     // ---- Planet-count classes ----
     let max_planets_here = MAX_PLANETS.min(remaining);
@@ -128,7 +113,9 @@ pub(in crate::physics) fn spawn_ms_frame(
     } else {
         1.0
     }) * fr.occ_scale;
-    let mut n_compact = if rng.next_f64() < P_COMPACT_CHAIN {
+    // M dwarfs host more compact chains (Dressing & Charbonneau 2015).
+    let p_chain = if m_sun < 0.5 { 0.60 } else { P_COMPACT_CHAIN };
+    let mut n_compact = if rng.next_f64() < p_chain {
         (2 + poisson(rng, (compact_mean - 1.0).max(0.1))).min(max_planets_here)
     } else {
         0
@@ -139,7 +126,16 @@ pub(in crate::physics) fn spawn_ms_frame(
 
     // Giants, and the fraction of giant hosts that are "unstable" (packed
     // inside mutual Hill stability so the system will scatter).
-    let has_giant = rng.next_f64() < (0.20 * giant_occ).min(0.95);
+    // Giant occurrence rises with host mass (Johnson 2010: f ~ M*). The base
+    // value of 0.12 gives about 18 % for Sun-like stars after the mean
+    // metallicity boost of 1.53 (Cumming 2008: 17-20 % within 20 AU).
+    let giant_mass_scale = m_sun.clamp(0.1, 2.0);
+    let has_giant = rng.next_f64() < (0.12 * giant_occ * giant_mass_scale).min(0.95);
+    // Giant hosts are about twice as likely to have inner super-Earths
+    // (Bryan 2019; Zhu & Wu 2018).
+    if has_giant && n_compact == 0 && rng.next_f64() < 0.30 {
+        n_compact = (2 + poisson(rng, (compact_mean - 1.0).max(0.1))).min(compact_cap);
+    }
     let p_second = (0.10 * giant_occ).min(0.5);
     let unstable_giants = has_giant && rng.next_f64() < P_UNSTABLE_GIANTS;
     let n_giants = if unstable_giants {
@@ -162,7 +158,7 @@ pub(in crate::physics) fn spawn_ms_frame(
     // Orbit is capped at P ~ 7 d (a = 0.07 AU · m^(1/3)); without the cap the
     // inner-edge scaling alone would reach ~0.5 AU for some hosts.
     let hj_frac = if (0.5..2.0).contains(&m_sun) {
-        0.01
+        0.006
     } else {
         0.001
     };
@@ -191,6 +187,7 @@ pub(in crate::physics) fn spawn_ms_frame(
     let sys_scale = sample_normal(rng, 0.0, log_sigma_sys);
     // Per-system log-mass mean, constant across the chain — hoisted.
     let log_base = log_mu + sys_scale;
+    let m_scale = m_sun.clamp(0.1, 1.5).sqrt();
 
     let mut a_au = inner_au.max(a_lo);
     let mut placed_c = 0usize;
@@ -205,7 +202,7 @@ pub(in crate::physics) fn spawn_ms_frame(
             break;
         }
         let z = sample_normal(rng, 0.0, 1.0);
-        let m = 10f64.powf(log_base + log_sigma_intra * z).clamp(0.1, 30.0);
+        let m = (10f64.powf(log_base + log_sigma_intra * z) * m_scale).clamp(0.1, 30.0);
         let e = sample_rayleigh(rng, 0.06);
         let k = spawn_planet(
             b,
@@ -225,8 +222,12 @@ pub(in crate::physics) fn spawn_ms_frame(
             (pr * (1.01 + 0.01 * rng.next_f64())).powf(2.0 / 3.0)
         } else {
             // Non-resonant spacing, 1.4–2.2 in semi-major axis
-            // (Fabrycky 2014, Weiss 2018).
-            1.4 + rng.next_f64() * 0.8
+            // (Fabrycky 2014, Weiss 2018), floored at ~8 mutual Hill radii
+            // (Chambers 1996; Smith & Lissauer 2009) so M-dwarf chains are stable.
+            let r_draw = 1.4 + rng.next_f64() * 0.8;
+            let k = (2.0 * m / (3.0 * fr.m_star)).cbrt();
+            let x = (8.0 * k).min(1.5);
+            r_draw.max((2.0 + x) / (2.0 - x))
         };
     }
 
@@ -251,12 +252,21 @@ pub(in crate::physics) fn spawn_ms_frame(
     // ---- Warm Jupiter (~10 % of giant hosts, never with a hot Jupiter) ----
     // Real systems (WASP-107, WASP-117) put one giant at 0.1–1 AU with
     // moderate eccentricity — inside the snow line.
-    let has_warm = rng.next_f64() < (0.10 * giant_occ).min(0.5)
-        && n_compact + n_giants < max_planets_here
-        && !has_hj;
+    // About 10 % of giant hosts, not 10 % of all hosts.
+    let has_warm =
+        has_giant && rng.next_f64() < 0.10 && n_compact + n_giants < max_planets_here && !has_hj;
     let mut placed_w = 0usize;
     if has_warm {
-        let a_warm = inner_au + (snow_line_au - inner_au) * (0.3 + 0.6 * rng.next_f64());
+        // Log-uniform from 0.1 AU (or 1.5x the inner edge) to 1 AU (or 0.9
+        // snow lines). NaN fails the range check below, so a host with no
+        // room gets no warm Jupiter.
+        let w_lo = (inner_au * 1.5).max(0.1);
+        let w_hi = (snow_line_au * 0.9).min(1.0);
+        let a_warm = if w_lo < w_hi {
+            w_lo * (w_hi / w_lo).powf(rng.next_f64())
+        } else {
+            f64::NAN
+        };
         if a_warm >= a_lo && a_warm <= a_hi {
             let m = sample_mass_power_law(rng, MASS_GIANT_MIN, MASS_GIANT_MAX, MASS_PLAW_GIANT);
             let e = sample_rayleigh(rng, 0.15);
@@ -279,7 +289,7 @@ pub(in crate::physics) fn spawn_ms_frame(
     // ---- Giants near or beyond the snow line ----
     // Start at 1.5–2.5× the snow line, and no closer than any compact or
     // warm-Jupiter planet already placed.
-    let mut a_au = (snow_line_au * (1.5 + rng.next_f64() * 1.0)).max(a_au);
+    let mut a_au = (snow_line_au * (0.8 + rng.next_f64() * 1.7)).max(a_au);
     let mut placed_g = 0usize;
     for _ in 0..n_giants {
         if a_au > a_hi {
@@ -314,14 +324,43 @@ pub(in crate::physics) fn spawn_ms_frame(
         };
     }
 
+    // ---- Cold Neptunes (10-50 Me) ----
+    // Microlensing finds about 0.3 per star at 1-10 AU (Suzuki 2016). This
+    // mass range sits between the compact chain (< 30 Me, close in) and the
+    // giants (>= 50 Me). The rate has no metallicity trend.
+    let mut placed_n = 0usize;
+    let n_so_far = placed_c + placed_g + placed_w + has_hj as usize;
+    if rng.next_f64() < 0.30 * fr.occ_scale && n_so_far < max_planets_here {
+        // 1 to 12 snow lines, log-uniform.
+        let a_n = snow_line_au * 10f64.powf(1.08 * rng.next_f64());
+        let clear = placed
+            .iter()
+            .all(|&(_, _, a)| (a_n / a).max(a / a_n) >= 2.0);
+        if clear && a_n >= a_lo && a_n <= a_hi {
+            let m = sample_mass_power_law(rng, 10.0, 50.0, MASS_PLAW_GIANT);
+            let e = sample_rayleigh(rng, 0.10).min(0.5);
+            let k = spawn_planet(
+                b,
+                fr.centre,
+                a_n * au,
+                e,
+                m,
+                BodyKind::Planet,
+                snow_line_au,
+                rng,
+            );
+            placed.push((k, m, a_n));
+            placed_n += 1;
+        }
+    }
     // ---- Moons around giant planets ----
     // Gas giants host moons in ~70 % of systems (1–4 moons, mass ratio
-    // 1e-4 to 1e-2 of the planet). Moons draw from the background budget,
+    // 3e-5 to 3e-4 of the planet). Moons draw from the background budget,
     // so the body count stays under the ceiling.
     //
     // `base_placed` and `moon_budget_limit` are invariant across the moon
     // loop; hoist them so `base_placed` is also reusable for the belt budget.
-    let base_placed = placed_c + placed_g + placed_w + has_hj as usize;
+    let base_placed = placed_c + placed_g + placed_w + placed_n + has_hj as usize;
     let moon_budget_limit = remaining.saturating_sub(base_placed) / 10;
     let mut moons_spawned = 0usize;
     // Iterate `placed` directly (skipping non-giants *before* the RNG roll,
@@ -345,16 +384,16 @@ pub(in crate::physics) fn spawn_ms_frame(
         // 5 giant radii and a fraction of the Hill radius.
         let r_hill = d_star * (m_p / (3.0 * fr.m_star)).cbrt();
         let a_lo_m = 5.0 * r_giant_gm;
-        let a_hi_m = MOON_HILL_FRAC * r_hill;
+        let a_hi_m = (MOON_HILL_FRAC * r_hill).min(40.0 * r_giant_gm);
         if a_lo_m >= a_hi_m {
             continue;
         }
         // Spread moons evenly in semi-major axis within the allowed range.
         for k in 0..n_moons {
-            let m_ratio = 10f64.powf(-4.0 + rng.next_f64() * 2.0);
+            let m_ratio = 10f64.powf(-4.5 + rng.next_f64() * 1.0); // 3e-5 to 3e-4
             let m_moon = m_p * m_ratio;
             let frac = (k as f64 + 1.0) / (n_moons as f64 + 1.0);
-            let a_moon = a_lo_m + (a_hi_m - a_lo_m) * frac;
+            let a_moon = a_lo_m * (a_hi_m / a_lo_m).powf(frac);
             let angle = rng.next_f64() * std::f64::consts::TAU;
             let (sa, ca) = angle.sin_cos();
             let v_circ = (G * m_p / a_moon).sqrt();
@@ -397,15 +436,19 @@ pub(in crate::physics) fn spawn_ms_frame(
     // Reserve up to 4 slots from what belts left over; the rest goes to
     // background debris.
     let avail_after_belts = belt_budget.saturating_sub(belt_budget_used);
+    // Nothing inside the P-type limit, nothing beyond the S-type limit.
+    // Single stars: no lower bound (sungrazers are fine).
+    let window = (if a_lo > inner_au { a_lo } else { 0.0 }, a_hi);
     let comet_budget = avail_after_belts.min(4);
     let len_before_comets = b.len();
-    spawn_comets(b, fr.centre, snow_line_au, comet_budget, rng);
+    spawn_comets(b, fr.centre, snow_line_au, window, comet_budget, rng);
     let comet_budget_used = b.len() - len_before_comets;
 
     spawn_background(
         b,
         fr.centre,
         snow_line_au,
+        window,
         avail_after_belts.saturating_sub(comet_budget_used),
         rng,
     );
@@ -429,8 +472,16 @@ pub(in crate::physics) fn spawn_evolved_system(
     // (L ~ 1e-3 Lsun) sits at ~0.1 AU, which would make every body Icy —
     // not what is observed around polluted WDs.
     let snow_line_au_for_density = 3.0;
-
+    // Only white dwarfs keep planets. Pulsar planets are very rare, and
+    // black holes get none.
+    let n_planets = if b.kind[prim] == BodyKind::WhiteDwarf {
+        spawn_wd_planets(b, prim, remaining, snow_line_au_for_density, rng)
+    } else {
+        0
+    };
+    let remaining = remaining - n_planets;
     let len_before = b.len();
+
     spawn_belts(b, centre, &spec, snow_line_au_for_density, remaining, rng);
     let belt_budget_used = b.len() - len_before;
 
@@ -438,7 +489,60 @@ pub(in crate::physics) fn spawn_evolved_system(
         b,
         centre,
         snow_line_au_for_density,
+        (0.0, f64::INFINITY),
         remaining.saturating_sub(belt_budget_used),
         rng,
     );
+}
+
+/// Planets that survive the giant phase of a white dwarf's progenitor.
+/// Orbits inside the engulfment radius are lost. The rest expand with the
+/// stellar mass loss: a_final = a_init * m_init / m_wd (adiabatic).
+/// Returns the number of planets placed.
+fn spawn_wd_planets(
+    b: &mut Bodies,
+    prim: usize,
+    remaining: usize,
+    snow_line_au: f64,
+    rng: &mut XorShift,
+) -> usize {
+    let au = au_in_gm();
+    let m_wd = b.m[prim];
+    let ratio = (b.m_init[prim] / m_wd).max(1.0);
+    // Engulfment limit before mass loss: about 3 AU for a 1 solar-mass
+    // progenitor, larger for heavier progenitors.
+    let a_engulf = 3.0 * (b.m_init[prim] / M_SUN_ME).max(0.8).sqrt();
+    let a_lo = a_engulf * 1.2;
+    // Keep the final orbit inside 300 AU.
+    let a_hi = 300.0 / ratio;
+    if a_hi <= a_lo {
+        return 0;
+    }
+    let centre = (b.x[prim], b.y[prim], b.vx[prim], b.vy[prim], m_wd);
+    let budget = remaining.min(3);
+    let mut finals: Vec<f64> = Vec::new();
+    // (probability, minimum mass, maximum mass) in Earth masses.
+    for &(p, m_lo, m_hi) in &[(0.15, MASS_GIANT_MIN, MASS_GIANT_MAX), (0.25, 10.0, 50.0)] {
+        if finals.len() >= budget || rng.next_f64() >= p {
+            continue;
+        }
+        let a_final = a_lo * (a_hi / a_lo).powf(rng.next_f64()) * ratio;
+        if finals.iter().any(|&a| (a_final / a).max(a / a_final) < 2.0) {
+            continue;
+        }
+        let m = sample_mass_power_law(rng, m_lo, m_hi, MASS_PLAW_GIANT);
+        let e = sample_rayleigh(rng, 0.10).min(0.6);
+        spawn_planet(
+            b,
+            centre,
+            a_final * au,
+            e,
+            m,
+            BodyKind::Planet,
+            snow_line_au,
+            rng,
+        );
+        finals.push(a_final);
+    }
+    finals.len()
 }

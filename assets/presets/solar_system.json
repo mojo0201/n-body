@@ -401,7 +401,7 @@
         }
     ],
     "belts": {
-        "belt_budget": 3000,
+        "belt_budget": 1000,
         "total_mass_earth": 0.05,
         "inner": {
             "a_lo_au": 2.1,

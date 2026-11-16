@@ -93,15 +93,26 @@ pub fn class_name(b: &Bodies, i: usize) -> Cow<'static, str> {
         BodyKind::BlackHole => "black hole".into(),
         BodyKind::NeutronStar => "neutron star".into(),
         BodyKind::WhiteDwarf => "white dwarf".into(),
-        BodyKind::BrownDwarf => format!(
-            "{}-type brown dwarf",
-            bd_class_for_temp(bd_state(b.m[i], b.age_gyr[i]).temperature)
-        )
+        BodyKind::BrownDwarf => match bd_class_for_temp(bd_state(b.m[i], b.age_gyr[i]).temperature)
+        {
+            'M' => "M-type brown dwarf",
+            'L' => "L-type brown dwarf",
+            'T' => "T-type brown dwarf",
+            _ => "Y-type brown dwarf",
+        }
         .into(),
         BodyKind::Star => match phase_of(b, i) {
             Some(StellarPhase::RedGiant) => "red giant".into(),
             Some(StellarPhase::RedSupergiant) => "red supergiant".into(),
-            _ => format!("{}-type star", star_class(b.m[i])).into(),
+            _ => match star_class(b.m[i]) {
+                'M' => "M-type star",
+                'K' => "K-type star",
+                'G' => "G-type star",
+                'F' => "F-type star",
+                'A' => "A-type star",
+                _ => "B-type star",
+            }
+            .into(),
         },
         BodyKind::Planet | BodyKind::DwarfPlanet => match b.origin[i] {
             BodyOrigin::AsteroidBelt => "asteroid".into(),

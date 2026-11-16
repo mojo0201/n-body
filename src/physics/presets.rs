@@ -189,8 +189,13 @@ pub(super) fn belt_spec_for(
     let mut a_giant_outer = 0.0f64;
     let mut n_compact = 0usize;
     let mut a_compact = 0.0f64;
+    let mut a_ice = 0.0f64; // outermost cold Neptune-class planet
     for p in planets {
         let (_, m, a) = *p;
+        // Outermost cold Neptune-class planet: sets the Kuiper resonances.
+        if (10.0..=50.0).contains(&m) && a >= snow_line_au && a > a_ice {
+            a_ice = a;
+        }
         if m > 50.0 {
             giants.push((m, a));
             if a < 0.1 {
@@ -203,7 +208,9 @@ pub(super) fn belt_spec_for(
                 a_giant_outer = a;
             }
         }
-        if m <= 30.0 {
+        // Only planets inside the snow line belong to the compact chain. A
+        // cold Neptune must not push the asteroid belt outward.
+        if m <= 30.0 && a < snow_line_au {
             if a > a_compact {
                 a_compact = a;
             }
@@ -257,7 +264,7 @@ pub(super) fn belt_spec_for(
         }
         spec.total_mass *= 0.1;
         spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
-    } else if n_compact >= 4 {
+    } else if n_compact >= 4 && giants.is_empty() {
         // Compact chains: four or more small planets inside 1 AU, i.e. the
         // TRAPPIST-1 / Kepler-90 regime. Same belt depletion factor as hot
         // Jupiters; the belt sits just outside the snow line.
@@ -276,7 +283,11 @@ pub(super) fn belt_spec_for(
         // unusually low eccentricity — the observed dust is dynamically
         // cold.
         spec.archetype = BeltArchetype::YoungDebrisDisk;
-        let (start, end) = (a_lo_au.max(80.0), a_hi_au.min(120.0));
+        // Disk radius follows stellar luminosity: 8 to 16 snow lines.
+        let (start, end) = (
+            a_lo_au.max(snow_line_au * 8.0),
+            a_hi_au.min(snow_line_au * 16.0),
+        );
         if end > start {
             spec.outer = single_outer(start, end, 0.02, 1e-3, 1e-1);
         }
@@ -310,7 +321,13 @@ pub(super) fn belt_spec_for(
                 leading_frac: 0.5,
                 mass_frac: frac,
             });
-            spec.gaps.extend(kirkwood_gaps(*ga));
+            // `kirkwood_gaps` assumes a Jupiter-mass giant; width ~ mu^(2/7).
+            let gap_scale = m_jup.powf(2.0 / 7.0);
+            spec.gaps
+                .extend(kirkwood_gaps(*ga).into_iter().map(|g| Gap {
+                    width_au: g.width_au * gap_scale,
+                    ..g
+                }));
             frac
         } else {
             0.0
@@ -344,10 +361,29 @@ pub(super) fn belt_spec_for(
         // least 10 snow lines out. The four populations are the standard
         // dynamical split; their mass_frac sum to 0.9, the missing 0.1
         // is the dust tail that `spawn_belts` adds to every outer belt.
-        let kui_lo = (a_giant_outer * 1.5).max(snow_line_au * 10.0).max(a_lo_au);
+        let kui_lo = (a_giant_outer * 1.5)
+            .max(snow_line_au * 10.0)
+            .max(a_ice * 1.3)
+            .max(a_lo_au);
         let kui_hi = (snow_line_au * 40.0).min(a_hi_au);
         if kui_hi > kui_lo {
             let span = kui_hi - kui_lo;
+            // Resonant objects need a perturber: 3:2 and 2:1 resonances of
+            // the cold Neptune. Without a fit, they become hot classicals.
+            let a_32 = a_ice * 1.5f64.powf(2.0 / 3.0);
+            let a_21 = a_ice * 2.0f64.powf(2.0 / 3.0);
+            let res_ok = a_ice > 0.0 && a_32 >= kui_lo && a_21 <= kui_hi;
+            let (r_kind, lo1, hi1, lo2, hi2) = if res_ok {
+                (
+                    BodyOrigin::KuiperResonant,
+                    a_32 * 0.98,
+                    a_32 * 1.02,
+                    a_21 * 0.98,
+                    a_21 * 1.02,
+                )
+            } else {
+                (BodyOrigin::KuiperHot, kui_lo, kui_hi, kui_lo, kui_hi)
+            };
             let pop = |kind, a_lo, a_hi, mass_frac, e_sigma, q_frac| OuterPopulation {
                 kind,
                 a_lo_au: a_lo,
@@ -374,7 +410,8 @@ pub(super) fn belt_spec_for(
                     // Hot classicals: wider eccentricities, full span.
                     pop(BodyOrigin::KuiperHot, kui_lo, kui_hi, 0.30, 0.15, None),
                     // Resonant objects (Plutinos etc.).
-                    pop(BodyOrigin::KuiperResonant, kui_lo, kui_hi, 0.10, 0.10, None),
+                    pop(r_kind, lo1, hi1, 0.07, 0.10, None),
+                    pop(r_kind, lo2, hi2, 0.03, 0.10, None),
                     // Scattered: pericentre tied to the outer giant.
                     pop(
                         BodyOrigin::KuiperScattered,

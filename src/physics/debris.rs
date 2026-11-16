@@ -569,6 +569,9 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
         }
     }
 
+    if !mass_updates.is_empty() || !to_kill.is_empty() {
+        mark_energy(b);
+    }
     for (i, m) in mass_updates {
         b.set_mass(i, m);
     }

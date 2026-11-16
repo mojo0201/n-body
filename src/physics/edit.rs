@@ -270,8 +270,8 @@ pub fn delete_bodies(b: &mut Bodies, mut indices: Vec<usize>) {
 ///
 /// Safe to batch: `circularize_raw` only changes velocities, never
 /// positions or masses, so the parent cache (which depends only on the
-/// latter) is valid across the entire batch. That means `find_parent`'s
-/// (Each body still calls the uncached find_parent.)
+/// latter) is valid across the entire batch.
+/// Note: each body still calls the uncached `find_parent`, so the cost is O(N·K).
 ///
 /// Returns the number of bodies successfully circularized.
 pub fn circularize_many(b: &mut Bodies, indices: &[usize]) -> usize {

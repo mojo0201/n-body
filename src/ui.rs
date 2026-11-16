@@ -2578,7 +2578,7 @@ fn selection_window(
     let mut open = true;
     // One O(n) `find_parent` per frame, reused for the title (moon vs
     // planet) and the Orbit section below.
-    let parent = ph::find_parent(b, i);
+    let parent = parent_of(b, i);
     let stale = match &st.kids {
         Some((id, t, _)) => *id != b.id[i] || t.elapsed() > Duration::from_millis(500),
         None => true,
@@ -3793,10 +3793,12 @@ fn refresh_rows(st: &mut UiState, b: &Bodies) {
 
     // Cache `find_parent` once: sort and display share it, so belt bodies
     // get real values (orbit about the primary) instead of 0 / ∞.
-    let parents: Vec<Option<usize>> = if b.parent_cache_valid && b.parent_cache.len() == n {
-        b.parent_cache.clone()
+    let owned: Vec<Option<usize>>;
+    let parents: &[Option<usize>] = if b.parent_cache_valid && b.parent_cache.len() == n {
+        &b.parent_cache
     } else {
-        (0..n).map(|i| ph::find_parent(b, i)).collect()
+        owned = (0..n).map(|i| ph::find_parent(b, i)).collect();
+        &owned
     };
     let orbital = |i: usize| -> (f64, f64, f64) {
         match parents[i].or_else(|| prim.filter(|&p| p != i)) {

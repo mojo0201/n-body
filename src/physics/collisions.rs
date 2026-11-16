@@ -169,7 +169,11 @@ pub(super) fn find_collisions(b: &Bodies, sweep: bool, dt: f64) -> Vec<(usize, u
         let cy = (b.y[i] * inv_cell).floor() as i64;
         keys.push((cell_key(cx, cy), i as u32));
     }
-    keys.par_sort_unstable();
+    if keys.len() > 8192 {
+        keys.par_sort_unstable();
+    } else {
+        keys.sort_unstable();
+    }
 
     for i in 0..n {
         if b.dead[i] || t_now < b.imm[i] {

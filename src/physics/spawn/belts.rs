@@ -9,13 +9,15 @@ use super::*;
 
 /// Fewest tracers of one belt population, so even a thin belt is visible.
 pub(in crate::physics) const BELT_MIN_TRACERS: usize = 3;
+/// Upper limit of tracers for one belt part.
+pub(in crate::physics) const BELT_MAX_TRACERS_PER_PART: usize = 500;
 
 /// Reference belt mass (M⊕) that receives `BELT_TRACER_SCALE` tracers.
 pub(in crate::physics) const BELT_REF_MASS: f64 = 0.01;
 
 /// Tracers per `BELT_REF_MASS` of belt mass. Each tracer therefore stands
 /// for `BELT_REF_MASS / BELT_TRACER_SCALE` ≈ 2×10⁻⁵ M⊕ of real debris —
-/// roughly the mass of Ceres.
+/// roughly half the mass of Vesta.
 pub(in crate::physics) const BELT_TRACER_SCALE: f64 = 500.0;
 
 /// Smallest mass (M⊕) a single tracer may carry. Below this the tracer
@@ -27,8 +29,8 @@ pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-4;
 pub(in crate::physics) const BELT_MAX_TRACER_MASS: f64 = 0.1;
 
 /// Hilda mass as a fraction of `spec.total_mass`. Real Hildas total
-/// ~10⁻⁶ M⊕ — ~0.04% of the asteroid belt — so 0.05% is the right
-/// order of magnitude and leaves room for the dominant body to be a
+/// ~10⁻⁶ M⊕ — ~0.2% of the asteroid belt — so 0.05% is on the low side
+/// but leaves room for the dominant body to be a
 /// realistic ~150 km object.
 pub(in crate::physics) const HILDA_MASS_FRAC: f64 = 0.0005;
 
@@ -50,17 +52,18 @@ pub(in crate::physics) fn debris_belt_occurrence_fraction(m_sun: f64, age_gyr: f
 
 /// Median inner (asteroid-like) belt mass in Earth masses, with a
 /// log-normal scatter. Calibrated so a solar analogue at 4.6 Gyr has
-/// ~1.5×10⁻³ M⊕ — the real asteroid belt. The `(1 + t/0.3 Gyr)⁻¹`
+/// ~5×10⁻⁴ M⊕ — the real asteroid belt. The `(1 + t/0.3 Gyr)⁻¹`
 /// factor models collisional depletion over a 300-Myr timescale
-/// (Wyatt 2008): a 100-Myr belt is ~4× heavier than a 5-Gyr one.
+/// (Wyatt 2008): a 100-Myr belt is ~13× heavier than a 5-Gyr one.
 pub(in crate::physics) fn belt_mass_earth(
     m_sun: f64,
     feh: f64,
     age_gyr: f64,
     rng: &mut XorShift,
 ) -> f64 {
-    let baseline = 0.02 * m_sun * 10f64.powf(1.5 * feh);
-    let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0));
+    // 0.008 gives 4.9e-4 Me at 4.6 Gyr: the real main belt (3.0e21 kg).
+    let baseline = 0.008 * m_sun * 10f64.powf(1.5 * feh);
+    let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0).clamp(-2.0, 2.0));
     baseline * scatter * (1.0 + age_gyr / 0.3).powf(-1.0)
 }
 
@@ -76,7 +79,7 @@ pub(in crate::physics) fn belt_mass_earth_outer(
     rng: &mut XorShift,
 ) -> f64 {
     let baseline = 0.035 * m_sun * 10f64.powf(1.5 * feh);
-    let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0));
+    let scatter = 10f64.powf(sample_normal(rng, 0.0, 1.0).clamp(-2.0, 2.0));
     baseline * scatter * (1.0 + age_gyr / 3.0).powf(-0.3)
 }
 
@@ -84,7 +87,12 @@ pub(in crate::physics) fn belt_mass_earth_outer(
 /// a giant at `a_giant_au`. A p:q resonance (giant : body periods) lies
 /// at `a = a_giant * (q/p)^(2/3)`.
 pub(in crate::physics) fn kirkwood_gaps(a_giant_au: f64) -> Vec<Gap> {
-    let mu = JUPITER_MASS / M_SUN_ME;
+    kirkwood_gaps_for(a_giant_au, JUPITER_MASS)
+}
+
+/// As `kirkwood_gaps`, scaled to the giant's actual mass (M⊕).
+pub(in crate::physics) fn kirkwood_gaps_for(a_giant_au: f64, m_giant: f64) -> Vec<Gap> {
+    let mu = m_giant / M_SUN_ME;
     let w = a_giant_au * mu.powf(2.0 / 7.0) * 0.05;
     let at = |p: f64, q: f64| a_giant_au * (q / p).powf(2.0 / 3.0);
     // The (q/p)^(2/3) factors are 0.48, 0.54, 0.57, 0.63, so this literal
@@ -123,6 +131,7 @@ pub(in crate::physics) fn tracers_for_mass(mass: f64, budget: usize) -> usize {
     by_mass
         .min(by_floor)
         .min(budget)
+        .min(BELT_MAX_TRACERS_PER_PART)
         .max(BELT_MIN_TRACERS.min(budget))
 }
 
@@ -187,7 +196,8 @@ pub(in crate::physics) fn spawn_belt_body(
     snow_line_au: f64,
     rng: &mut XorShift,
 ) -> usize {
-    let e = e.clamp(0.0, 0.9);
+    // 0.99 so sungrazing comets (e = 1 - q/a) keep their intended perihelion.
+    let e = e.clamp(0.0, 0.99);
     let mean_anom = rng.next_f64() * std::f64::consts::TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
     let omega = rng.next_f64() * std::f64::consts::TAU;
@@ -221,8 +231,15 @@ pub(in crate::physics) fn giant_near(
         {
             continue;
         }
+        // Compare the semi-major axis (vis-viva), not the instantaneous
+        // radius, so eccentric giants still match their trojan clusters.
         let (dx, dy) = (b.x[i] - centre.0, b.y[i] - centre.1);
-        let d = (dx.hypot(dy) / au - a_au).abs();
+        let (dvx, dvy) = (b.vx[i] - centre.2, b.vy[i] - centre.3);
+        let inv_a = 2.0 / dx.hypot(dy) - (dvx * dvx + dvy * dvy) / (G * (centre.4 + b.m[i]));
+        if inv_a <= 0.0 {
+            continue; // unbound
+        }
+        let d = (1.0 / inv_a / au - a_au).abs();
         if d < 0.1 * a_au && best.is_none_or(|(bd, _, _)| d < bd) {
             best = Some((d, dy.atan2(dx), b.m[i]));
         }
@@ -263,7 +280,7 @@ pub(in crate::physics) fn spawn_trojan(
 ) -> usize {
     let e = rng.next_f64() * 0.05;
     // A little scatter around the Lagrange point.
-    let jitter = (rng.next_f64() - 0.5) * 0.2;
+    let jitter = (rng.next_f64() - 0.5) * 0.7; // ±20 degrees
     let omega = giant_angle + lead * std::f64::consts::PI / 3.0 + jitter;
     let (cx, cy, cvx, cvy, mc) = centre;
     let (x, y, vx, vy) = kepler_state(G * mc, a_gm, e, 0.0, omega);
@@ -281,7 +298,7 @@ pub(in crate::physics) fn spawn_trojan(
 pub(in crate::physics) enum BeltPart<'a> {
     Inner(&'a InnerBelt),
     Outer(&'a OuterPopulation),
-    Trojan(&'a Trojan),
+    Trojan(&'a Trojan, usize),
 }
 
 /// A small population of scattered background bodies — interstellar
@@ -291,13 +308,23 @@ pub(in crate::physics) fn spawn_background(
     b: &mut Bodies,
     centre: (f64, f64, f64, f64, f64),
     snow_line_au: f64,
+    window: (f64, f64),
     budget: usize,
     rng: &mut XorShift,
 ) {
+    let lo = 5.0f64.max(window.0);
+    let hi = 56.0f64.min(window.1);
+    if lo >= hi {
+        return;
+    }
     let n = poisson(rng, 2.0).min(8).min(budget);
     for _ in 0..n {
-        let a_au = 5.0 + rng.next_f64() * 51.0;
+        let a_au = lo + rng.next_f64() * (hi - lo);
         let e = sample_rayleigh(rng, 0.30).min(0.9);
+        // Orbit must stay inside the stable window (periapsis and apoapsis).
+        if a_au * (1.0 - e) < window.0 || a_au * (1.0 + e) > window.1 {
+            continue;
+        }
         let m = sample_mass_power_law(rng, 1e-6, 1e-4, 1.8);
         spawn_belt_body(
             b,
@@ -341,13 +368,13 @@ pub(in crate::physics) fn spawn_belts(
         .map(|t| giant_near(b, centre, t.giant_a_au))
         .collect();
 
-    // Hildas: a 3:2 group about a Jupiter-like giant (300–350 M⊕). They
+    // Hildas: a 3:2 group about a Saturn-mass or heavier giant (>= 95 M⊕). They
     // take their share of the budget first.
     let hilda_giant = spec
         .trojans
         .iter()
         .zip(&trojan_giants)
-        .find(|(_, g)| g.is_some_and(|(_, m)| (300.0..=350.0).contains(&m)))
+        .find(|(_, g)| g.is_some_and(|(_, m)| m >= 95.0))
         .map(|(t, _)| t.giant_a_au);
     let n_hilda = if hilda_giant.is_some() {
         (budget / 20).clamp(1, 30).min(budget)
@@ -376,9 +403,15 @@ pub(in crate::physics) fn spawn_belts(
             ));
         }
     }
-    for t in &spec.trojans {
+    for (ti, (t, g)) in spec.trojans.iter().zip(&trojan_giants).enumerate() {
+        // L4/L5 need a giant and are stable only if m_giant / m_host < 0.0385
+        // (Routh limit).
+        match g {
+            Some((_, mg)) if mg / centre.4 <= 0.0385 => {}
+            _ => continue,
+        }
         plan.push((
-            BeltPart::Trojan(t),
+            BeltPart::Trojan(t, ti),
             want(spec.total_mass * t.mass_frac),
             t.mass_frac,
         ));
@@ -465,16 +498,9 @@ pub(in crate::physics) fn spawn_belts(
                     spawn_belt_body(b, centre, a_au, e, m, pop.kind, snow_line_au, rng);
                 }
             }
-            BeltPart::Trojan(troj) => {
-                // Reuse the giant angle resolved above; fall back to a
-                // random azimuth if no giant was found nearby.
-                let ang = spec
-                    .trojans
-                    .iter()
-                    .position(|t| std::ptr::eq(t, *troj))
-                    .and_then(|idx| trojan_giants[idx])
-                    .map(|(a, _)| a)
-                    .unwrap_or_else(|| rng.next_f64() * std::f64::consts::TAU);
+            BeltPart::Trojan(troj, ti) => {
+                // Trojans are only planned when a giant was found.
+                let ang = trojan_giants[*ti].map_or(0.0, |(a, _)| a);
                 let m_total = spec.total_mass * troj.mass_frac;
                 let masses = draw_masses_to_total(
                     rng,
@@ -534,6 +560,7 @@ pub(in crate::physics) fn spawn_comets(
     b: &mut Bodies,
     centre: (f64, f64, f64, f64, f64),
     snow_line_au: f64,
+    window: (f64, f64),
     budget: usize,
     rng: &mut XorShift,
 ) {
@@ -545,7 +572,7 @@ pub(in crate::physics) fn spawn_comets(
 
     for _ in 0..n {
         // Perihelion 0.2–3.0 AU — inside the snow line, so they become active.
-        let q_au = 0.2 + rng.next_f64() * 2.8;
+        let q_au = (0.2 + rng.next_f64() * 2.8) * (snow_line_au / 2.7).clamp(0.2, 3.0);
 
         // Semi-major axis 20–500 AU (Kuiper belt to inner Oort cloud).
         // Capped at 500 AU so they don't immediately hit HARD_CULL_DIST.
@@ -553,6 +580,12 @@ pub(in crate::physics) fn spawn_comets(
 
         // e = 1 − q/a, clamped to keep the orbit well-defined.
         let e = (1.0 - q_au / a_au).clamp(0.0, 0.99);
+
+        // Truncated Oort cloud around S-type hosts; no comets whose
+        // perihelion lies inside a P-type cavity.
+        if q_au < window.0 || a_au * (1.0 + e) > window.1 {
+            continue;
+        }
 
         // Comet nucleus mass: 1e-12 to 1e-9 Earth masses.
         let m = sample_mass_power_law(rng, 1e-12, 1e-9, 1.8);

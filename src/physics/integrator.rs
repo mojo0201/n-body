@@ -95,7 +95,6 @@ pub(super) fn assign_rungs(b: &mut Bodies, dt: f64) -> u8 {
 pub(super) fn age_flashes(b: &mut Bodies) {
     let t = b.time;
     b.flashes.retain(|f| f.expires_at > t);
-    let t = b.time;
     for f in &mut b.flashes {
         f.age = t - (f.expires_at - f.life);
     }
@@ -429,7 +428,6 @@ pub fn advance(b: &mut Bodies, dt: f64) {
         step_block(b, dt, kmax);
         b.stats.last_nsub = 1u32 << kmax;
     }
-    mark_energy(b);
     tidal_dissipation(b, dt);
     evolve_stars(b, dt);
     dust::evolve(b, dt);

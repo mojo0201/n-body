@@ -4,8 +4,7 @@ use super::*;
 
 /// Push the primary of a random system at the origin and give it an age.
 ///
-/// Ages are drawn uniformly over each star's *lifetime*, not over cosmic time,
-/// so a sample is equally likely to catch a star at any phase of its life.
+/// Ages are drawn uniformly over cosmic time (0 to `AGE_UNIVERSE_GYR`).
 /// A star whose sampled age exceeds its total lifetime is instead spawned as
 /// its remnant (kind, mass and cooling age), preserving `m_init`. Surviving
 /// stars are placed on the main sequence or giant branch at the mass and radius
@@ -36,19 +35,21 @@ pub(in crate::physics) fn spawn_aged_primary(
     let t_total = star_total_life_gyr(m_init);
     // Sampling range is capped at the age of the universe.
     let t_cap = t_total.min(AGE_UNIVERSE_GYR);
-    // With uniform-over-lifetime sampling, the fraction of stars drawn as
-    // remnants equals the fraction of the t_cap window that lies beyond the
-    // lifetime. Capped at 0.95 so even low-mass stars keep a small
-    // main-sequence tail.
-    let p_remnant = (1.0 - t_cap / AGE_UNIVERSE_GYR).clamp(0.0, 0.95);
+    // With uniform sampling over cosmic time, the fraction of stars drawn as
+    // remnants equals the fraction of the universe's age that lies beyond the
+    // lifetime. Low-mass stars have t_cap = AGE_UNIVERSE_GYR, so p_remnant = 0.
+    let p_remnant = (1.0 - t_cap / AGE_UNIVERSE_GYR).clamp(0.0, 1.0);
     let u = rng.next_f64();
     if u < p_remnant {
         // The star has evolved past its total lifetime: spawn as a remnant.
         let (rkind, m_rem) = remnant_of(m_init);
+        // The sampled age is uniform on [t_total, AGE_UNIVERSE_GYR], so the
+        // cooling age is uniform on [0, AGE_UNIVERSE_GYR - t_total].
+        let cool_window = (AGE_UNIVERSE_GYR - t_total).max(0.1);
         let cool_age = match rkind {
-            BodyKind::WhiteDwarf => 0.1 + 9.9 * rng.next_f64(), // 0.1-10 Gyr
-            BodyKind::NeutronStar => 1.0 + 9.0 * rng.next_f64(), // 1-10 Gyr
-            BodyKind::BlackHole => 1.0 + 9.0 * rng.next_f64(),  // 1-10 Gyr
+            BodyKind::WhiteDwarf | BodyKind::NeutronStar | BodyKind::BlackHole => {
+                rng.next_f64() * cool_window
+            }
             _ => 0.0,
         };
         let i = b.push(0.0, 0.0, 0.0, 0.0, m_rem, rkind);
@@ -87,17 +88,20 @@ pub(in crate::physics) fn spawn_companion(
     if q_lo >= 1.0 {
         return None;
     }
-    // Mass-ratio distribution rises toward q = 1 for G/K primaries, is
-    // roughly flat for M dwarfs, and is strongly peaked at q ~ 1 for
-    // brown-dwarf pairs (Duchene & Kraus 2013; Burgasser 2007): density ~ q^alpha.
-    let alpha = if is_bd {
-        4.0
-    } else if m1 > 0.5 * M_SUN_ME {
-        0.5
+    // Mass-ratio distribution (Moe & Di Stefano 2017; Burgasser 2007):
+    // density ~ q^alpha on [q_lo, 1]. Flat for stellar primaries and strongly
+    // peaked at q ~ 1 for brown-dwarf pairs. Primaries above 0.5 M☉ also have a
+    // "twin" excess at q > 0.95 (10 % here; tune this value).
+    let alpha = if is_bd { 4.0 } else { 0.0 };
+    let twin = !is_bd && m1 > 0.5 * M_SUN_ME && q_lo < 0.95 && rng.next_f64() < 0.10;
+    let q = if twin {
+        0.95 + 0.05 * rng.next_f64()
     } else {
-        0.0
+        // Inverse CDF of density ~ q^alpha on [q_lo, 1].
+        let k = 1.0 + alpha;
+        let c = q_lo.powf(k);
+        (c + (1.0 - c) * rng.next_f64()).powf(1.0 / k)
     };
-    let q = q_lo + (1.0 - q_lo) * rng.next_f64().powf(1.0 / (1.0 + alpha));
     let m2 = q * m1;
     let mt = m1 + m2;
     let au = au_in_gm();
@@ -131,7 +135,10 @@ pub(in crate::physics) fn spawn_companion(
             let p_days = if is_bd {
                 // Brown-dwarf binaries: log10(a/AU) ~ N(0.55, 0.45),
                 // truncated at 20 AU (Burgasser 2007).
-                let a_bd_au = 10f64.powf(sample_normal(rng, 0.55, 0.45)).min(20.0);
+                let a_bd_au = 10f64.powf(sample_normal(rng, 0.55, 0.45));
+                if a_bd_au > 20.0 {
+                    continue; // truncate by rejection, not by clamping
+                }
                 orbital_period_days(a_bd_au * au, mt)
             } else {
                 10f64.powf(sample_normal(rng, BIN_LOGP_MEAN, BIN_LOGP_SIGMA))
@@ -151,7 +158,10 @@ pub(in crate::physics) fn spawn_companion(
             } else if is_bd {
                 rng.next_f64() * 0.3
             } else {
-                rng.next_f64().sqrt() * 0.95
+                // Upper envelope of observed e versus P (Moe & Kratter 2021):
+                // e_max = 1 - (P / 2 d)^(-2/3), capped at 0.95.
+                let e_max = (1.0 - (p_days / 2.0).powf(-2.0 / 3.0)).clamp(0.0, 0.95);
+                rng.next_f64().sqrt() * e_max
             };
             if a * (1.0 - e) < clear {
                 continue;
@@ -229,7 +239,9 @@ pub(in crate::physics) fn plan_outer_star(
     if q_lo >= 1.0 {
         return None;
     }
-    let q = q_lo + (1.0 - q_lo) * rng.next_f64().powf(1.0 / 1.5);
+    // Inverse CDF of density ~ q^1.5 on [q_lo, 1].
+    let c = q_lo.powf(2.5);
+    let q = (c + (1.0 - c) * rng.next_f64()).powf(1.0 / 2.5);
     let m = q * m1;
     // Thermal eccentricity distribution truncated at 0.8.
     let ecc = rng.next_f64().sqrt() * 0.8;
@@ -342,8 +354,14 @@ pub(in crate::physics) fn spawn_binary_planets(
     };
     // S-type needs enough room between the host's inner edge and the
     // Holman-Wiegert limit to fit a compact planetary system.
-    let s_ok = a_hi_s >= 3.0 * inner_s;
-    let use_p = !s_ok || rng.next_f64() < p_prob;
+    let s_ok = a_hi_s.min(a_outer_limit_au) >= 3.0 * inner_s;
+    // P-type also needs its stable zone to start inside the outer limit.
+    let p_ok = HW_MARGIN_P * hw_critical_p(bi.a_au, bi.ecc, m2 / mt) < a_outer_limit_au;
+    let use_p = match (s_ok, p_ok) {
+        (true, true) => rng.next_f64() < p_prob,
+        (true, false) => false,
+        (false, _) => true,
+    };
 
     if use_p {
         let a_crit_p = hw_critical_p(bi.a_au, bi.ecc, m2 / mt);
@@ -368,7 +386,10 @@ pub(in crate::physics) fn spawn_binary_planets(
             m_star: mt,
             age_gyr: b.age_gyr[if m1 >= m2 { prim } else { comp }],
         };
-        spawn_ms_frame(b, &fr, remaining, rng);
+        // No circumbinary planets are known around binaries with P < ~7 d.
+        if bi.period_days >= 7.0 {
+            spawn_ms_frame(b, &fr, remaining, rng);
+        }
     } else {
         bi.arch = if host == prim {
             BinaryArch::STypePrimary
@@ -385,7 +406,7 @@ pub(in crate::physics) fn spawn_binary_planets(
             inner_au: inner_s,
             a_lo_au: inner_s,
             a_hi_au: a_hi_s.min(a_outer_limit_au),
-            occ_scale: BIN_OCC_S,
+            occ_scale: BIN_OCC_S * (bi.a_au / 200.0).clamp(0.1, 1.0),
             m_star: b.m[host],
             age_gyr: b.age_gyr[host],
         };

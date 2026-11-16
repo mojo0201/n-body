@@ -62,9 +62,7 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
 /// Common inbound trajectory shared by `spawn_interstellar_object` and
 /// `spawn_rogue_planet`.
 ///
-/// Draws exactly three `next_f64()` values, in this order: position
-/// angle, impact distance, impact angle. Both spawners therefore keep
-/// the RNG stream they had before this helper was factored out.
+/// Draws from `b.rng`: position angle, periapsis, direction, then v∞.
 struct Inbound {
     x: f64,
     y: f64,
@@ -84,34 +82,30 @@ fn setup_inbound(b: &mut Bodies) -> Option<Inbound> {
     }
     let m_prim = b.m[prim];
 
-    // Start at 0.9 × CULL_DIST, at a random direction from the primary.
     let r0 = 0.9 * CULL_DIST;
     let theta = b.rng.next_f64() * TAU;
     let (sx, sy) = (r0 * theta.cos(), r0 * theta.sin());
 
-    // Aim at a point offset from the primary by `b_impact` in a random
-    // direction. Log-uniform 0.5 to 50 AU. The closest approach of the
-    // straight-line trajectory to the primary is approximately
-    // `b_impact` because b_impact << r0.
-    let b_impact_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
-    let b_impact = b_impact_au * au_in_gm();
-    let aim_theta = b.rng.next_f64() * TAU;
-    let (ax, ay) = (b_impact * aim_theta.cos(), b_impact * aim_theta.sin());
-    let (dx, dy) = (ax - sx, ay - sy);
-    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
-    let (ux, uy) = (dx / d, dy / d);
+    // Periapsis, log-uniform 0.5-50 AU; direction of motion is random.
+    let q_au = 0.5 * 10f64.powf(2.0 * b.rng.next_f64());
+    let q = (q_au * au_in_gm()).min(0.5 * r0);
+    let dir = if b.rng.next_f64() < 0.5 { 1.0 } else { -1.0 };
 
-    // 10 % above the primary's escape speed at `r0`: bound orbit has
-    // E = 0, so E = 0.105 × v_esc² > 0 — unbound, leaves the system.
-    let v_esc = (2.0 * G * m_prim / r0).sqrt();
-    let v = 1.1 * v_esc;
+    // Hyperbolic excess speed (km/s -> Gm per code time unit).
+    let v_inf = sample_normal(&mut b.rng, 26.0, 8.0).clamp(5.0, 60.0) * 1.0e-6 * time_unit_s();
+    let mu = G * m_prim;
+    // h² = q²·v_q² with v_q² = v∞² + 2μ/q  =>  periapsis is exactly q.
+    let h = (q * q * v_inf * v_inf + 2.0 * mu * q).sqrt();
+    let v_t = dir * h / r0;
+    let v_r = -(v_inf * v_inf + 2.0 * mu / r0 - v_t * v_t).max(0.0).sqrt(); // inbound
+    let (st, ct) = theta.sin_cos();
 
     Some(Inbound {
         x: sx,
         y: sy,
-        vx: ux * v,
-        vy: uy * v,
-        b_impact_au,
+        vx: v_r * ct - v_t * st,
+        vy: v_r * st + v_t * ct,
+        b_impact_au: q / au_in_gm(), // now the true periapsis
     })
 }
 
@@ -201,10 +195,10 @@ pub fn add_ring(b: &mut Bodies, i: usize, n: usize, rng: &mut XorShift) -> Vec<u
         b.class[k] = BodyClass::Icy;
         b.bulk_density[k] = draw_density(rng, b.class[k]);
         b.r[k] = b.radius_now(k);
-        b.parent_cache_valid = false;
         out.push(k);
     }
     if !out.is_empty() {
+        b.parent_cache_valid = false;
         let (x, y) = (b.x[i], b.y[i]);
         let text = format!("ring added around {} ({} particles)", tag(b, i), out.len());
         b.log(EventKind::User, text, x, y);
@@ -404,7 +398,7 @@ pub(super) fn spawn_planet(
         // Gas giants are Icy for colour purposes; `render.rs` checks
         // mass and origin to give them the tan gas-giant look.
         b.class[i] = BodyClass::Icy;
-        b.bulk_density[i] = 0.6 + 1.1 * rng.next_f64();
+        b.bulk_density[i] = giant_density(m, rng);
     } else {
         let a_au = a_gm / au_in_gm();
         b.class[i] = class_for(BodyOrigin::Spawned, a_au, snow_line_au);
@@ -412,6 +406,29 @@ pub(super) fn spawn_planet(
     }
     b.r[i] = b.radius_now(i);
     i
+}
+
+/// Cold-giant bulk density from an M-R table anchored on Neptune, Saturn and
+/// Jupiter; radii saturate near 1 R_J from ~1 to 10 M_J (Fortney 2007).
+/// Uses exactly one RNG draw, like the code it replaces.
+fn giant_density(m: f64, rng: &mut XorShift) -> f64 {
+    const T: [(f64, f64); 5] = [
+        (17.0, 3.9),
+        (95.0, 9.45),
+        (318.0, 11.2),
+        (1000.0, 11.4),
+        (3180.0, 11.2),
+    ];
+    let r = if m <= T[0].0 {
+        T[0].1
+    } else if m >= T[4].0 {
+        T[4].1
+    } else {
+        let k = T.windows(2).position(|w| m < w[1].0).unwrap_or(3);
+        let f = (m / T[k].0).ln() / (T[k + 1].0 / T[k].0).ln();
+        (T[k].1.ln() + f * (T[k + 1].1.ln() - T[k].1.ln())).exp()
+    };
+    5.514 * m / (r * r * r) * (0.85 + 0.30 * rng.next_f64())
 }
 
 /// Planets at or above this mass (Earth masses) get gas-giant densities.
@@ -655,6 +672,10 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> 
     let (m_init, kind0) = sample_primary(&mut rng);
     let prim = spawn_aged_primary(b, m_init, kind0, &mut rng);
     let kind = b.kind[prim];
+    // Older disc stars are on average more metal-poor (weak trend).
+    if kind == BodyKind::Star {
+        b.metallicity += (-0.03 * (b.age_gyr[prim] - 4.0)).clamp(-0.25, 0.05);
+    }
 
     let mut remaining = body_count.saturating_sub(1);
     // Main-sequence hosts get a stellar companion with `binary_fraction`;
@@ -686,7 +707,10 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> 
             let mut a_in = bi.a_au;
             while outer_stars.len() < 2 && remaining > BIN_MIN_BODIES {
                 let p_next = if outer_stars.is_empty() {
-                    P_TRIPLE_GIVEN_BINARY
+                    // Tertiaries are far commoner around tight binaries.
+                    let lp = bi.period_days.max(1.0).log10();
+                    (P_TRIPLE_GIVEN_BINARY * (1.0 + 1.5 * ((3.0 - lp) / 2.0).clamp(0.0, 1.0)))
+                        .min(0.9)
                 } else {
                     P_QUAD_GIVEN_TRIPLE
                 };

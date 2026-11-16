@@ -393,7 +393,7 @@ pub const MASS_ROCKY_MAX: f64 = 5.0;
 
 pub const MASS_GIANT_MIN: f64 = 50.0;
 
-pub const MASS_GIANT_MAX: f64 = 300.0;
+pub const MASS_GIANT_MAX: f64 = 3000.0; // about 9.4 Jupiter masses, below BD_M_MIN
 
 pub const MASS_ASTEROID_MIN: f64 = 1e-10;
 
@@ -460,7 +460,7 @@ pub const CULL_DIST: f64 = 100_000.0;
 pub const HARD_CULL_DIST: f64 = 1_000_000.0;
 
 /// Hard cap on the number of bodies. `Bodies` panics or truncates above this.
-pub const MAX_BODIES: usize = 100_000;
+pub const MAX_BODIES: usize = 256_000;
 
 // ---- Collisions & debris ---------------------------------------------------
 

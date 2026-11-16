@@ -110,6 +110,8 @@ pub(in crate::physics) fn ring_slots(
     }
     let mut rng = XorShift::new(seed ^ 0x51AB_C0DE);
     let s = ring_sum(n);
+    // `ring_sum` assumes equal masses; use the mean so the ring stays balanced.
+    let m_mean = masses.iter().sum::<f64>() / n as f64;
     (0..n)
         .map(|k| {
             let theta = ring_theta(n, k, rng.next_f64());
@@ -121,7 +123,7 @@ pub(in crate::physics) fn ring_slots(
             );
             // Perifocal angle plus argument of periapsis must equal the
             // slot's polar angle; solve for omega.
-            ring_slot(masses[k], s, a_k, e_k, nu, theta - nu)
+            ring_slot(m_mean, s, a_k, e_k, nu, theta - nu)
         })
         .collect()
 }
@@ -174,9 +176,16 @@ pub(in crate::physics) fn system_reach_gm_with_mass(b: &Bodies, mt: f64) -> f64 
             dx.mul_add(dx, dy * dy).sqrt()
         })
         .collect();
+    // Stars (incl. hierarchical outer stars) always count; the quantile only
+    // exists to ignore a scattered small body. Must run before the select,
+    // which reorders `d`.
+    let star_reach = (0..n)
+        .filter(|&i| is_host_kind(b.kind[i]))
+        .map(|i| d[i])
+        .fold(0.0f64, f64::max);
     let k = ((n as f64 * REACH_QUANTILE) as usize).min(n - 1);
     let (_, val, _) = d.select_nth_unstable_by(k, |a, c| a.total_cmp(c));
-    (*val * 1.5).max(200.0)
+    ((*val).max(star_reach) * 1.5).max(200.0)
 }
 
 /// (x, y, vx, vy) for every system in a Plummer cluster.
@@ -229,7 +238,7 @@ pub(in crate::physics) fn cluster_slots(
                 // Truncate the Plummer tail so a single system cannot
                 // be flung so far it makes the cluster a one-system
                 // affair. u = 0.95 caps r at ~√19 · a.
-                let u = rng.next_f64().min(0.95);
+                let u = 0.95 * rng.next_f64();
                 let r = a * (u / (1.0 - u)).sqrt();
                 let th = rng.next_f64() * std::f64::consts::TAU;
                 let p = (r * th.cos(), r * th.sin());
@@ -252,6 +261,7 @@ pub(in crate::physics) fn cluster_slots(
         }
         break;
     }
+    debug_assert_eq!(pos.len(), n, "cluster_slots: growth loop exhausted");
     pos.iter()
         .map(|&(x, y)| {
             // sigma_1D² = G M / (6 √(r² + a²)) — the local value of the
@@ -268,13 +278,13 @@ pub(in crate::physics) fn cluster_slots(
         .collect()
 }
 
-/// Spawn `n_systems` independent random systems on a ring of radius
-/// `solar_ring_radius_gm(n_systems)`.
+/// Spawn `n_systems` independent random systems as a virialised Plummer
+/// cluster (see `cluster_slots`).
 ///
 /// Each system has up to `body_count` bodies (per-system) and its own
-/// derived seed, so systems are statistically independent. Systems sit on
-/// the ring and are given the circular-ring velocity so they orbit the
-/// common centre rather than collapsing into one clump.
+/// derived seed, so systems are statistically independent. Positions and
+/// velocities come from the Plummer sampler, with separations scaled to
+/// each system's reach so they cannot overlap at spawn.
 pub fn spawn_random_systems(
     b: &mut Bodies,
     body_count: usize,
@@ -298,8 +308,7 @@ fn spawn_one(body_count: usize, seed: u128) -> (Bodies, SystemInfo) {
 }
 
 /// Thread count for a job of `n` items: never more than `n`, never zero.
-/// Very small `n` falls back to single-threaded because thread spawn
-/// overhead dominates.
+/// Callers fall back to a single thread for very small `n`.
 fn n_threads_for(n: usize) -> usize {
     std::thread::available_parallelism()
         .map(|x| x.get())
@@ -337,99 +346,27 @@ pub(in crate::physics) fn spawn_random_systems_impl(
     // Per-system seed. Multiply by an odd constant so consecutive `k`
     // land in well-separated parts of the u128 space even from the same
     // master seed.
-    let sys_seed = |k: usize| seed.wrapping_add((k as u128).wrapping_mul(0x9E37_79B9));
-    let n_threads = n_threads_for(n);
-
-    // ---- Phase 1: spawn every system in parallel ----------------------
-    // Each system owns its own scratch `Bodies` and its own seed, so the
-    // work is embarrassingly parallel. Each thread builds a contiguous
-    // chunk; flattening in chunk order restores index order without a
-    // gather step.
-    let mut temps: Vec<(Bodies, SystemInfo)> = Vec::with_capacity(n);
-    if n_threads <= 1 || n < 4 {
-        for k in 0..n {
-            temps.push(spawn_one(body_count, sys_seed(k)));
-        }
-    } else {
-        let chunk = n.div_ceil(n_threads);
-        let mut chunk_results: Vec<Vec<(Bodies, SystemInfo)>> = Vec::with_capacity(n_threads);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n_threads)
-                .map(|ti| {
-                    let lo = ti * chunk;
-                    let hi = ((ti + 1) * chunk).min(n);
-                    // `sys_seed` captures only `seed: u128` (Copy), so it
-                    // is itself Copy and each thread gets its own copy —
-                    // no shared mutation, no closures-over-&mut.
-                    s.spawn(move || {
-                        (lo..hi)
-                            .map(|k| spawn_one(body_count, sys_seed(k)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for h in handles {
-                chunk_results.push(h.join().unwrap());
-            }
-        });
-        for v in chunk_results {
-            temps.extend(v);
-        }
-    }
+    let sys_seed = |k: usize| seed.wrapping_add((k as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    use rayon::prelude::*;
+    let mut temps: Vec<(Bodies, SystemInfo)> = (0..n)
+        .into_par_iter()
+        .map(|k| spawn_one(body_count, sys_seed(k)))
+        .collect();
 
     // ---- Phase 2: mass-scale body counts in parallel ------------------
-    // Heavier systems get more bodies. The heaviest system is unchanged
-    // by construction (its scale is 2.0, clamped, and its count grows);
-    // the lightest shrinks; the rest move proportionally.
-    //
-    // [Behavioural note] Skipping the respawn when |scale − 1| ≤ 0.05 is
-    // a deliberate deviation from the unoptimised version. The respawn
-    // only changes body count by a fraction already inside the `round`
-    // noise, so this halves the spawn cost for typical multi-system runs
-    // while preserving monotone mass ↔ body-count and the heaviest
-    // system. Removing the early return restores bit-identical layouts.
+    // Heavier systems get more bodies: the count scales with the system's
+    // mass relative to the mean, clamped to 0.5x-2x. Systems whose rounded
+    // count is unchanged are not respawned.
     if n > 1 {
         let masses: Vec<f64> = temps.iter().map(|t| t.0.m.iter().sum::<f64>()).collect();
         let avg = masses.iter().sum::<f64>() / n as f64;
-
-        let rescale_one = |k: usize, masses: &[f64]| -> Option<(Bodies, SystemInfo)> {
+        temps.par_iter_mut().enumerate().for_each(|(k, slot)| {
             let scale = (masses[k] / avg).clamp(0.5, 2.0);
-            if (scale - 1.0).abs() <= 0.05 {
-                return None;
-            }
             let count = ((body_count as f64 * scale).round() as usize).max(1);
             if count != body_count {
-                Some(spawn_one(count, sys_seed(k)))
-            } else {
-                None
+                *slot = spawn_one(count, sys_seed(k));
             }
-        };
-
-        if n_threads <= 1 || n < 4 {
-            for k in 0..n {
-                if let Some(t) = rescale_one(k, &masses) {
-                    temps[k] = t;
-                }
-            }
-        } else {
-            // `chunks_mut` gives each thread a disjoint &mut slice, so
-            // in-place replacement is race-free without a mutex.
-            let chunk = n.div_ceil(n_threads);
-            let masses_ref = &masses;
-            let rescale_ref = &rescale_one;
-            std::thread::scope(|s| {
-                for (ti, slice) in temps.chunks_mut(chunk).enumerate() {
-                    s.spawn(move || {
-                        for (j, slot) in slice.iter_mut().enumerate() {
-                            let k = ti * chunk + j;
-                            if let Some(t) = rescale_ref(k, masses_ref) {
-                                *slot = t;
-                            }
-                        }
-                    });
-                }
-            });
-        }
+        });
     }
 
     // ---- Phase 3: layout and assembly ---------------------------------
@@ -459,7 +396,12 @@ pub(in crate::physics) fn spawn_random_systems_impl(
             b.vy[i] += vy;
         }
         ranges.push((start, end));
-        infos.push(*info);
+        // `companion` is local to the scratch `Bodies`; make it global.
+        let mut info = *info;
+        if let Some(bi) = info.binary.as_mut() {
+            bi.companion += start;
+        }
+        infos.push(info);
     }
 
     // The ring shares a single metallicity; the first system's value

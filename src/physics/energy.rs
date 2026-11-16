@@ -82,7 +82,7 @@ fn potential_energy(b: &Bodies, n: usize) -> f64 {
     let mid = n / 2;
 
     let mut pe: f64 = if n >= PE_PAR_THRESHOLD {
-        (0..mid)
+        let parts: Vec<f64> = (0..mid)
             .into_par_iter()
             .map(|k| {
                 let i = k;
@@ -95,7 +95,8 @@ fn potential_energy(b: &Bodies, n: usize) -> f64 {
                 }
                 s
             })
-            .sum()
+            .collect();
+        parts.iter().sum::<f64>()
     } else {
         // Serial path for small n: same pairing, no rayon overhead.
         let mut s = 0.0;
