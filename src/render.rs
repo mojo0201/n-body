@@ -521,8 +521,8 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
-            bind_group_layouts: &[&camera_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout)],
+            immediate_size: 0,
         });
 
         let msaa_state = wgpu::MultisampleState {
@@ -578,13 +578,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
-                buffers: &[body_instance_layout],
+                entry_point: Some("vs_main"),
+                buffers: &[Some(body_instance_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[blend_target(format)],
                 compilation_options: Default::default(),
             }),
@@ -594,7 +594,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -620,13 +620,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_orbit",
-                buffers: &[orbit_layout.clone()],
+                entry_point: Some("vs_orbit"),
+                buffers: &[Some(orbit_layout.clone())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_orbit",
+                entry_point: Some("fs_orbit"),
                 targets: &[blend_target(format)],
                 compilation_options: Default::default(),
             }),
@@ -636,7 +636,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         // ---- Flash pipeline ----
@@ -666,13 +666,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_flash",
-                buffers: &[flash_instance_layout],
+                entry_point: Some("vs_flash"),
+                buffers: &[Some(flash_instance_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_flash",
+                entry_point: Some("fs_flash"),
                 targets: &[blend_target(format)],
                 compilation_options: Default::default(),
             }),
@@ -682,7 +682,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -719,8 +719,8 @@ impl Renderer {
         });
         let dust_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dust-pipeline-layout"),
-            bind_group_layouts: &[&camera_layout, &dust_fields_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout), Some(&dust_fields_layout)],
+            immediate_size: 0,
         });
         let dust_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DustVertex>() as u64,
@@ -762,13 +762,13 @@ impl Renderer {
             layout: Some(&dust_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_dust",
-                buffers: &[dust_vertex_layout],
+                entry_point: Some("vs_dust"),
+                buffers: &[Some(dust_vertex_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_dust",
+                entry_point: Some("fs_dust"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(additive),
@@ -782,7 +782,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         // ---- Comet pipeline: orbit vertex format, triangles, additive ----
@@ -791,13 +791,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_orbit",
-                buffers: &[orbit_layout],
+                entry_point: Some("vs_orbit"),
+                buffers: &[Some(orbit_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_orbit",
+                entry_point: Some("fs_orbit"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(additive),
@@ -811,7 +811,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -847,13 +847,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_glow",
-                buffers: &[glow_instance_layout],
+                entry_point: Some("vs_glow"),
+                buffers: &[Some(glow_instance_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_glow",
+                entry_point: Some("fs_glow"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(additive),
@@ -867,7 +867,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -892,13 +892,13 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_blackhole",
-                buffers: &[blackhole_instance_layout],
+                entry_point: Some("vs_blackhole"),
+                buffers: &[Some(blackhole_instance_layout)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_blackhole",
+                entry_point: Some("fs_blackhole"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -912,7 +912,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: msaa_state,
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

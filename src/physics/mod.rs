@@ -69,15 +69,17 @@ static DUST_VERSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---- Physics constants -----------------------------------------------------
 
-/// Gravitational constant in simulation units. Chosen so that a body at 1 AU
-/// with 1 M☉ has an orbital period of about 1 time unit; see `time_unit_s`.
+/// Gravitational constant in simulation units. One time unit is 49.9 days
+/// (see `time_unit_s`), so a body at 1 AU around 1 M☉ has an orbital period
+/// of about 7.32 time units (1 year).
 pub const G: f64 = 7.4;
 
-/// Squared gravitational softening length: 1e-3 Gm (1000 km). This is larger
-/// than the true radius of a neutron star (1e-5 Gm) and of a stellar-mass
-/// black hole's horizon, so for those bodies it regularises close encounters
-/// rather than truncating forces above any physical surface.
-pub const SOFT2: f64 = 1e-6;
+/// Squared gravitational softening length: 1e-4 Gm (100 km). At the
+/// distance of Phobos from Mars (9.4e-3 Gm) the force error is about
+/// 1.5·(ε/r)² = 0.017 %. The old value (1000 km) gave 1.7 %. For a neutron
+/// star (1e-5 Gm) or a stellar-mass black hole, this length is still larger
+/// than the body, so close encounters stay regularised.
+pub const SOFT2: f64 = 1e-8;
 
 // ---- Integration -----------------------------------------------------------
 
@@ -116,7 +118,7 @@ pub const PAR_WORK_MIN: usize = 20_000;
 
 /// Block time steps: body i takes steps of `DT / 2^rung`, at most `MAX_RUNG`
 /// halvings below the base step.
-pub const MAX_RUNG: u8 = 6;
+pub const MAX_RUNG: u8 = 8;
 
 /// Per-pair dynamical-time limit: dt ≤ ETA_GRAV · sqrt(d³ / (G M)).
 pub const ETA_GRAV: f64 = 0.015;
@@ -128,6 +130,10 @@ pub const ETA_VEL: f64 = 0.03;
 /// Systems this small and quiet use the 4th-order Yoshida step instead of
 /// block leapfrog (whose per-body sub-steps have lower order).
 pub const YOSHIDA_MAX_N: usize = 1500;
+
+/// Largest work for the Yoshida path in one `advance`, in pair evaluations:
+/// `n² · 3 · 2^kmax`. Above this, `advance` uses the block stepper.
+pub const YOSHIDA_WORK_MAX: usize = 20_000_000;
 
 // ---- Unit conversion -------------------------------------------------------
 
@@ -264,7 +270,9 @@ pub const EVO_WIND_LOSS_MASSIVE: f64 = 0.2;
 /// 2005).
 pub const SN_KICK_SIGMA_KMS: f64 = 265.0;
 
-/// A rate that makes a 1 M☉ star live about 10 time units (about 500 days).
+/// Demo rate: a 1 M☉ star would live about 10 time units (about 500 days).
+/// Not used by the app. `main.rs` sets the real rate, `time_unit_s() /
+/// SECONDS_PER_GYR`, times `aging_mult` (default 1.0).
 pub const EVO_RATE_DEMO: f64 = 1.0;
 
 // White dwarf cooling: Mestel law, L ∝ M t^(-7/6) with t = cooling age.
@@ -493,6 +501,11 @@ pub const HIT_RUN_RESTITUTION: f64 = 0.5;
 /// Leinhardt & Stewart (2012) catastrophic-disruption scale factor for stars.
 pub const LS_C_STAR: f64 = 1.9;
 
+/// Leinhardt & Stewart (2012) velocity-coupling parameter `μ̄`. It sets the
+/// exponent `2/(3μ̄) − 1` (about 0.80) of the mass-ratio factor in `Q*_RD`.
+/// Check the value against the paper for the regime that you model.
+pub const LS_MU_BAR: f64 = 0.37;
+
 /// Power-law slope of the fragment mass distribution: dN/dm ∝ m^-slope.
 pub const FRAG_SLOPE: f64 = 2.85;
 
@@ -660,6 +673,46 @@ pub const DUST_YIELD_FRAC: f64 = 0.02;
 /// Boost on the Poynting–Robertson drag speed. With β folded in, a grain
 /// drifts from 1 AU in about 10 yr at 100.
 pub const PR_DRAG_BOOST: f64 = 100.0;
+
+/// When true, the demo speed-ups use their physical values: PR drag and
+/// tides run with boost 1, and belt grinding is off (belt bodies still
+/// collide through the collision code). Default: true.
+static PHYSICAL_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_physical_mode(on: bool) {
+    PHYSICAL_MODE.store(on, AtomicOrdering::Relaxed);
+}
+
+pub fn physical_mode() -> bool {
+    PHYSICAL_MODE.load(AtomicOrdering::Relaxed)
+}
+
+/// Poynting–Robertson boost in use: 1.0 in physical mode.
+pub fn pr_drag_boost() -> f64 {
+    if physical_mode() {
+        1.0
+    } else {
+        PR_DRAG_BOOST
+    }
+}
+
+/// Tidal boost in use: 1.0 in physical mode.
+pub fn tidal_boost() -> f64 {
+    if physical_mode() {
+        1.0
+    } else {
+        TIDAL_BOOST
+    }
+}
+
+/// Belt grinding rate in use: 0.0 in physical mode.
+pub fn belt_grind_per_orbit() -> f64 {
+    if physical_mode() {
+        0.0
+    } else {
+        BELT_GRIND_PER_ORBIT
+    }
+}
 
 /// Initial dust mass injected per belt source body, as a fraction of the
 /// body's own mass. The physical steady-state zodiacal cloud is roughly

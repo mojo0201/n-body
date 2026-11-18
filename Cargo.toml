@@ -17,20 +17,20 @@ path = "src/bin/find_planets.rs"
  
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
-egui = "0.29"
-egui-wgpu = "0.29"
-egui-winit = "0.29"
-glam = "0.29"
+egui = "0.37.0"
+egui-wgpu = "0.37.0"
+egui-winit = "0.37.0"
+glam = "0.34.3"
 num_cpus = "1"
-pollster = "0.4"
+pollster = "1.0.1"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-wgpu = "22"
+wgpu = "30.0.2"
 winit = "0.30"
  
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
  
 [profile.release]
 opt-level = 3

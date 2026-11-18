@@ -230,6 +230,10 @@ pub(super) fn move_rung(
 pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
     let ticks = 1u32 << kmax;
     let dtf = dt / ticks as f64;
+    // Momentum at the start of the block. The full-force path removes the
+    // net acceleration (see `compute_accel`). A block updates only some
+    // bodies per sub-tick, so the same fix is done once at the block end.
+    let (p0x, p0y, _) = total_momentum(&*b);
     // Precomputed sub-tick sizes: rung_dt[r] = dt / 2^r. One division per
     // rung per block, replacing two per active body per tick.
     let rung_dt: Vec<f64> = (0..=(kmax as usize))
@@ -389,6 +393,8 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         b.time += dtf;
     }
 
+    remove_momentum_drift(b, (p0x, p0y));
+
     // Flashes are cosmetic. One O(F) retain at block end gives the same
     // survivor set as per-sub-tick aging would, because age is linear in
     // time and nothing in the block reads flashes.
@@ -421,13 +427,22 @@ pub fn advance(b: &mut Bodies, dt: f64) {
     }
     let kmax = assign_rungs(b, dt);
     b.stats.max_rung = kmax;
-    if kmax == 0 && n < YOSHIDA_MAX_N {
-        yoshida_step(b, dt);
-        b.stats.last_nsub = 1;
+    // Small systems keep the 4th-order Yoshida step even when a moon needs
+    // a short step. All bodies share one step `dt / 2^kmax`. Each Yoshida
+    // step costs 3 force evaluations. `work` counts the pair evaluations.
+    let substeps = 1usize << kmax;
+    let work = n.saturating_mul(n).saturating_mul(3 * substeps);
+    if n < YOSHIDA_MAX_N && work <= YOSHIDA_WORK_MAX {
+        let h = dt / substeps as f64;
+        for _ in 0..substeps {
+            yoshida_step(b, h);
+        }
+        b.stats.last_nsub = substeps as u32;
     } else {
         step_block(b, dt, kmax);
         b.stats.last_nsub = 1u32 << kmax;
     }
+    account_gw_loss(b, dt);
     tidal_dissipation(b, dt);
     evolve_stars(b, dt);
     dust::evolve(b, dt);

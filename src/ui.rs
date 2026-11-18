@@ -978,13 +978,13 @@ pub fn setup_style(ctx: &egui::Context) {
     v.panel_fill = t.colors.panel_fill();
     v.window_fill = t.colors.window_fill();
     v.window_stroke = Stroke::new(1.0_f32, Color32::from_gray(48));
-    v.window_rounding = egui::Rounding::same(t.spacing.window_rounding);
+    v.window_corner_radius = egui::CornerRadius::same(t.spacing.window_rounding as u8);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, Color32::from_gray(40));
     v.selection.bg_fill = t.colors.selection_bg();
     v.override_text_color = Some(t.colors.text());
     ctx.set_visuals(v);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.style_of(ctx.theme())).clone();
     // Tighter spacing than egui's default: the dock is dense, and the
     // default 8×4 px item spacing makes it 20 % taller for no benefit.
     style.spacing.item_spacing = egui::vec2(t.spacing.item_spacing[0], t.spacing.item_spacing[1]);
@@ -1018,12 +1018,12 @@ pub fn setup_style(ctx: &egui::Context) {
     style.interaction.tooltip_delay = 1.0;
     // Thin scroll bars that float over the content instead of taking a column.
     style.spacing.scroll = egui::style::ScrollStyle::floating();
-    ctx.set_style(style);
+    ctx.set_style_of(ctx.theme(), style);
 }
 fn panel_frame() -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(theme().colors.panel_fill())
-        .inner_margin(egui::Margin::same(theme().spacing.panel_margin))
+        .inner_margin(egui::Margin::same(theme().spacing.panel_margin as i8))
         .stroke(Stroke::new(1.0_f32, Color32::from_gray(40)))
 }
 
@@ -1286,7 +1286,7 @@ fn heading_row(ui: &mut egui::Ui, text: &str) {
 /// Order matters: overlays go under the panels so panels are readable on
 /// top, and the status bar is drawn before the dock so the dock's scroll
 /// area gets the remaining height.
-pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, view: &ViewInfo, b: &Bodies) -> Actions {
+pub fn draw(ctx: &egui::Context, ui: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bodies) -> Actions {
     let mut act = Actions::default();
 
     // Stats are O(n²) for moons — recompute only every 250 ms, not every
@@ -1310,10 +1310,10 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
     }
 
     draw_overlays(ctx, ui_state, view, b);
-    status_bar(ctx, ui_state, view, b);
+    status_bar(ui, ui_state, view, b);
     save_toast(ctx, ui_state);
     if ui_state.show_dock {
-        dock(ctx, ui_state, view, b, &mut act);
+        dock(ui, ui_state, view, b, &mut act);
     }
     if ui_state.diag.visible {
         diag_window(ctx, ui_state, view, b, &mut act);
@@ -1396,7 +1396,7 @@ fn drawn_pos(view: &ViewInfo, b: &Bodies, i: usize) -> (f64, f64) {
 /// the status bar) but over the wgpu scene.
 fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies) {
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let screen = ctx.screen_rect();
+    let screen = ctx.input(|i| i.content_rect());
 
     // Selection ring.
     if let Some(id) = view.selected {
@@ -1489,10 +1489,10 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
 
 /// Top-of-window status strip: running state, speed, time, body count, fps,
 /// warnings, and a hint about the help key.
-fn status_bar(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
-    egui::TopBottomPanel::top("status")
-        .frame(panel_frame().inner_margin(egui::Margin::symmetric(10.0, 4.0)))
-        .show(ctx, |ui| {
+fn status_bar(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
+    egui::Panel::top("status")
+        .frame(panel_frame().inner_margin(egui::Margin::symmetric(10, 4)))
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // If the dock is hidden, surface a way to bring it back. The
                 // button label is "☰ panel" to match the hamburger menu
@@ -1553,14 +1553,14 @@ fn status_bar(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies
 
 /// The left control panel. Everything is a `CollapsingHeader` so the panel
 /// can be scrolled to whatever the user cares about.
-fn dock(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies, act: &mut Actions) {
-    egui::SidePanel::left("dock")
+fn dock(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies, act: &mut Actions) {
+    egui::Panel::left("dock")
         .frame(panel_frame())
-        .default_width(235.0)
-        .min_width(190.0)
-        .max_width(320.0)
+        .default_size(235.0)
+        .min_size(190.0)
+        .max_size(320.0)
         .resizable(true)
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Orbital N-Body")
@@ -2267,7 +2267,7 @@ fn systems_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
                 }
             }
             egui::ScrollArea::vertical()
-                .max_height((ctx.screen_rect().height() - 220.0).max(160.0))
+                .max_height((ctx.content_rect().height() - 220.0).max(160.0))
                 .show(ui, |ui| {
                     egui::Grid::new("systems_grid")
                         .num_columns(5)
@@ -2361,7 +2361,7 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
     let mut open = st.show_events;
     let si = st.units_si;
     egui::Window::new(format!("Events ({})", b.events.len()))
-        .id(egui::Id::new("events_window"))
+        .id(egui::Id::unique("events_window"))
         .open(&mut open)
         .default_pos([340.0, 80.0])
         .default_size([620.0, 520.0])
@@ -2442,7 +2442,7 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
                             egui::pos2(x0 + 0.5, y - h),
                             egui::pos2(x0 + bw - 0.5, y),
                         ),
-                        egui::Rounding::ZERO,
+                        egui::CornerRadius::ZERO,
                         event_color(EVENT_KINDS[k].0),
                     );
                     y -= h;
@@ -2498,7 +2498,7 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
                     .color(theme().colors.dim()),
             );
             egui::ScrollArea::both()
-                .max_height((ctx.screen_rect().height() - 330.0).max(160.0))
+                .max_height((ctx.content_rect().height() - 330.0).max(160.0))
                 .auto_shrink([false, false])
                 .id_salt("events_scroll")
                 .show(ui, |ui| {
@@ -2603,7 +2603,7 @@ fn selection_window(
     let label = b.name[i].clone().unwrap_or_else(|| format!("#{}", b.id[i]));
     let title = format!("{}  {}", label, ph::body_class_with_parent(b, i, parent));
     egui::Window::new(title)
-        .id(egui::Id::new("selection"))
+        .id(egui::Id::unique("selection"))
         .open(&mut open)
         // Anchored top-right with a 10-point margin, so it sits over the
         // 3D scene but doesn't collide with the dock.
@@ -2667,7 +2667,7 @@ fn selection_window(
             // window never overflows on small screens.
             egui::ScrollArea::vertical()
                 .id_salt(("sel_scroll", b.id[i]))
-                .max_height((ctx.screen_rect().height() - 300.0).max(120.0))
+                .max_height((ctx.content_rect().height() - 300.0).max(120.0))
                 .show(ui, |ui| {
                     if sec[0] || sec[1] || sec[2] || sec[3] || sec[4] {
                         // Calculate half the available width, minus half the spacing (10.0 / 2)
@@ -2807,7 +2807,7 @@ fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
     let red = Color32::from_rgb(220, 90, 90);
     let confirm_time = Duration::from_secs(4);
     egui::Window::new("Saves")
-        .id(egui::Id::new("saves_window"))
+        .id(egui::Id::unique("saves_window"))
         .open(&mut open)
         .default_width(360.0)
         .resizable(true)
@@ -2981,7 +2981,7 @@ fn save_toast(ctx: &egui::Context, st: &UiState) {
     if left.is_zero() {
         return;
     }
-    egui::Area::new(egui::Id::new("save_toast"))
+    egui::Area::new(egui::Id::unique("save_toast"))
         .anchor(Align2::CENTER_BOTTOM, [0.0, -48.0])
         .interactable(false)
         .show(ctx, |ui| {
@@ -4131,7 +4131,7 @@ fn plot_rect(ui: &mut egui::Ui, height: f32) -> (egui::Rect, egui::Painter, egui
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, egui::Rounding::same(2.0), Color32::from_gray(20));
+    painter.rect_filled(rect, egui::CornerRadius::same(2), Color32::from_gray(20));
     (rect, painter, resp)
 }
 
@@ -4343,7 +4343,7 @@ fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
                 egui::pos2(x0, rect.bottom() - h),
                 egui::pos2(x1, rect.bottom()),
             ),
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             theme().colors.accent(),
         );
     }
@@ -4466,7 +4466,7 @@ fn diag_window(
             ui.separator();
 
             egui::ScrollArea::vertical()
-                .max_height((ctx.screen_rect().height() - 220.0).max(160.0))
+                .max_height((ctx.content_rect().height() - 220.0).max(160.0))
                 .show(ui, |ui| {
                     let d = &st.diag;
                     plot_series(

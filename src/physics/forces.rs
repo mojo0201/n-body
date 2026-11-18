@@ -19,6 +19,16 @@ use super::*;
 /// hardware, which is about the cost of one rayon dispatch.
 pub(super) const DIRECT_CHUNK: usize = 2048;
 
+/// PN corrections run when some body moves faster than this fraction of
+/// `c`. 1e-5 (about 3 km/s) is below the speed of every planet, so GR
+/// works for ordinary planetary systems.
+pub(super) const PN_V_OVER_C_MIN: f64 = 1e-5;
+
+/// The 2.5PN drag runs for a pair when `(v_rel / c)^2` is above this value
+/// (v_rel above about 300 km/s). `add_pn_corrections` and `account_gw_loss`
+/// both use it. Keep them in sync.
+pub(super) const GW_REL_V2_MIN: f64 = 1e-6;
+
 /// Serial direct-sum acceleration on body `i`.
 ///
 /// Computes, over all `j != i`:
@@ -342,8 +352,8 @@ pub fn compute_accel(b: &mut Bodies) {
     // Post-Newtonian corrections. 1PN is the leading GR correction
     // (perihelion precession); 2.5PN is the leading gravitational-wave
     // radiation reaction (orbital decay). Only run when at least one
-    // body is moving at v/c > 1e-5 (≈390 km/s), so ordinary slow systems
-    // pay nothing.
+    // body is moving at v/c > 1e-5 (about 3 km/s). Only pairs that
+    // include a host body are corrected, so the cost is O(hosts · n).
     if n >= 2 && needs_pn(b) {
         add_pn_corrections(b, None);
     }
@@ -369,11 +379,12 @@ pub fn compute_accel(b: &mut Bodies) {
     }
 }
 
-/// True if any live body has `v/c > 1e-5` (≈390 km/s), the threshold below
-/// which post-Newtonian corrections are numerically invisible. O(n).
+/// True if any live body has `v/c > PN_V_OVER_C_MIN` (1e-5, about 3 km/s).
+/// Below this speed the post-Newtonian terms are smaller than the
+/// integrator error. O(n).
 pub(super) fn needs_pn(b: &Bodies) -> bool {
     let c = c_sim();
-    let thresh = 1e-6 * c * c; // v/c > 1e-3 (~390 km/s): compact objects only
+    let thresh = PN_V_OVER_C_MIN * PN_V_OVER_C_MIN * c * c;
     for i in 0..b.len() {
         if b.dead[i] {
             continue;
@@ -384,6 +395,77 @@ pub(super) fn needs_pn(b: &Bodies) -> bool {
         }
     }
     false
+}
+
+/// Total mass-weighted momentum `(px, py, M)` of the live bodies.
+pub(super) fn total_momentum(b: &Bodies) -> (f64, f64, f64) {
+    let (mut px, mut py, mut mt) = (0.0, 0.0, 0.0);
+    for i in 0..b.len() {
+        if b.dead[i] {
+            continue;
+        }
+        px += b.m[i] * b.vx[i];
+        py += b.m[i] * b.vy[i];
+        mt += b.m[i];
+    }
+    (px, py, mt)
+}
+
+/// Remove the momentum that the numerical scheme added since `p0` was
+/// measured. Every body gets the same velocity shift, so the centre of
+/// mass stays inertial. The block stepper uses this at the end of a
+/// block, in place of the acceleration fix in `compute_accel`.
+pub(super) fn remove_momentum_drift(b: &mut Bodies, p0: (f64, f64)) {
+    let (px, py, mt) = total_momentum(b);
+    if mt <= 0.0 {
+        return;
+    }
+    let dvx = (px - p0.0) / mt;
+    let dvy = (py - p0.1) / mt;
+    for i in 0..b.len() {
+        b.vx[i] -= dvx;
+        b.vy[i] -= dvy;
+    }
+}
+
+/// Add the energy that the 2.5PN drag removed during a step of length `dt`
+/// to `stats.energy_offset`, so `energy_drift_pct` does not show it as
+/// integrator error. For one pair the power is `K · |v_rel|²` with
+/// `K = (32/5) G³ m_i² m_j² / (c⁵ r⁴)`. Call it once per step, after the
+/// integration and before `settle_energy`.
+pub(super) fn account_gw_loss(b: &mut Bodies, dt: f64) {
+    let n = b.len();
+    if n < 2 || !needs_pn(b) {
+        return;
+    }
+    let c = c_sim();
+    let inv_c2 = 1.0 / (c * c);
+    let inv_c5 = inv_c2 * inv_c2 / c;
+    let mut power = 0.0;
+    for i in 0..n {
+        if b.dead[i] || !is_host_kind(b.kind[i]) {
+            continue;
+        }
+        for j in 0..n {
+            if j == i || b.dead[j] || (is_host_kind(b.kind[j]) && j < i) {
+                continue;
+            }
+            let rvx = b.vx[i] - b.vx[j];
+            let rvy = b.vy[i] - b.vy[j];
+            let rel_v_sq = rvx * rvx + rvy * rvy;
+            if rel_v_sq * inv_c2 <= GW_REL_V2_MIN {
+                continue;
+            }
+            let dx = b.x[i] - b.x[j];
+            let dy = b.y[i] - b.y[j];
+            let r2 = dx * dx + dy * dy + SOFT2;
+            let mi = b.m[i];
+            let mj = b.m[j];
+            let k = (32.0 / 5.0) * G * G * G * mi * mi * mj * mj * inv_c5 / (r2 * r2);
+            power += k * rel_v_sq;
+        }
+    }
+    b.stats.energy_offset -= power * dt;
 }
 
 /// Add 1PN (Einstein–Infeld–Hoffmann) and 2.5PN (Peters-drag) corrections
@@ -428,10 +510,14 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     });
     let on = |k: usize| mask.as_ref().map_or(true, |m| m[k]);
 
-    for i in 0..n {
-        if b.dead[i] {
-            continue;
-        }
+    // Every pair that gets PN terms contains a host body. The outer loop
+    // visits hosts only. The `j` loop below skips a host `j` with `j < i`,
+    // so a host-host pair is done once, and a host-planet pair is done
+    // once. Planet-planet pairs get no PN terms (they are negligible).
+    let hosts: Vec<usize> = (0..n)
+        .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
+        .collect();
+    for &i in &hosts {
         let mi = b.m[i];
         let xi = b.x[i];
         let yi = b.y[i];
@@ -483,12 +569,13 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
 
             // ---- 2.5PN (Peters drag) ----
             // Skips the arithmetic for pairs where v_rel << c. The
-            // threshold is (v_rel/c)² > 1e-10, i.e. (≈390 km/s); below that
-            // the drag is orders below f64 resolution.
+            // threshold is (v_rel/c)² > GW_REL_V2_MIN (1e-6), that is
+            // v_rel above about 300 km/s. Below that the drag is
+            // far smaller than the integrator error.
             let rvx = vxi - vxj;
             let rvy = vyi - vyj;
             let rel_v_sq = rvx * rvx + rvy * rvy;
-            if rel_v_sq * inv_c2 > 1e-6 {
+            if rel_v_sq * inv_c2 > GW_REL_V2_MIN {
                 let r4 = r2 * r2;
                 let coeff_i = -(32.0 / 5.0) * G * G * G * mi * mj * mj * inv_c5 / r4;
                 let coeff_j = (32.0 / 5.0) * G * G * G * mi * mi * mj * inv_c5 / r4;

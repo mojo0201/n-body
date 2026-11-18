@@ -73,8 +73,8 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         return;
     }
 
-    // Constant (9/2)·(k₂/Q_eff) with Q_eff = Q*/BOOST, folded at compile time.
-    const K2Q_45: f64 = 4.5 * TIDAL_K2_STAR * TIDAL_BOOST / TIDAL_Q_STAR;
+    // (9/2)·(k₂/Q_eff) with Q_eff = Q*/boost. The boost is 1 in physical mode.
+    let k2q_45 = 4.5 * TIDAL_K2_STAR * tidal_boost() / TIDAL_Q_STAR;
 
     // A bound orbit satisfies r ≤ 2a, hence a ≥ r/2. So if r exceeds
     // 2·TIDAL_MAX_RADII·R∗, the later `a > TIDAL_MAX_RADII·R∗` test is
@@ -139,7 +139,7 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         let q = b.m[j] / m_host;
         let ratio = r_host / a_sma;
         let ratio5 = ratio * ratio * ratio * ratio * ratio;
-        let rate = K2Q_45 * q * (1.0 + q) * ratio5 * n_mean;
+        let rate = k2q_45 * q * (1.0 + q) * ratio5 * n_mean;
         if !(rate > 0.0) || !rate.is_finite() {
             continue;
         }
@@ -153,8 +153,19 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         };
 
         // Decay factor 1 − Ω/n: slow host → inward, fast host → outward.
+        // `b.spin` is signed (positive = counter-clockwise), so the mean
+        // motion must be signed too. The sign of the orbital angular
+        // momentum `dx·dvy − dy·dvx` gives the sense of the orbit. A
+        // retrograde orbit has n < 0, so a host that spins prograde
+        // pushes the planet inward faster.
+        let n_signed = if dx * dvy - dy * dvx >= 0.0 {
+            n_mean
+        } else {
+            -n_mean
+        };
         // Clamped so a single step cannot destabilize the integrator.
-        let frac = (rate * (1.0 - omega_host / n_mean) * dt).clamp(-TIDAL_MAX_FRAC, TIDAL_MAX_FRAC);
+        let frac =
+            (rate * (1.0 - omega_host / n_signed) * dt).clamp(-TIDAL_MAX_FRAC, TIDAL_MAX_FRAC);
         if frac == 0.0 {
             continue;
         }
@@ -173,14 +184,26 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         let new_dvx = new_vr * ux - new_vt * uy;
         let new_dvy = new_vr * uy + new_vt * ux;
 
-        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
-        b.vx[j] += new_dvx - dvx;
-        b.vy[j] += new_dvy - dvy;
+        // The tide changes the RELATIVE velocity by (ddvx, ddvy). Share it by
+        // mass so the pair's linear momentum does not change: the planet
+        // gets m_host/M of it and the host gets -m_planet/M of it.
+        let ddvx = new_dvx - dvx;
+        let ddvy = new_dvy - dvy;
+        let m_pair = m_host + b.m[j];
+        let share_planet = m_host / m_pair;
+        let share_host = b.m[j] / m_pair;
+        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
+            + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host]);
+        b.vx[j] += share_planet * ddvx;
+        b.vy[j] += share_planet * ddvy;
+        b.vx[host] -= share_host * ddvx;
+        b.vy[host] -= share_host * ddvy;
         // Positions and masses do not change, so the energy change is the
-        // planet's kinetic-energy change. If a snapshot is pending,
+        // kinetic-energy change of both bodies. If a snapshot is pending,
         // `settle_energy` already counts it. Do not count it twice.
         if b.e_pre.is_none() {
-            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
+            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
+                + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host]);
             b.stats.energy_offset += ke1 - ke0;
         }
 

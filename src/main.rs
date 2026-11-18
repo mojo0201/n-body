@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nbody_rust::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
+use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
 use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
 use nbody_rust::Preset;
@@ -1223,7 +1223,7 @@ impl App {
             let _ = h.join();
         }
         if let Some(gfx) = &self.gfx {
-            gfx.device.poll(wgpu::Maintain::Wait);
+            let _ = gfx.device.poll(wgpu::PollType::wait_indefinitely());
         }
         self.gfx = None;
     }
@@ -1244,24 +1244,24 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            apply_limit_buckets: false,
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
         .expect("adapter");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::default(),
+            label: None,
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: Default::default(),
+        }))
         .expect("device");
 
         let size = window.inner_size();
@@ -1280,6 +1280,7 @@ impl ApplicationHandler for App {
             caps.alpha_modes[0]
         };
         let config = wgpu::SurfaceConfiguration {
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
@@ -1310,7 +1311,16 @@ impl ApplicationHandler for App {
             None,
         );
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 4, false);
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 4,
+                depth_stencil_format: None,
+                dithering: false,
+                ..Default::default()
+            },
+        );
 
         self.gfx = Some(GfxState {
             renderer,
@@ -1361,7 +1371,7 @@ impl ApplicationHandler for App {
                     let _ = h.join();
                 }
                 if let Some(gfx) = &self.gfx {
-                    gfx.device.poll(wgpu::Maintain::Wait);
+                    let _ = gfx.device.poll(wgpu::PollType::wait_indefinitely());
                 }
                 self.gfx = None;
                 event_loop.exit();
@@ -1388,7 +1398,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || gfx.egui_ctx.wants_keyboard_input() {
+                if event.state != ElementState::Pressed || gfx.egui_ctx.egui_wants_keyboard_input()
+                {
                     return;
                 }
                 // Held keys repeat only for panning and zooming. Toggles,
@@ -1542,7 +1553,7 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if state == ElementState::Pressed {
-                    if response.consumed || gfx.egui_ctx.is_pointer_over_area() {
+                    if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
                         return;
                     }
                     self.sim.dragging = true;
@@ -1582,7 +1593,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if response.consumed || gfx.egui_ctx.is_pointer_over_area() {
+                if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
                     return;
                 }
                 let zoom_mod = self.mods.control_key()
@@ -1614,7 +1625,7 @@ impl ApplicationHandler for App {
 
             // macOS pinch gesture. `delta` is the fractional change in scale.
             WindowEvent::PinchGesture { delta, .. } => {
-                if response.consumed || gfx.egui_ctx.is_pointer_over_area() {
+                if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
                     return;
                 }
                 let cursor = self.sim.cursor;
@@ -1641,16 +1652,13 @@ impl ApplicationHandler for App {
                 }
 
                 let frame = match gfx.surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    wgpu::CurrentSurfaceTexture::Success(f)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+                    wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                         gfx.surface.configure(&gfx.device, &gfx.config);
                         return;
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        event_loop.exit();
-                        return;
-                    }
-                    Err(_) => return,
+                    _ => return,
                 };
                 let view = frame
                     .texture
@@ -1766,8 +1774,9 @@ impl ApplicationHandler for App {
                         mass_transfer: self.sim.mass_transfer,
                         aging_mult: self.sim.aging_mult,
                     };
-                    full_output = gfx.egui_ctx.run(raw_input, |ctx| {
-                        actions = ui::draw(ctx, &mut self.ui, &view_info, &b);
+                    full_output = gfx.egui_ctx.run_ui(raw_input, |root_ui| {
+                        let ctx = root_ui.ctx().clone();
+                        actions = ui::draw(&ctx, root_ui, &mut self.ui, &view_info, &b);
                     });
                     self.sim
                         .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
@@ -1906,9 +1915,11 @@ impl ApplicationHandler for App {
                     .egui_ctx
                     .tessellate(full_output.shapes, pixels_per_point);
 
-                for (id, delta) in &full_output.textures_delta.set {
-                    gfx.egui_renderer
-                        .update_texture(&gfx.device, &gfx.queue, *id, delta);
+                for (id, deltas) in &full_output.textures_delta.set {
+                    for delta in deltas.iter() {
+                        gfx.egui_renderer
+                            .update_texture(&gfx.device, &gfx.queue, *id, delta);
+                    }
                 }
 
                 let screen_desc = ScreenDescriptor {
@@ -1928,8 +1939,10 @@ impl ApplicationHandler for App {
 
                 {
                     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        multiview_mask: None,
                         label: Some("main-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            depth_slice: None,
                             view: &gfx.msaa_view,
                             resolve_target: Some(&view),
                             ops: wgpu::Operations {
@@ -1947,7 +1960,7 @@ impl ApplicationHandler for App {
                 }
 
                 gfx.queue.submit([encoder.finish()]);
-                frame.present();
+                gfx.queue.present(frame);
 
                 for id in &full_output.textures_delta.free {
                     gfx.egui_renderer.free_texture(id);

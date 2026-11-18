@@ -257,7 +257,7 @@ impl DustField {
         };
         let cull = CULL_FACTOR * self.extent_gm;
         let pert = collect_perturbers(b, pri, cull);
-        let c = c_sim() / PR_DRAG_BOOST;
+        let c = c_sim() / pr_drag_boost();
         let cull2 = cull * cull;
 
         if self.grains.len() < SEQUENTIAL_GRAIN_THRESHOLD {
@@ -545,7 +545,7 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
         .filter_map(|i| semi_major_axis(b, i, pri).map(|a| (i, a)))
         .collect();
     let belt_mass: f64 = members.iter().map(|&(i, _)| b.m[i]).sum();
-    let rate = BELT_GRIND_PER_ORBIT * (belt_mass / BELT_GRIND_M_REF).clamp(0.01, 100.0);
+    let rate = belt_grind_per_orbit() * (belt_mass / BELT_GRIND_M_REF).clamp(0.01, 100.0);
     for (i, a) in members {
         let m = b.m[i];
         if m < BELT_GRIND_MIN_M || f.grains.len() + DUST_EMIT_GRAINS > DUST_MAX_GRAINS {

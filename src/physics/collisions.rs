@@ -521,7 +521,10 @@ pub(super) fn q_star_rd(m_tot: f64, gamma: f64) -> f64 {
     let rho1 = rho1_sim();
     let rc1 = (3.0 * m_tot / (4.0 * pi * rho1)).cbrt();
     let q11 = LS_C_STAR * 0.8 * pi * rho1 * G * rc1 * rc1;
-    q11 * (gamma + 1.0).powi(2) / (4.0 * gamma)
+    // Leinhardt & Stewart (2012): the mass-ratio factor has the exponent
+    // 2/(3·μ̄) − 1, which is about 0.80 and not 1.
+    let ratio_factor = (gamma + 1.0).powi(2) / (4.0 * gamma);
+    q11 * ratio_factor.powf(2.0 / (3.0 * LS_MU_BAR) - 1.0)
 }
 
 /// Draw `n` fragment masses from a power-law distribution with slope
