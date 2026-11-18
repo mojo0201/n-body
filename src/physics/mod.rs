@@ -162,6 +162,8 @@ pub const R_EARTH_GM: f64 = 0.006371;
 
 /// Main-sequence mass–radius exponent: R ∝ M^0.8.
 pub const STAR_MR_EXP: f64 = 0.8;
+/// Mass–radius exponent above 1 M☉ (CNO-cycle stars expand more slowly).
+pub const STAR_MR_EXP_HI: f64 = 0.57;
 
 /// Schwarzschild radius in Gm per Earth mass: R_s = 2GM/c².
 pub const SCHWARZSCHILD_GM_PER_ME: f64 = 8.87e-12;
@@ -933,7 +935,10 @@ pub fn radius_from_density(m: f64, rho_gcc: f64) -> f64 {
 /// `planet_true_r`. Used for collisions and Roche geometry.
 pub fn physical_radius(kind: BodyKind, m: f64) -> f64 {
     match kind {
-        BodyKind::Star => R_SUN_GM * (m / M_SUN_ME).powf(STAR_MR_EXP),
+        BodyKind::Star => {
+            let x = m / M_SUN_ME;
+            R_SUN_GM * x.powf(if x < 1.0 { STAR_MR_EXP } else { STAR_MR_EXP_HI })
+        }
         BodyKind::BrownDwarf => R_EARTH_GM * BD_R_EARTH * (m / JUPITER_MASS).powf(BD_R_EXP),
         BodyKind::WhiteDwarf => R_EARTH_GM * WD_R_EARTH * (m / M_SUN_ME).powf(WD_R_EXP),
         BodyKind::NeutronStar => NS_R_GM,
@@ -1395,15 +1400,30 @@ pub fn au_in_gm() -> f64 {
     AU_KM / LEN_KM
 }
 
-/// Conservative habitable zone of a host of `(kind, m)`, in AU. The inner and
-/// outer edges correspond to 1.1× and 0.36× Earth's stellar flux. Both are
-/// NaN if the host emits no light.
+/// Kopparapu et al. (2013) habitable-zone flux limits `(inner, outer)` in S⊕
+/// for a star of effective temperature `teff` (K): runaway greenhouse (inner)
+/// and maximum greenhouse (outer). Cool stars shift light to the infrared
+/// where it is absorbed better, so their limits are lower than a Sun-like
+/// star's. Valid 2600–7200 K; `teff` is clamped to that range.
+pub fn hz_flux_limits(teff: f64) -> (f64, f64) {
+    let t = teff.clamp(2600.0, 7200.0) - 5780.0;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t4 = t2 * t2;
+    let inner = 1.107 + 1.332e-4 * t + 1.580e-8 * t2 - 8.308e-12 * t3 - 1.931e-15 * t4;
+    let outer = 0.356 + 6.171e-5 * t + 1.698e-9 * t2 - 3.198e-12 * t3 - 5.575e-16 * t4;
+    (inner, outer)
+}
+
+/// Habitable zone of a host of `(kind, m)`, in AU, using the main-sequence
+/// luminosity and temperature. Both are NaN if the host emits no light.
 pub fn habitable_zone_au(kind: BodyKind, m: f64) -> (f64, f64) {
     let l = star_luminosity(kind, m);
     if l <= 0.0 {
         return (f64::NAN, f64::NAN);
     }
-    ((l / 1.1).sqrt(), (l / 0.36).sqrt())
+    let (si, so) = hz_flux_limits(star_temperature(kind, m));
+    ((l / si).sqrt(), (l / so).sqrt())
 }
 
 /// Sum the flux at `(x, y)` from every luminous body except `skip`.
@@ -1442,12 +1462,67 @@ pub fn stellar_flux(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
     s
 }
 
-/// Equilibrium temperature in K for a body receiving flux `s`
-/// (L☉ / AU²). Uses the zero-albedo blackbody form, calibrated to 255 K at
-/// Earth's insolation.
+/// Equilibrium temperature in K for a body with Bond albedo `a` receiving
+/// flux `s` (L☉ / AU²): T = 278.6 K · (s (1 − a))^¼, no greenhouse.
+#[inline]
+pub fn equilibrium_temp_albedo(s: f64, albedo: f64) -> f64 {
+    278.6 * (s * (1.0 - albedo).max(0.0)).powf(0.25)
+}
+
+/// Equilibrium temperature for an Earth-like Bond albedo (0.3): 255 K at
+/// Earth's insolation. Use `equilibrium_temp_albedo` for other albedos.
 #[inline]
 pub fn equilibrium_temp(s: f64) -> f64 {
-    255.0 * s.powf(0.25)
+    equilibrium_temp_albedo(s, 0.3)
+}
+
+/// Luminosity-weighted effective temperature of the light reaching `(x, y)`
+/// (used to choose the habitable-zone limits). 5780 K if nothing shines.
+pub fn stellar_flux_teff(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
+    let au2 = au_in_gm() * au_in_gm();
+    let (mut sw, mut st) = (0.0, 0.0);
+    for k in 0..b.len() {
+        if k == skip {
+            continue;
+        }
+        let l = luminosity_of(b, k);
+        if l <= 0.0 {
+            continue;
+        }
+        let dx = b.x[k] - x;
+        let dy = b.y[k] - y;
+        let f = l / ((dx * dx + dy * dy) / au2).max(1e-12);
+        sw += f;
+        st += f * temperature_of(b, k);
+    }
+    if sw > 0.0 { st / sw } else { 5780.0 }
+}
+
+/// How strongly black hole `i` is being fed, 0..1 (drives its accretion disk).
+/// 1 while a bound donor overflows its Roche lobe onto it, 0.5 for a hole
+/// orbited closely by a very luminous (wind-losing) star, otherwise 0 — an
+/// isolated hole has no luminous disk.
+pub fn accretion_level(b: &Bodies, i: usize) -> f64 {
+    if i >= b.len() || b.kind[i] != BodyKind::BlackHole {
+        return 0.0;
+    }
+    let au = au_in_gm();
+    let mut level: f64 = 0.0;
+    for k in 0..b.len() {
+        if k == i || b.dead[k] || b.kind[k] != BodyKind::Star {
+            continue;
+        }
+        let dx = b.x[k] - b.x[i];
+        let dy = b.y[k] - b.y[i];
+        let d = (dx * dx + dy * dy).sqrt();
+        if k < b.rlof.len() && b.rlof[k] && d < 1e4 * b.r[i].max(1e-12) + 50.0 * au {
+            return 1.0;
+        }
+        if d < 100.0 * au && luminosity_of(b, k) > 1e4 {
+            level = level.max(0.5);
+        }
+    }
+    level
 }
 
 /// Hill radius of body `i` around host `h`, in simulation units.

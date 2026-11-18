@@ -399,13 +399,54 @@ pub(super) fn spawn_planet(
         // mass and origin to give them the tan gas-giant look.
         b.class[i] = BodyClass::Icy;
         b.bulk_density[i] = giant_density(m, rng);
+        // Hot-Jupiter radius inflation (Demory & Seager 2011): above
+        // ~150 S⊕ the radius grows by up to ~25 %. Uses the snow-line scaling
+        // for flux (flux at the snow line ≈ 0.137 S⊕), so it needs no RNG.
+        let flux = flux_from_snow_line(a_gm / au_in_gm(), snow_line_au);
+        let infl = 1.0 + 0.25 * ((flux / 150.0).max(1.0).log10() / 1.5).min(1.0);
+        b.bulk_density[i] /= infl * infl * infl;
     } else {
         let a_au = a_gm / au_in_gm();
         b.class[i] = class_for(BodyOrigin::Spawned, a_au, snow_line_au);
-        b.bulk_density[i] = draw_density(rng, b.class[i]);
+        let flux = flux_from_snow_line(a_au, snow_line_au);
+        b.bulk_density[i] = draw_planet_density(rng, b.class[i], m, flux);
     }
     b.r[i] = b.radius_now(i);
     i
+}
+
+/// Approximate stellar flux in S⊕ at `a_au`, inferred from the snow-line
+/// distance (which scales as √L): flux ≈ 0.137 (snow / a)².
+fn flux_from_snow_line(a_au: f64, snow_line_au: f64) -> f64 {
+    if !(a_au > 0.0 && snow_line_au.is_finite() && snow_line_au > 0.0) {
+        return 1.0;
+    }
+    0.137 * (snow_line_au / a_au) * (snow_line_au / a_au)
+}
+
+/// Bulk density (g/cm³) for a spawned planet of mass `m` (M⊕) and flux `flux`
+/// (S⊕), with the same single RNG draw as `draw_density`.
+///
+/// Rocky planets get Earth-like compositions whose density rises with mass
+/// through compression (∝ M^0.19). Above ~2 M⊕ a fraction of them keep a
+/// volatile envelope (sub-Neptunes, ρ ≈ 1.5–3 g/cm³); that fraction rises with
+/// mass and is stripped by photoevaporation at high flux. That reproduces the
+/// radius valley: few planets between ~1.7 and ~2 R⊕ at high flux.
+/// Icy planets keep the plain draw.
+fn draw_planet_density(rng: &mut XorShift, class: BodyClass, m: f64, flux: f64) -> f64 {
+    if class != BodyClass::Rocky {
+        return draw_density(rng, class);
+    }
+    let u = rng.next_f64();
+    let p_env = ((m - 2.0) / 8.0).clamp(0.0, 0.9) / (1.0 + flux / (30.0 * m.max(1.0)));
+    if u < p_env {
+        // Envelope-bearing sub-Neptune: R ≈ 2.5 R⊕ (m/6)^0.55.
+        let r = 2.5 * (m / 6.0).powf(0.55);
+        5.514 * m / (r * r * r)
+    } else {
+        let f = (u - p_env) / (1.0 - p_env).max(1e-9);
+        (4.4 + 1.4 * f) * m.clamp(1.0, 20.0).powf(0.19)
+    }
 }
 
 /// Cold-giant bulk density from an M-R table anchored on Neptune, Saturn and

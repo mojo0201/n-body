@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
+use nbody_rust::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
 use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
 use nbody_rust::Preset;
@@ -1244,23 +1244,25 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+            event_loop.owned_display_handle(),
+        )));
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            apply_limit_buckets: false,
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("adapter");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-            trace: wgpu::Trace::default(),
             label: None,
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: Default::default(),
+            trace: wgpu::Trace::Off,
         }))
         .expect("device");
 
@@ -1280,7 +1282,6 @@ impl ApplicationHandler for App {
             caps.alpha_modes[0]
         };
         let config = wgpu::SurfaceConfiguration {
-            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
@@ -1293,6 +1294,7 @@ impl ApplicationHandler for App {
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -1316,8 +1318,6 @@ impl ApplicationHandler for App {
             format,
             egui_wgpu::RendererOptions {
                 msaa_samples: 4,
-                depth_stencil_format: None,
-                dithering: false,
                 ..Default::default()
             },
         );
@@ -1398,8 +1398,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || gfx.egui_ctx.egui_wants_keyboard_input()
-                {
+                if event.state != ElementState::Pressed || gfx.egui_ctx.egui_wants_keyboard_input() {
                     return;
                 }
                 // Held keys repeat only for panning and zooming. Toggles,
@@ -1652,8 +1651,11 @@ impl ApplicationHandler for App {
                 }
 
                 let frame = match gfx.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(f)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+                    wgpu::CurrentSurfaceTexture::Success(f) => f,
+                    wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                        gfx.surface.configure(&gfx.device, &gfx.config);
+                        f
+                    }
                     wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                         gfx.surface.configure(&gfx.device, &gfx.config);
                         return;
@@ -1774,9 +1776,8 @@ impl ApplicationHandler for App {
                         mass_transfer: self.sim.mass_transfer,
                         aging_mult: self.sim.aging_mult,
                     };
-                    full_output = gfx.egui_ctx.run_ui(raw_input, |root_ui| {
-                        let ctx = root_ui.ctx().clone();
-                        actions = ui::draw(&ctx, root_ui, &mut self.ui, &view_info, &b);
+                    full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
+                        actions = ui::draw(ui, &mut self.ui, &view_info, &b);
                     });
                     self.sim
                         .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
@@ -1916,7 +1917,7 @@ impl ApplicationHandler for App {
                     .tessellate(full_output.shapes, pixels_per_point);
 
                 for (id, deltas) in &full_output.textures_delta.set {
-                    for delta in deltas.iter() {
+                    for delta in deltas {
                         gfx.egui_renderer
                             .update_texture(&gfx.device, &gfx.queue, *id, delta);
                     }
@@ -1939,11 +1940,10 @@ impl ApplicationHandler for App {
 
                 {
                     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        multiview_mask: None,
                         label: Some("main-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            depth_slice: None,
                             view: &gfx.msaa_view,
+                            depth_slice: None,
                             resolve_target: Some(&view),
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1953,6 +1953,7 @@ impl ApplicationHandler for App {
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
                     let mut pass = pass.forget_lifetime();
                     gfx.renderer.draw(&mut pass);

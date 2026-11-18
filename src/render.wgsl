@@ -312,11 +312,13 @@ const PI: f32 = 3.14159265;
 struct BlackHoleIn {
     @location(0) pos: vec2<f32>,
     @location(1) radius: f32,   // event-horizon radius (Rs), world units
+    @location(2) accretion: f32, // 0..1: how strongly the disk is fed; 0 hides it
 };
 
 struct BlackHoleOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) local: vec2<f32>,  // position in Rs, centred on the hole
+    @location(1) @interpolate(flat) accretion: f32,
 };
 
 @vertex
@@ -332,6 +334,7 @@ fn vs_blackhole(@builtin(vertex_index) vi: u32, inst: BlackHoleIn) -> BlackHoleO
     var out: BlackHoleOut;
     out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.local = corner * BH_QUAD;
+    out.accretion = inst.accretion;
     return out;
 }
 
@@ -494,6 +497,10 @@ fn fs_blackhole(in: BlackHoleOut) -> @location(0) vec4<f32> {
                   + bh_trace(p + px * vec2<f32>(-0.125, -0.375))
                   + bh_trace(p + px * vec2<f32>(-0.375, 0.125)));
     }
+
+    // A hole with nothing falling in has no luminous disk: fade it by the
+    // accretion rate (the shadow and lensing stay).
+    c = c * clamp(in.accretion, 0.0, 1.0);
 
     // Shadow: whatever the disk does not hide is black inside b_crit
     // and clear outside it.

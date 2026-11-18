@@ -140,7 +140,8 @@ pub struct GlowInstance {
 pub struct BlackHoleInstance {
     pub pos: [f32; 2],
     pub radius: f32,
-    pub _pad: f32,
+    /// 0..1 strength of the accretion disk; 0 draws only the shadow.
+    pub accretion: f32,
 }
 
 /// Radius of the black shadow in horizon radii: 3·sqrt(3)/2. A distant
@@ -189,6 +190,85 @@ fn blackbody_to_rgb(t_kelvin: f64) -> [f32; 3] {
         (g.clamp(0.0, 255.0) / 255.0) as f32,
         (b.clamp(0.0, 255.0) / 255.0) as f32,
     ]
+}
+
+/// Equilibrium temperature (K, Bond albedo 0.3) of planet `i` from its host's
+/// light alone. O(1): uses the cached parent, one hop up for moons.
+fn planet_equilibrium_temp(b: &Bodies, i: usize) -> Option<f64> {
+    if !b.parent_cache_valid {
+        return None;
+    }
+    let mut p = b.parent_cache.get(i).copied().flatten()?;
+    if p < b.len() && !physics::is_host_kind(b.kind[p]) {
+        p = b.parent_cache.get(p).copied().flatten()?;
+    }
+    if p >= b.len() || !physics::is_host_kind(b.kind[p]) {
+        return None;
+    }
+    let l = physics::luminosity_of(b, p);
+    if !(l > 0.0) {
+        return None;
+    }
+    let d_au = ((b.x[i] - b.x[p]).hypot(b.y[i] - b.y[p]) / physics::au_in_gm()).max(1e-4);
+    Some(physics::equilibrium_temp(l / (d_au * d_au)))
+}
+
+/// Piecewise-linear colour ramp over `ln T`.
+fn ramp(t: f64, stops: &[(f64, [f32; 3])]) -> [f32; 3] {
+    if t <= stops[0].0 {
+        return stops[0].1;
+    }
+    for w in stops.windows(2) {
+        if t <= w[1].0 {
+            let f = ((t / w[0].0).ln() / (w[1].0 / w[0].0).ln()) as f32;
+            let (a, c) = (w[0].1, w[1].1);
+            return [
+                a[0] + (c[0] - a[0]) * f,
+                a[1] + (c[1] - a[1]) * f,
+                a[2] + (c[2] - a[2]) * f,
+            ];
+        }
+    }
+    stops[stops.len() - 1].1
+}
+
+/// Colour of a spawned planet at equilibrium temperature `t` (K).
+///
+/// Giants (≥ 50 M⊕) follow the Sudarsky classes: cream ammonia clouds below
+/// ~150 K, white water clouds to ~250 K, clear blue-ish to ~1400 K, then dark
+/// alkali-metal absorbers glowing red-orange above ~2000 K. Rocky worlds go
+/// from frozen blue-white through temperate blue-green and scorched brown to
+/// glowing lava. Ice giants and icy worlds keep their class colour.
+fn planet_color_for_temp(t: f64, m: f64, class: BodyClass) -> Option<[f32; 3]> {
+    if m >= 50.0 {
+        return Some(ramp(
+            t,
+            &[
+                (60.0, [0.80, 0.72, 0.58]),
+                (150.0, [0.86, 0.78, 0.62]),
+                (250.0, [0.93, 0.93, 0.90]),
+                (800.0, [0.60, 0.68, 0.82]),
+                (1400.0, [0.30, 0.42, 0.72]),
+                (1800.0, [0.20, 0.17, 0.17]),
+                (2500.0, [0.95, 0.40, 0.18]),
+            ],
+        ));
+    }
+    if class == BodyClass::Rocky {
+        return Some(ramp(
+            t,
+            &[
+                (120.0, [0.80, 0.85, 0.92]),
+                (230.0, [0.62, 0.74, 0.88]),
+                (300.0, [0.32, 0.52, 0.72]),
+                (400.0, [0.62, 0.55, 0.42]),
+                (900.0, [0.55, 0.40, 0.32]),
+                (1500.0, [0.85, 0.42, 0.18]),
+                (2200.0, [1.00, 0.55, 0.20]),
+            ],
+        ));
+    }
+    None
 }
 
 /// Color for a body, by kind + subclass. Stars use spectral class (giants are
@@ -269,6 +349,15 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
             // identifiable at a glance.
             if b.origin[i] == BodyOrigin::RoguePlanet {
                 return [0.90, 0.42, 0.25];
+            }
+            // Spawned planets are coloured from their equilibrium temperature
+            // (gas giants by Sudarsky class, rocky worlds from lava to ice).
+            if b.origin[i] == BodyOrigin::Spawned {
+                if let Some(t) = planet_equilibrium_temp(b, i) {
+                    if let Some(c) = planet_color_for_temp(t, b.m[i], b.class[i]) {
+                        return c;
+                    }
+                }
             }
             // A spawned body past 50 M⊕ is a gas giant — keep the tan
             // look instead of the pale-blue Icy class colour.
@@ -885,6 +974,11 @@ impl Renderer {
                     offset: 8,
                     shader_location: 1,
                 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 12,
+                    shader_location: 2,
+                },
             ],
         };
         let blackhole_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1223,7 +1317,7 @@ impl Renderer {
             self.blackhole_scratch.push(BlackHoleInstance {
                 pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
                 radius: r_world as f32,
-                _pad: 0.0,
+                accretion: physics::accretion_level(b, i) as f32,
             });
         }
         self.blackhole_count = self.blackhole_scratch.len() as u32;

@@ -57,23 +57,23 @@ pub fn install_fonts(ctx: &egui::Context) {
     // holds `Arc<FontData>`: wrap each value in `std::sync::Arc::new(..)`.
     fonts.font_data.insert(
         "jbm-regular".to_owned(),
-        egui::FontData::from_static(f.mono_regular).into(),
+        std::sync::Arc::new(egui::FontData::from_static(f.mono_regular)),
     );
     fonts.font_data.insert(
         "jbm-bold".to_owned(),
-        egui::FontData::from_static(f.mono_bold).into(),
+        std::sync::Arc::new(egui::FontData::from_static(f.mono_bold)),
     );
     fonts.font_data.insert(
         "inter-regular".to_owned(),
-        egui::FontData::from_static(f.sans_regular).into(),
+        std::sync::Arc::new(egui::FontData::from_static(f.sans_regular)),
     );
     fonts.font_data.insert(
         "inter-medium".to_owned(),
-        egui::FontData::from_static(f.sans_medium).into(),
+        std::sync::Arc::new(egui::FontData::from_static(f.sans_medium)),
     );
     fonts.font_data.insert(
         "dejavu-symbols".to_owned(),
-        egui::FontData::from_static(f.symbols).into(),
+        std::sync::Arc::new(egui::FontData::from_static(f.symbols)),
     );
     if let Some(mono) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         mono.insert(0, "jbm-regular".to_owned());

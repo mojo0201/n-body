@@ -431,7 +431,8 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
         for i in 0..n {
             if b.kind[i] == BodyKind::Planet && b.origin[i] == BodyOrigin::Spawned {
                 let f = ph::stellar_flux(b, b.x[i], b.y[i], i);
-                if (0.36..=1.1).contains(&f) {
+                let (hi, ho) = ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
+                if (ho..=hi).contains(&f) {
                     hz += 1;
                 }
             }
@@ -984,7 +985,7 @@ pub fn setup_style(ctx: &egui::Context) {
     v.override_text_color = Some(t.colors.text());
     ctx.set_visuals(v);
 
-    let mut style = (*ctx.style_of(ctx.theme())).clone();
+    let mut style = (*ctx.global_style()).clone();
     // Tighter spacing than egui's default: the dock is dense, and the
     // default 8×4 px item spacing makes it 20 % taller for no benefit.
     style.spacing.item_spacing = egui::vec2(t.spacing.item_spacing[0], t.spacing.item_spacing[1]);
@@ -1018,7 +1019,7 @@ pub fn setup_style(ctx: &egui::Context) {
     style.interaction.tooltip_delay = 1.0;
     // Thin scroll bars that float over the content instead of taking a column.
     style.spacing.scroll = egui::style::ScrollStyle::floating();
-    ctx.set_style_of(ctx.theme(), style);
+    ctx.set_global_style(style);
 }
 fn panel_frame() -> egui::Frame {
     egui::Frame::new()
@@ -1151,7 +1152,7 @@ fn info_text(k: &str) -> Option<&'static str> {
         "heaviest planet" => "The most massive planet that was spawned with the system.",
         "farthest bound" => "The body farthest from the primary that is still gravitationally bound to it.",
         "on escape orbits" => "Bodies moving fast enough to leave the primary for good (kinetic energy above the gravitational pull).",
-        "in habitable zone" => "Planets that receive between 0.36 and 1.1 times the sunlight Earth gets. This ignores atmosphere, so it is a rough guide.",
+        "in habitable zone" => "Planets inside the habitable zone (Kopparapu limits, which depend on the star's colour; about 0.36 to 1.1 times Earth's sunlight for a Sun-like star). This ignores atmosphere, so it is a rough guide.",
         "oldest star" => "Age of the oldest star, in billions of years.",
         "planet eccentricity" => "Eccentricity is how stretched an orbit is: 0 is a circle, close to 1 is a long thin ellipse. Shows the mean and maximum over planets.",
         // ---- Events ----
@@ -1196,7 +1197,9 @@ fn info_text(k: &str) -> Option<&'static str> {
         // ---- Climate ----
         "stellar flux" => "Starlight received, as a multiple of what Earth gets from the Sun (S⊕). Summed over every luminous body.",
         "equilibrium temp" => "Temperature a bare rock would settle to from starlight alone, without a greenhouse effect. Real surfaces are usually warmer.",
-        "zone" => "Whether the flux is too hot, in the habitable range (0.36 to 1.1 S⊕), or too cold.",
+        "rotation" => "How fast the body spins. A planet whose day equals its year always shows one face to its star (tidally locked).",
+        "tidal heating" => "Heat from flexing as the body is squeezed along an eccentric orbit (Io is the Solar System's example). Earth's internal heat is about 0.09 W/m².",
+        "zone" => "Whether the flux is too hot, in the habitable range (star-colour dependent, ~0.36 to 1.1 S⊕ for the Sun), or too cold.",
         // ---- Orbit ----
         "orbits" => "The body this one is gravitationally bound to (its parent).",
         "distance" => "Current distance to the parent.",
@@ -1286,7 +1289,8 @@ fn heading_row(ui: &mut egui::Ui, text: &str) {
 /// Order matters: overlays go under the panels so panels are readable on
 /// top, and the status bar is drawn before the dock so the dock's scroll
 /// area gets the remaining height.
-pub fn draw(ctx: &egui::Context, ui: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bodies) -> Actions {
+pub fn draw(root: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bodies) -> Actions {
+    let ctx = &root.ctx().clone();
     let mut act = Actions::default();
 
     // Stats are O(n²) for moons — recompute only every 250 ms, not every
@@ -1310,10 +1314,10 @@ pub fn draw(ctx: &egui::Context, ui: &mut egui::Ui, ui_state: &mut UiState, view
     }
 
     draw_overlays(ctx, ui_state, view, b);
-    status_bar(ui, ui_state, view, b);
+    status_bar(root, ui_state, view, b);
     save_toast(ctx, ui_state);
     if ui_state.show_dock {
-        dock(ui, ui_state, view, b, &mut act);
+        dock(root, ui_state, view, b, &mut act);
     }
     if ui_state.diag.visible {
         diag_window(ctx, ui_state, view, b, &mut act);
@@ -1396,7 +1400,7 @@ fn drawn_pos(view: &ViewInfo, b: &Bodies, i: usize) -> (f64, f64) {
 /// the status bar) but over the wgpu scene.
 fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies) {
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let screen = ctx.input(|i| i.content_rect());
+    let screen = ctx.content_rect();
 
     // Selection ring.
     if let Some(id) = view.selected {
@@ -1489,10 +1493,12 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
 
 /// Top-of-window status strip: running state, speed, time, body count, fps,
 /// warnings, and a hint about the help key.
-fn status_bar(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
+fn status_bar(root: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
+    let ctx = &root.ctx().clone();
+    let _ = ctx;
     egui::Panel::top("status")
         .frame(panel_frame().inner_margin(egui::Margin::symmetric(10, 4)))
-        .show(ui, |ui| {
+        .show(root, |ui| {
             ui.horizontal(|ui| {
                 // If the dock is hidden, surface a way to bring it back. The
                 // button label is "☰ panel" to match the hamburger menu
@@ -1553,14 +1559,15 @@ fn status_bar(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies) 
 
 /// The left control panel. Everything is a `CollapsingHeader` so the panel
 /// can be scrolled to whatever the user cares about.
-fn dock(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies, act: &mut Actions) {
+fn dock(root: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies, act: &mut Actions) {
+    let ctx = &root.ctx().clone();
+    let _ = ctx;
     egui::Panel::left("dock")
         .frame(panel_frame())
         .default_size(235.0)
-        .min_size(190.0)
-        .max_size(320.0)
+        .size_range(190.0..=320.0)
         .resizable(true)
-        .show(ui, |ui| {
+        .show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Orbital N-Body")
@@ -2361,7 +2368,7 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
     let mut open = st.show_events;
     let si = st.units_si;
     egui::Window::new(format!("Events ({})", b.events.len()))
-        .id(egui::Id::unique("events_window"))
+        .id(egui::Id::new("events_window"))
         .open(&mut open)
         .default_pos([340.0, 80.0])
         .default_size([620.0, 520.0])
@@ -2603,7 +2610,7 @@ fn selection_window(
     let label = b.name[i].clone().unwrap_or_else(|| format!("#{}", b.id[i]));
     let title = format!("{}  {}", label, ph::body_class_with_parent(b, i, parent));
     egui::Window::new(title)
-        .id(egui::Id::unique("selection"))
+        .id(egui::Id::new("selection"))
         .open(&mut open)
         // Anchored top-right with a 10-point margin, so it sits over the
         // 3D scene but doesn't collide with the dock.
@@ -2807,7 +2814,7 @@ fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
     let red = Color32::from_rgb(220, 90, 90);
     let confirm_time = Duration::from_secs(4);
     egui::Window::new("Saves")
-        .id(egui::Id::unique("saves_window"))
+        .id(egui::Id::new("saves_window"))
         .open(&mut open)
         .default_width(360.0)
         .resizable(true)
@@ -2981,7 +2988,7 @@ fn save_toast(ctx: &egui::Context, st: &UiState) {
     if left.is_zero() {
         return;
     }
-    egui::Area::new(egui::Id::unique("save_toast"))
+    egui::Area::new(egui::Id::new("save_toast"))
         .anchor(Align2::CENTER_BOTTOM, [0.0, -48.0])
         .interactable(false)
         .show(ctx, |ui| {
@@ -3360,8 +3367,7 @@ fn selection_rows(
             if s > 0.0 {
                 heading_row(ui, "Climate");
                 kv(ui, "stellar flux", format!("{:.2} S⊕", s));
-                // Equilibrium temperature: T = 255 K * S^(1/4). That's the
-                // blackbody temperature with no greenhouse — actual surface
+                // Equilibrium temperature: T = 255 K * S^(1/4) (Bond albedo 0.3). No greenhouse — actual surface
                 // temperatures are higher, but the user gets the right idea.
                 kv(
                     ui,
@@ -3375,14 +3381,45 @@ fn selection_rows(
                 // "Habitable zone" here is a very rough 0.36..1.1 S_earth
                 // (the standard Kasting-ish bounds). Labeled "zone" not
                 // "habitable" because the sim doesn't know about atmosphere.
-                let (txt, col) = if s > 1.1 {
+                let (hz_in, hz_out) =
+                    ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
+                let (txt, col) = if s > hz_in {
                     ("too hot", theme().colors.warn())
-                } else if s >= 0.36 {
+                } else if s >= hz_out {
                     ("in habitable zone", theme().colors.good())
                 } else {
                     ("too cold", theme().colors.accent())
                 };
                 kv_color(ui, "zone", txt, col);
+            }
+            // Rotation and tidal heating (needs a parent to compare against).
+            if let Some(p) = parent {
+                let inertia = 0.3 * b.m[i] * b.r[i] * b.r[i];
+                if inertia > 0.0 && b.spin[i] != 0.0 {
+                    let omega = b.spin[i] / inertia;
+                    let o = ph::orbit_info(b, i, p);
+                    let day_s = std::f64::consts::TAU / omega.abs() * ph::time_unit_s();
+                    let locked = o.bound
+                        && o.period.is_finite()
+                        && (omega.abs() * o.period / std::f64::consts::TAU - 1.0).abs() < 0.02;
+                    let txt = if locked {
+                        "tidally locked".to_string()
+                    } else if day_s < 172_800.0 {
+                        format!("{:.1} h day", day_s / 3600.0)
+                    } else {
+                        format!("{:.1} d day", day_s / 86_400.0)
+                    };
+                    kv(ui, "rotation", txt);
+                }
+                let w = ph::tidal_heating_w(b, i, p);
+                if w > 1e8 {
+                    let area = 4.0 * std::f64::consts::PI * (b.r[i] * ph::LEN_KM * 1e3).powi(2);
+                    kv(
+                        ui,
+                        "tidal heating",
+                        format!("{:.1e} W ({:.2} W/m²)", w, w / area),
+                    );
+                }
             }
         }
         _ => {}

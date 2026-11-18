@@ -20,8 +20,18 @@ use super::*;
 pub fn star_luminosity(kind: BodyKind, m: f64) -> f64 {
     match kind {
         BodyKind::Star => {
+            // Piecewise main-sequence mass–luminosity relation (continuous at
+            // the breaks): M<0.43: 0.23 M^2.3; <2: M^4; <55: 1.4 M^3.5; else 32000 M.
             let s = m / M_SUN_ME;
-            s * s * s * s.sqrt()
+            if s < 0.43 {
+                0.23 * s.powf(2.3)
+            } else if s < 2.0 {
+                s.powi(4)
+            } else if s < 55.0 {
+                1.4 * s.powi(3) * s.sqrt()
+            } else {
+                32_000.0 * s
+            }
         }
         BodyKind::BrownDwarf => {
             let x = m / JUPITER_MASS / 80.0;
@@ -65,8 +75,10 @@ pub fn star_temperature(kind: BodyKind, m: f64) -> f64 {
 pub fn star_lifetime_gyr(kind: BodyKind, m: f64) -> f64 {
     match kind {
         BodyKind::Star => {
+            // Fuel ∝ M, burn rate ∝ L(M), so t = 10 Gyr · M / L. Floored at
+            // 3 Myr: the most massive stars do not live shorter than that.
             let s = m / M_SUN_ME;
-            10.0 / (s * s * s.sqrt())
+            (10.0 * s / star_luminosity(kind, m)).max(0.003)
         }
         BodyKind::BrownDwarf | BodyKind::WhiteDwarf | BodyKind::NeutronStar => f64::INFINITY,
         _ => 0.0,
@@ -280,15 +292,16 @@ pub fn temperature_of(b: &Bodies, i: usize) -> f64 {
 
 /// Habitable zone (inner, outer) in AU.
 ///
-/// Standard inverse-square scaling L = flux · r², with the solar-flux
-/// multipliers 1.1 (inner, runaway greenhouse) and 0.36 (outer, early
-/// Mars limit). Returns (NaN, NaN) for a non-luminous body.
+/// Inverse-square scaling L = flux · r² with temperature-dependent
+/// Kopparapu flux limits (`hz_flux_limits`). Returns (NaN, NaN) for a
+/// non-luminous body.
 pub fn habitable_zone_of(b: &Bodies, i: usize) -> (f64, f64) {
     let l = luminosity_of(b, i);
     if l <= 0.0 {
         return (f64::NAN, f64::NAN);
     }
-    ((l / 1.1).sqrt(), (l / 0.36).sqrt())
+    let (si, so) = hz_flux_limits(temperature_of(b, i));
+    ((l / si).sqrt(), (l / so).sqrt())
 }
 
 /// Time remaining until star `i` dies, in Gyr. Infinite for anything

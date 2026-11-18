@@ -129,6 +129,9 @@ pub(in crate::physics) fn spawn_ms_frame(
     // Giant occurrence rises with host mass (Johnson 2010: f ~ M*). The base
     // value of 0.12 gives about 18 % for Sun-like stars after the mean
     // metallicity boost of 1.53 (Cumming 2008: 17-20 % within 20 AU).
+    // A disk around a low-mass star cannot build a planet much above ~1 % of the
+    // star's mass, so cap giants by host mass (no RNG: sampled masses are clamped).
+    let giant_cap = (0.01 * m_sun * M_SUN_ME).clamp(MASS_GIANT_MIN, MASS_GIANT_MAX);
     let giant_mass_scale = m_sun.clamp(0.1, 2.0);
     let has_giant = rng.next_f64() < (0.12 * giant_occ * giant_mass_scale).min(0.95);
     // Giant hosts are about twice as likely to have inner super-Earths
@@ -268,7 +271,8 @@ pub(in crate::physics) fn spawn_ms_frame(
             f64::NAN
         };
         if a_warm >= a_lo && a_warm <= a_hi {
-            let m = sample_mass_power_law(rng, MASS_GIANT_MIN, MASS_GIANT_MAX, MASS_PLAW_GIANT);
+            let m = sample_mass_power_law(rng, MASS_GIANT_MIN, MASS_GIANT_MAX, MASS_PLAW_GIANT)
+                .min(giant_cap);
             let e = sample_rayleigh(rng, 0.15);
             let k = spawn_planet(
                 b,
@@ -295,7 +299,8 @@ pub(in crate::physics) fn spawn_ms_frame(
         if a_au > a_hi {
             break;
         }
-        let m = sample_mass_power_law(rng, MASS_GIANT_MIN, MASS_GIANT_MAX, MASS_PLAW_GIANT);
+        let m = sample_mass_power_law(rng, MASS_GIANT_MIN, MASS_GIANT_MAX, MASS_PLAW_GIANT)
+                .min(giant_cap);
         // Observed giants are fairly eccentric (mean e ~ 0.2 for a lone
         // giant, Kipping 2013); multi-giant systems are rounder.
         let sigma_e = if n_giants == 1 { 0.15 } else { 0.08 };
