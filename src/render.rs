@@ -385,6 +385,66 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
 // Body instance construction
 // ---------------------------------------------------------------------------
 
+/// Comet tails: for each active comet (inside ~4 AU of its host, fading in as
+/// in `body_color`) a blue ion tail pointing straight away from the host and a
+/// shorter, curved, yellowish dust tail bent back along the orbit. Triangles in
+/// world coordinates for the additive comet pipeline; alpha fades to zero at
+/// the tip. Tail length is at least 12 px so a comet stays readable when the
+/// view is zoomed out.
+pub fn build_comet_tails(b: &Bodies, zoom: f32) -> Vec<OrbitVertex> {
+    let mut out = Vec::new();
+    if !b.parent_cache_valid {
+        return out;
+    }
+    let au = physics::au_in_gm();
+    let z = zoom.max(1e-6) as f64;
+    for i in 0..b.len() {
+        if b.dead[i] || b.origin[i] != BodyOrigin::Comet {
+            continue;
+        }
+        let Some(h) = b.parent_cache.get(i).copied().flatten() else {
+            continue;
+        };
+        if h >= b.len() || !physics::is_host_kind(b.kind[h]) {
+            continue;
+        }
+        let dx = b.x[i] - b.x[h];
+        let dy = b.y[i] - b.y[h];
+        let d = dx.hypot(dy);
+        if !(d > 0.0) {
+            continue;
+        }
+        let t = (((4.0 - d / au) / 2.5).clamp(0.0, 1.0)) as f64;
+        let act = t * t * (3.0 - 2.0 * t);
+        if act < 0.02 {
+            continue;
+        }
+        let (ux, uy) = (dx / d, dy / d); // away from the host
+        let len = (0.5 * au).max(12.0 / z) * act;
+        // Velocity direction relative to the host, for the curved dust tail.
+        let (vx, vy) = (b.vx[i] - b.vx[h], b.vy[i] - b.vy[h]);
+        let v = vx.hypot(vy).max(1e-30);
+        let (mut tx, mut ty) = (ux - 0.4 * vx / v, uy - 0.4 * vy / v);
+        let tn = tx.hypot(ty).max(1e-30);
+        tx /= tn;
+        ty /= tn;
+        let mut tri = |dirx: f64, diry: f64, l: f64, w: f64, col: [u8; 3], a: f64| {
+            let (nx, ny) = (-diry, dirx);
+            let (cx, cy) = (b.x[i], b.y[i]);
+            let alpha = (a * act * 255.0).clamp(0.0, 255.0) as u8;
+            let base = [col[0], col[1], col[2], alpha];
+            let tip = [col[0], col[1], col[2], 0];
+            out.push(OrbitVertex { pos: [(cx + nx * w) as f32, (cy + ny * w) as f32], color: base });
+            out.push(OrbitVertex { pos: [(cx - nx * w) as f32, (cy - ny * w) as f32], color: base });
+            out.push(OrbitVertex { pos: [(cx + dirx * l) as f32, (cy + diry * l) as f32], color: tip });
+        };
+        let w_min = 1.0 / z;
+        tri(ux, uy, len, (0.03 * len).max(w_min), [120, 170, 255], 0.45);
+        tri(tx, ty, 0.65 * len, (0.10 * len).max(1.5 * w_min), [255, 238, 200], 0.30);
+    }
+    out
+}
+
 impl BodyInstance {
     /// Build a `BodyInstance`. The displayed radius is floored at a per-kind
     /// minimum in screen pixels so every body stays visible (black holes 4 px,

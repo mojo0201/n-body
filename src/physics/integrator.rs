@@ -445,6 +445,7 @@ pub fn advance(b: &mut Bodies, dt: f64) {
     account_gw_loss(b, dt);
     tidal_dissipation(b, dt);
     yarkovsky(b, dt);
+    gas_disk_migration(b, dt);
     evolve_stars(b, dt);
     dust::evolve(b, dt);
     coalesce_debris(b);

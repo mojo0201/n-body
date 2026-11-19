@@ -593,9 +593,12 @@ pub(super) fn sample_primary(rng: &mut XorShift) -> (f64, BodyKind) {
     if rng.next_f64() < 0.85 {
         (sample_imf_mass(rng) * M_SUN_ME, BodyKind::Star)
     } else {
-        // Log-uniform: the brown-dwarf mass function declines toward the
+        // Substellar mass function dN/dm ∝ m^-0.3 (Kroupa 2001), sampled by
+        // inverting its CDF; still one draw. It is flatter than the old
+        // log-uniform (dN/dm ∝ m^-1), so more brown dwarfs sit near the
         // hydrogen-burning limit.
-        let m = BD_M_MIN * (BD_M_MAX / BD_M_MIN).powf(rng.next_f64());
+        let (lo, hi) = (BD_M_MIN.powf(0.7), BD_M_MAX.powf(0.7));
+        let m = (lo + (hi - lo) * rng.next_f64()).powf(1.0 / 0.7);
         (m, BodyKind::BrownDwarf)
     }
 }

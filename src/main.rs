@@ -1856,7 +1856,7 @@ impl ApplicationHandler for App {
                     );
                     self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
                     let t_comet0 = Instant::now();
-                    comet_tail_verts = Vec::new();
+                    comet_tail_verts = nbody_rust::render::build_comet_tails(&b, self.sim.zoom);
                     self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
                     flashes_active = !b.flashes.is_empty();
                     n_bodies = b.len();

@@ -28,6 +28,7 @@ pub mod save;
 pub mod spawn;
 #[cfg(test)]
 mod tests;
+pub mod migration;
 pub mod tides;
 pub mod yarkovsky;
 
@@ -58,6 +59,7 @@ pub use presets::*;
 pub use rng::*;
 pub use save::*;
 pub use spawn::*;
+pub use migration::*;
 pub use tides::*;
 pub use yarkovsky::*;
 

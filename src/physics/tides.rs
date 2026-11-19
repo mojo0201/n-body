@@ -94,7 +94,11 @@ fn k2_over_q(b: &Bodies, k: usize) -> f64 {
             } else {
                 TIDAL_K2_Q_ROCKY
             };
-            base * tidal_boost() * PLANET_BOOST_REL
+            base * if physical_mode() {
+                1.0
+            } else {
+                TIDAL_BOOST * PLANET_BOOST_REL
+            }
         }
         _ => TIDAL_K2_STAR / TIDAL_Q_STAR * tidal_boost(),
     }

@@ -1984,6 +1984,22 @@ fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
         {
             act.mass_transfer = Some(mt);
         }
+        let mut disk = ph::gas_disk();
+        if ui
+            .checkbox(&mut disk, "force gas disk")
+            .on_hover_text("young stars (under ~20 Myr) already have a fading gas disk; this forces one around every star. Planets feel it: they spiral in, their orbits circularize, and converging pairs lock into resonances. Sped up so it is visible.")
+            .changed()
+        {
+            ph::set_gas_disk(disk);
+        }
+        let mut accel = !ph::physical_mode();
+        if ui
+            .checkbox(&mut accel, "accelerated tides and drag")
+            .on_hover_text("speeds up tides, Poynting-Robertson drag and Yarkovsky drift so they show within a session; off uses the physical rates")
+            .changed()
+        {
+            ph::set_physical_mode(!accel);
+        }
         let mut age_mult = view.aging_mult;
         let r = ui
             .add(

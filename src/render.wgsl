@@ -43,6 +43,9 @@ struct VertexOut {
     @location(1) color: vec3<f32>,
     // xy = unit vector toward the star (world axes), z = light strength 0..1.
     @location(2) light: vec3<f32>,
+    // Limb-darkening strength: 1 for a self-luminous disc big enough to show
+    // it (stars), 0 otherwise.
+    @location(3) limb: f32,
 };
 
 // draw(0..4, 0..n), triangle strip: vi 0..3 -> (-1,-1) (+1,-1) (-1,+1) (+1,+1).
@@ -63,6 +66,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOut {
     let px_r = inst.radius * camera.zoom;
     let strength = inst.lit * smoothstep(2.5, 7.0, px_r);
     out.light = vec3<f32>(cos(inst.light_angle), sin(inst.light_angle), strength);
+    out.limb = (1.0 - inst.lit) * smoothstep(3.0, 8.0, px_r);
     return out;
 }
 
@@ -84,7 +88,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Lambert term plus a faint floor for scattered light on the night side.
     let lit_shade = 0.04 + 1.15 * pow(n_dot_l, 0.8);
     let shade = mix(1.0, lit_shade, in.light.z);
-    return vec4<f32>(in.color * shade * alpha, alpha);
+    // Limb darkening of self-luminous discs: I = 1 - u (1 - mu), mu = cos of
+    // the angle from the disc centre. Cool red stars darken more (u ~ 0.7)
+    // than hot blue ones (u ~ 0.35); the blue/red ratio of the colour stands
+    // in for temperature.
+    let mu = sqrt(max(1.0 - d * d, 0.0));
+    let u = clamp(0.85 - 0.5 * (in.color.b / max(in.color.r, 0.05)), 0.35, 0.75);
+    let limb = mix(1.0, 1.0 - u * (1.0 - mu), in.limb);
+    return vec4<f32>(in.color * shade * limb * alpha, alpha);
 }
 
 // -------- Orbit lines (LineList) --------
@@ -506,8 +517,14 @@ fn fs_blackhole(in: BlackHoleOut) -> @location(0) vec4<f32> {
     // and clear outside it.
     let shadow = 1.0 - smoothstep(BH_B_CRIT - px, BH_B_CRIT + px, b);
     let a = c.a + (1.0 - c.a) * shadow;
-    if a < 1e-4 {
+
+    // White outline on the shadow edge, about 1.5 px wide at any zoom, drawn
+    // over everything else so a hole stays visible against bright backgrounds.
+    let ring = 1.0 - smoothstep(0.6 * px, 1.4 * px, abs(b - BH_B_CRIT));
+    let a2 = a + (1.0 - a) * ring;
+    if a2 < 1e-4 {
         discard;
     }
-    return vec4<f32>(c.rgb / a, a);
+    let rgb = c.rgb * (1.0 - ring) + vec3<f32>(1.0) * ring;
+    return vec4<f32>(rgb / a2, a2);
 }
