@@ -2368,7 +2368,7 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
     let mut open = st.show_events;
     let si = st.units_si;
     egui::Window::new(format!("Events ({})", b.events.len()))
-        .id(egui::Id::new("events_window"))
+        .id(egui::Id::unique("events_window"))
         .open(&mut open)
         .default_pos([340.0, 80.0])
         .default_size([620.0, 520.0])
@@ -2610,7 +2610,7 @@ fn selection_window(
     let label = b.name[i].clone().unwrap_or_else(|| format!("#{}", b.id[i]));
     let title = format!("{}  {}", label, ph::body_class_with_parent(b, i, parent));
     egui::Window::new(title)
-        .id(egui::Id::new("selection"))
+        .id(egui::Id::unique("selection"))
         .open(&mut open)
         // Anchored top-right with a 10-point margin, so it sits over the
         // 3D scene but doesn't collide with the dock.
@@ -2814,7 +2814,7 @@ fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
     let red = Color32::from_rgb(220, 90, 90);
     let confirm_time = Duration::from_secs(4);
     egui::Window::new("Saves")
-        .id(egui::Id::new("saves_window"))
+        .id(egui::Id::unique("saves_window"))
         .open(&mut open)
         .default_width(360.0)
         .resizable(true)
@@ -2988,7 +2988,7 @@ fn save_toast(ctx: &egui::Context, st: &UiState) {
     if left.is_zero() {
         return;
     }
-    egui::Area::new(egui::Id::new("save_toast"))
+    egui::Area::new(egui::Id::unique("save_toast"))
         .anchor(Align2::CENTER_BOTTOM, [0.0, -48.0])
         .interactable(false)
         .show(ctx, |ui| {

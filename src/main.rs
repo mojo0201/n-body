@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nbody_rust::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
+use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
 use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
 use nbody_rust::Preset;

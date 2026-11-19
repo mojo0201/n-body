@@ -418,6 +418,50 @@ pub(in crate::physics) fn spawn_ms_frame(
         }
     }
 
+    // ---- Moons of terrestrial planets ----
+    // Large moons form in giant impacts (Earth–Moon, Pluto–Charon): about
+    // 25 % of rocky planets between 0.3 and 50 M⊕ get one, with a mass of
+    // 0.3–3 % of the planet's. Drawn from a private RNG seeded by the
+    // planet itself, so the main spawn stream (and every belt, comet and
+    // background body after this point) is unchanged.
+    for &(pi, pm, _) in placed.iter() {
+        if !(0.3..50.0).contains(&pm) || b.class[pi] != BodyClass::Rocky {
+            continue;
+        }
+        if moons_spawned + 1 > moon_budget_limit {
+            break;
+        }
+        let seed = (pm.to_bits() ^ b.x[pi].to_bits().rotate_left(17) ^ b.y[pi].to_bits().rotate_left(41)) as u128;
+        let mut mrng = XorShift::new(seed ^ 0x4D4F_4F4E);
+        if mrng.next_f64() > 0.25 {
+            continue;
+        }
+        let d_star = (b.x[pi] - fr.centre.0).hypot(b.y[pi] - fr.centre.1);
+        let r_hill = d_star * (pm / (3.0 * fr.m_star)).cbrt();
+        let a_lo_m = 10.0 * b.r[pi];
+        let a_hi_m = (MOON_HILL_FRAC * r_hill).min(45.0 * b.r[pi]);
+        if a_lo_m >= a_hi_m {
+            continue;
+        }
+        let a_moon = a_lo_m * (a_hi_m / a_lo_m).powf(mrng.next_f64());
+        let angle = mrng.next_f64() * std::f64::consts::TAU;
+        let (sa, ca) = angle.sin_cos();
+        let v_circ = (G * pm / a_moon).sqrt();
+        let m_moon = pm * 10f64.powf(-2.5 + mrng.next_f64() * 1.0);
+        let moon_idx = b.push(
+            b.x[pi] + a_moon * ca,
+            b.y[pi] + a_moon * sa,
+            b.vx[pi] - v_circ * sa,
+            b.vy[pi] + v_circ * ca,
+            m_moon,
+            BodyKind::Planet,
+        );
+        b.class[moon_idx] = b.class[pi];
+        b.bulk_density[moon_idx] = draw_density(&mut mrng, b.class[moon_idx]);
+        b.r[moon_idx] = b.radius_now(moon_idx);
+        moons_spawned += 1;
+    }
+
     // ---- Belts ----
     // Archetype chosen from host mass, metallicity, age, and the planets
     // already placed (a giant inside the belt gaps it).

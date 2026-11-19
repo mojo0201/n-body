@@ -593,6 +593,27 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
             continue;
         };
         if !b.rlof[d] {
+            // Stability: a donor much heavier than its partner shrinks its
+            // lobe as it loses mass, so the transfer runs away. Giants
+            // (deep convective envelopes) tolerate q = m_d/m_a only up to
+            // ~1.4; main-sequence donors to ~3. Beyond that the partner is
+            // swallowed in a common envelope, which here ends in a merger.
+            let post_ms = b.age_gyr[d] >= star_lifetime_gyr(BodyKind::Star, b.m_init[d]);
+            let q = b.m[d] / b.m[a].max(1e-30);
+            let q_crit = if post_ms { 1.4 } else { 3.0 };
+            if q > q_crit && b.kind[a] != BodyKind::BlackHole {
+                let text = format!(
+                    "{} overflowed unstably onto {}: common envelope",
+                    tag(b, d),
+                    tag(b, a)
+                );
+                let (px, py) = (b.x[d], b.y[d]);
+                b.log(EventKind::Evolve, text, px, py);
+                super::collisions::merge(b, d, a);
+                destroyed = true;
+                changed = true;
+                continue;
+            }
             b.rlof[d] = true;
             let text = format!("{} began transferring mass to {}", tag(b, d), tag(b, a));
             let (px, py) = (b.x[d], b.y[d]);
