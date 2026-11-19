@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Value of the `format` field. A file without it is not one of our saves.
 pub const SAVE_FORMAT: &str = "nbody-rust-save";
 /// Bump when the layout changes in a way old code cannot read.
-pub const SAVE_VERSION: u32 = 1;
+pub const SAVE_VERSION: u32 = 2;
 /// Folder for save files, relative to the working directory.
 pub const SAVE_DIR: &str = "saves";
 /// End of every save file name.
@@ -103,6 +103,12 @@ pub struct BodySave {
     pub y: f64,
     pub vx: f64,
     pub vy: f64,
+    /// Out-of-plane position and velocity (version 2). Version 1 files have
+    /// none and load as 0.
+    #[serde(default)]
+    pub z: f64,
+    #[serde(default)]
+    pub vz: f64,
     pub m: f64,
     pub r: f64,
     /// `None` means "not finite" (read back as infinity for `dtl`, 0 for `imm`).
@@ -271,6 +277,8 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
                 b.y[i],
                 b.vx[i],
                 b.vy[i],
+                b.z[i],
+                b.vz[i],
                 b.m[i],
                 b.r[i],
                 b.bulk_density[i],
@@ -290,6 +298,8 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
             y: b.y[i],
             vx: b.vx[i],
             vy: b.vy[i],
+            z: b.z[i],
+            vz: b.vz[i],
             m: b.m[i],
             r: b.r[i],
             imm: b.imm[i].is_finite().then_some(b.imm[i]),
@@ -435,6 +445,8 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
                 bs.y,
                 bs.vx,
                 bs.vy,
+                bs.z,
+                bs.vz,
                 bs.m,
                 bs.r,
                 bs.bulk_density,
@@ -452,6 +464,8 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
         max_id = max_id.max(bs.id);
         let kind = kind_from_str(&bs.kind)?;
         let i = nb.push(bs.x, bs.y, bs.vx, bs.vy, bs.m, kind);
+        nb.z[i] = bs.z;
+        nb.vz[i] = bs.vz;
         nb.id[i] = bs.id;
         nb.name[i] = bs.name.clone();
         nb.origin[i] = origin_from_str(&bs.origin)?;
@@ -704,6 +718,8 @@ mod tests {
             assert_eq!(a.y[i].to_bits(), c.y[i].to_bits());
             assert_eq!(a.vx[i].to_bits(), c.vx[i].to_bits());
             assert_eq!(a.vy[i].to_bits(), c.vy[i].to_bits());
+            assert_eq!(a.z[i].to_bits(), c.z[i].to_bits());
+            assert_eq!(a.vz[i].to_bits(), c.vz[i].to_bits());
             assert_eq!(a.m[i].to_bits(), c.m[i].to_bits());
         }
         assert!(c.next_id >= a.next_id);

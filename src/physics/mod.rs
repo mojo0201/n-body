@@ -1049,11 +1049,17 @@ pub struct Bodies {
     pub y: Vec<f64>,
     pub vx: Vec<f64>,
     pub vy: Vec<f64>,
+    /// Out-of-plane position and velocity. Zero everywhere until the 3D work
+    /// lands; nothing reads them yet.
+    pub z: Vec<f64>,
+    pub vz: Vec<f64>,
     pub ax: Vec<f64>,
     pub ay: Vec<f64>,
+    pub az: Vec<f64>,
     /// Previous-step positions for the leapfrog's velocity update.
     pub _px: Vec<f64>,
     pub _py: Vec<f64>,
+    pub _pz: Vec<f64>,
     pub m: Vec<f64>,
     pub r: Vec<f64>,
     pub kind: Vec<BodyKind>,
@@ -1108,10 +1114,14 @@ impl Bodies {
             y: Vec::with_capacity(n),
             vx: Vec::with_capacity(n),
             vy: Vec::with_capacity(n),
+            z: Vec::with_capacity(n),
+            vz: Vec::with_capacity(n),
             ax: Vec::with_capacity(n),
             ay: Vec::with_capacity(n),
+            az: Vec::with_capacity(n),
             _px: Vec::with_capacity(n),
             _py: Vec::with_capacity(n),
+            _pz: Vec::with_capacity(n),
             m: Vec::with_capacity(n),
             r: Vec::with_capacity(n),
             kind: Vec::with_capacity(n),
@@ -1182,10 +1192,14 @@ impl Bodies {
         self.y.push(y);
         self.vx.push(vx);
         self.vy.push(vy);
+        self.z.push(0.0);
+        self.vz.push(0.0);
         self.ax.push(0.0);
         self.ay.push(0.0);
+        self.az.push(0.0);
         self._px.push(x);
         self._py.push(y);
+        self._pz.push(0.0);
         self.m.push(m);
         let rho_default = default_bulk_density(kind, m);
         self.r.push(physical_radius(kind, m));
@@ -1293,10 +1307,14 @@ impl Bodies {
                 self.y[write] = self.y[read];
                 self.vx[write] = self.vx[read];
                 self.vy[write] = self.vy[read];
+                self.z[write] = self.z[read];
+                self.vz[write] = self.vz[read];
                 self.ax[write] = self.ax[read];
                 self.ay[write] = self.ay[read];
+                self.az[write] = self.az[read];
                 self._px[write] = self._px[read];
                 self._py[write] = self._py[read];
+                self._pz[write] = self._pz[read];
                 self.m[write] = self.m[read];
                 self.r[write] = self.r[read];
                 self.kind[write] = self.kind[read];
@@ -1324,10 +1342,14 @@ impl Bodies {
         self.y.truncate(write);
         self.vx.truncate(write);
         self.vy.truncate(write);
+        self.z.truncate(write);
+        self.vz.truncate(write);
         self.ax.truncate(write);
         self.ay.truncate(write);
+        self.az.truncate(write);
         self._px.truncate(write);
         self._py.truncate(write);
+        self._pz.truncate(write);
         self.m.truncate(write);
         self.r.truncate(write);
         self.kind.truncate(write);

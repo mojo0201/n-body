@@ -31,13 +31,16 @@ pub(super) fn leapfrog_step(b: &mut Bodies, dt: f64) {
     for i in 0..n {
         b.vx[i] += 0.5 * b.ax[i] * dt;
         b.vy[i] += 0.5 * b.ay[i] * dt;
+        b.vz[i] += 0.5 * b.az[i] * dt;
         b.x[i] += b.vx[i] * dt;
         b.y[i] += b.vy[i] * dt;
+        b.z[i] += b.vz[i] * dt;
     }
     compute_accel(b);
     for i in 0..n {
         b.vx[i] += 0.5 * b.ax[i] * dt;
         b.vy[i] += 0.5 * b.ay[i] * dt;
+        b.vz[i] += 0.5 * b.az[i] * dt;
     }
 }
 
@@ -110,6 +113,7 @@ pub(super) fn snapshot_positions(b: &mut Bodies) {
     for i in 0..b.len() {
         b._px[i] = b.x[i];
         b._py[i] = b.y[i];
+        b._pz[i] = b.z[i];
     }
 }
 
@@ -233,7 +237,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
     // Momentum at the start of the block. The full-force path removes the
     // net acceleration (see `compute_accel`). A block updates only some
     // bodies per sub-tick, so the same fix is done once at the block end.
-    let (p0x, p0y, _) = total_momentum(&*b);
+    let (p0x, p0y, p0z, _) = total_momentum(&*b);
     // Precomputed sub-tick sizes: rung_dt[r] = dt / 2^r. One division per
     // rung per block, replacing two per active body per tick.
     let rung_dt: Vec<f64> = (0..=(kmax as usize))
@@ -246,6 +250,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         let h = rung_dt[b.rung[i].min(kmax) as usize];
         b.vx[i] += 0.5 * b.ax[i] * h;
         b.vy[i] += 0.5 * b.ay[i] * h;
+        b.vz[i] += 0.5 * b.az[i] * h;
     }
 
     // Build the BH tree once for the whole block. See the doc comment above
@@ -276,8 +281,10 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         for i in 0..n {
             b._px[i] = b.x[i];
             b._py[i] = b.y[i];
+            b._pz[i] = b.z[i];
             b.x[i] += b.vx[i] * dtf;
             b.y[i] += b.vy[i] * dtf;
+            b.z[i] += b.vz[i] * dtf;
         }
 
         // Active set for this sub-tick: bodies whose rung r has
@@ -319,6 +326,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
             let h = rung_dt[r as usize];
             b.vx[i] += 0.5 * b.ax[i] * h;
             b.vy[i] += 0.5 * b.ay[i] * h;
+            b.vz[i] += 0.5 * b.az[i] * h;
 
             if tick < ticks {
                 // Rung change: at most one step finer is taken per sub-tick
@@ -352,6 +360,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
                 let h2 = rung_dt[k as usize];
                 b.vx[i] += 0.5 * b.ax[i] * h2;
                 b.vy[i] += 0.5 * b.ay[i] * h2;
+                b.vz[i] += 0.5 * b.az[i] * h2;
             }
         }
 
@@ -393,7 +402,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         b.time += dtf;
     }
 
-    remove_momentum_drift(b, (p0x, p0y));
+    remove_momentum_drift(b, (p0x, p0y, p0z));
 
     // Flashes are cosmetic. One O(F) retain at block end gives the same
     // survivor set as per-sub-tick aging would, because age is linear in

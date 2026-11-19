@@ -1430,6 +1430,8 @@ pub(super) fn append_system(dst: &mut Bodies, src: &Bodies, cx: f64, cy: f64) ->
             src.m[i],
             src.kind[i],
         );
+        dst.z[idx] = src.z[i];
+        dst.vz[idx] = src.vz[i];
         dst.origin[idx] = src.origin[i];
         dst.bulk_density[idx] = src.bulk_density[i];
         dst.class[idx] = src.class[i];

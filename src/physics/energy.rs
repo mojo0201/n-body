@@ -32,7 +32,8 @@ pub fn total_energy(b: &Bodies) -> Option<f64> {
         .map(|i| {
             let vx = b.vx[i];
             let vy = b.vy[i];
-            0.5 * b.m[i] * (vx * vx + vy * vy)
+            let vz = b.vz[i];
+            0.5 * b.m[i] * (vx * vx + vy * vy + vz * vz)
         })
         .sum();
 
@@ -51,12 +52,14 @@ pub fn total_energy(b: &Bodies) -> Option<f64> {
 fn row_pe(b: &Bodies, i: usize, n: usize) -> f64 {
     let xi = b.x[i];
     let yi = b.y[i];
+    let zi = b.z[i];
     let gmi = -G * b.m[i];
     let mut s = 0.0;
     for m in (i + 1)..n {
         let dx = b.x[m] - xi;
         let dy = b.y[m] - yi;
-        let r2 = dx * dx + dy * dy + SOFT2;
+        let dz = b.z[m] - zi;
+        let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
         // Softened Newtonian potential: -G m_i m_j / sqrt(r² + ε²).
         // `SOFT2` matches the softened force used by the integrator, so
         // this PE is the true conserved quantity of the simulated system,
@@ -118,7 +121,8 @@ fn potential_energy(b: &Bodies, n: usize) -> f64 {
     pe
 }
 
-/// Total angular momentum about the center of mass, including intrinsic
+/// Total angular momentum (z component only until the vector form lands in
+/// the 3D work) about the center of mass, including intrinsic
 /// spin.  `L = Σ m_i (r_i - R) × (v_i - V) + Σ spin_i`.
 ///
 /// Two passes on purpose.  The algebraically equivalent one-pass form

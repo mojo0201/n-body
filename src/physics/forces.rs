@@ -41,16 +41,17 @@ pub(super) const GW_REL_V2_MIN: f64 = 1e-6;
 /// The j-loop is split into `[0, i)` and `(i, n)` rather than carrying a
 /// `j == i` branch through the hot loop. This is the canonical serial
 /// path: its fp order defines what the parallel variants must reproduce.
-pub(super) fn force_direct_on(b: &Bodies, i: usize) -> (f64, f64, f64) {
-    let (mut sx, mut sy, mut s_max, mut w_max) = (0.0, 0.0, 0.0f64, 0.0f64);
+pub(super) fn force_direct_on(b: &Bodies, i: usize) -> (f64, f64, f64, f64) {
+    let (mut sx, mut sy, mut sz, mut s_max, mut w_max) = (0.0, 0.0, 0.0, 0.0f64, 0.0f64);
     for (lo, hi) in direct_bounds(i, b.len()) {
         let c = force_direct_range(b, i, lo..hi);
         sx += c.0;
         sy += c.1;
-        s_max = s_max.max(c.2);
-        w_max = w_max.max(c.3);
+        sz += c.2;
+        s_max = s_max.max(c.3);
+        w_max = w_max.max(c.4);
     }
-    (sx, sy, dt_limit(s_max, w_max))
+    (sx, sy, sz, dt_limit(s_max, w_max))
 }
 
 /// Chunk bounds over `[0, n) \ {i}` in ascending order. The serial and
@@ -77,32 +78,35 @@ pub(super) fn force_direct_range(
     b: &Bodies,
     i: usize,
     range: std::ops::Range<usize>,
-) -> (f64, f64, f64, f64) {
-    let (xs, ys, ms) = (&b.x, &b.y, &b.m);
-    let (vxs, vys) = (&b.vx, &b.vy);
-    let (xi, yi, mi) = (xs[i], ys[i], ms[i]);
-    let (vxi, vyi) = (vxs[i], vys[i]);
-    let (mut sx, mut sy) = (0.0, 0.0);
+) -> (f64, f64, f64, f64, f64) {
+    let (xs, ys, zs, ms) = (&b.x, &b.y, &b.z, &b.m);
+    let (vxs, vys, vzs) = (&b.vx, &b.vy, &b.vz);
+    let (xi, yi, zi, mi) = (xs[i], ys[i], zs[i], ms[i]);
+    let (vxi, vyi, vzi) = (vxs[i], vys[i], vzs[i]);
+    let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
     let mut s_max = 0.0f64;
     let mut w_max = 0.0f64;
     for j in range {
         let mj = ms[j];
         let dx = xs[j] - xi;
         let dy = ys[j] - yi;
-        let d2 = dx * dx + dy * dy + SOFT2;
+        let dz = zs[j] - zi;
+        let d2 = dx * dx + dy * dy + dz * dz + SOFT2;
         let d = d2.sqrt();
         let inv = 1.0 / (d2 * d);
         let f = G * mj * inv;
         sx += f * dx;
         sy += f * dy;
+        sz += f * dz;
         let s = (mi + mj) * inv;
         let dvx = vxs[j] - vxi;
         let dvy = vys[j] - vyi;
-        let w = (dvx * dvx + dvy * dvy) * inv * d;
+        let dvz = vzs[j] - vzi;
+        let w = (dvx * dvx + dvy * dvy + dvz * dvz) * inv * d;
         s_max = s_max.max(s);
         w_max = w_max.max(w);
     }
-    (sx, sy, s_max, w_max)
+    (sx, sy, sz, s_max, w_max)
 }
 
 /// Parallel-within-body variant of `force_direct_on`.
@@ -114,26 +118,27 @@ pub(super) fn force_direct_range(
 /// the partials are folded **in the order the slabs were emitted** —
 /// not in completion order. That ordered fold is what keeps the sum
 /// bit-identical to the serial path across every thread count.
-pub(super) fn force_direct_on_parallel(b: &Bodies, i: usize) -> (f64, f64, f64) {
+pub(super) fn force_direct_on_parallel(b: &Bodies, i: usize) -> (f64, f64, f64, f64) {
     let n = b.len();
 
     let bounds: Vec<(usize, usize)> = direct_bounds(i, n).collect();
 
-    let chunks: Vec<(f64, f64, f64, f64)> = bounds
+    let chunks: Vec<(f64, f64, f64, f64, f64)> = bounds
         .par_iter()
         .map(|&(lo, hi)| force_direct_range(b, i, lo..hi))
         .collect();
 
     // Fold in emission order. rayon::reduce would give a different
     // reduction tree and a different last-ULP result.
-    let (mut sx, mut sy, mut s_max, mut w_max) = (0.0, 0.0, 0.0f64, 0.0f64);
+    let (mut sx, mut sy, mut sz, mut s_max, mut w_max) = (0.0, 0.0, 0.0, 0.0f64, 0.0f64);
     for c in chunks {
         sx += c.0;
         sy += c.1;
-        s_max = s_max.max(c.2);
-        w_max = w_max.max(c.3);
+        sz += c.2;
+        s_max = s_max.max(c.3);
+        w_max = w_max.max(c.4);
     }
-    (sx, sy, dt_limit(s_max, w_max))
+    (sx, sy, sz, dt_limit(s_max, w_max))
 }
 
 /// Serial pairwise (symmetric) direct sum, used below `PAR_DIRECT_MIN`.
@@ -161,11 +166,14 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
     let Bodies {
         x,
         y,
+        z,
         m,
         vx,
         vy,
+        vz,
         ax,
         ay,
+        az,
         dtl,
         ..
     } = b;
@@ -173,6 +181,7 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
 
     ax[..n].fill(0.0);
     ay[..n].fill(0.0);
+    az[..n].fill(0.0);
 
     // Per-body running maxima; index j is updated by every i < j and
     // finalised once the outer loop reaches j.
@@ -181,27 +190,34 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
 
     let xs = &x[..n];
     let ys = &y[..n];
+    let zs = &z[..n];
     let ms = &m[..n];
     let vxs = &vx[..n];
     let vys = &vy[..n];
+    let vzs = &vz[..n];
     let axs = &mut ax[..n];
     let ays = &mut ay[..n];
+    let azs = &mut az[..n];
     let dtls = &mut dtl[..n];
 
     for i in 0..n {
         let xi = xs[i];
         let yi = ys[i];
+        let zi = zs[i];
         let mi = ms[i];
         let vxi = vxs[i];
         let vyi = vys[i];
+        let vzi = vzs[i];
         let mut axi = 0.0;
         let mut ayi = 0.0;
+        let mut azi = 0.0;
 
         // Head/tail split: ax_hi[i] is the accumulator we add to here,
         // ax_rest covers j > i. No fp-order change — j still runs
         // i+1..n in order.
         let (ax_hi, ax_rest) = axs.split_at_mut(i + 1);
         let (ay_hi, ay_rest) = ays.split_at_mut(i + 1);
+        let (az_hi, az_rest) = azs.split_at_mut(i + 1);
         let (sm_hi, sm_rest) = s_max.split_at_mut(i + 1);
         let (wm_hi, wm_rest) = w_max.split_at_mut(i + 1);
         let mut si = sm_hi[i];
@@ -212,7 +228,8 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
             let mj = ms[j];
             let dx = xs[j] - xi;
             let dy = ys[j] - yi;
-            let d2 = dx * dx + dy * dy + SOFT2;
+            let dz = zs[j] - zi;
+            let d2 = dx * dx + dy * dy + dz * dz + SOFT2;
             let d = d2.sqrt();
             let inv = 1.0 / (d2 * d);
 
@@ -223,13 +240,16 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
             let fj = G * mi * inv;
             axi += fi * dx;
             ayi += fi * dy;
+            azi += fi * dz;
             ax_rest[k] -= fj * dx;
             ay_rest[k] -= fj * dy;
+            az_rest[k] -= fj * dz;
 
             let s = (mi + mj) * inv;
             let dvx = vxs[j] - vxi;
             let dvy = vys[j] - vyi;
-            let w = (dvx * dvx + dvy * dvy) * inv * d;
+            let dvz = vzs[j] - vzi;
+            let w = (dvx * dvx + dvy * dvy + dvz * dvz) * inv * d;
 
             // `f64::max` == `if a > b` for non-NaN operands; d2 >= SOFT2
             // guarantees both s and w here are finite, so the branchless
@@ -242,6 +262,7 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
 
         ax_hi[i] += axi;
         ay_hi[i] += ayi;
+        az_hi[i] += azi;
         sm_hi[i] = si;
         wm_hi[i] = wi;
         // s_max[i], w_max[i] are final for body i: nothing will ever
@@ -284,7 +305,7 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
     }
     let use_tree = n >= BH_THRESHOLD && active.len() >= DIRECT_ACTIVE_MAX;
     let threads = rayon::current_num_threads();
-    let out: Vec<(f64, f64, f64)> = if use_tree {
+    let out: Vec<(f64, f64, f64, f64)> = if use_tree {
         // Build only if the caller didn't hand us one.
         let owned;
         let tree_ref = if let Some(t) = tree {
@@ -325,7 +346,8 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
         let i = i as usize;
         b.ax[i] = out[k].0;
         b.ay[i] = out[k].1;
-        b.dtl[i] = out[k].2;
+        b.az[i] = out[k].2;
+        b.dtl[i] = out[k].3;
     }
 }
 
@@ -359,22 +381,26 @@ pub fn compute_accel(b: &mut Bodies) {
     }
 
     // Mass-weighted mean acceleration → subtract to zero the COM drift.
-    let Bodies { m, ax, ay, .. } = b;
+    let Bodies { m, ax, ay, az, .. } = b;
     let mut mt = 0.0;
     let mut px = 0.0;
     let mut py = 0.0;
+    let mut pz = 0.0;
     for i in 0..n {
         let mi = m[i];
         mt += mi;
         px += mi * ax[i];
         py += mi * ay[i];
+        pz += mi * az[i];
     }
     if mt > 0.0 {
         let cx = px / mt;
         let cy = py / mt;
+        let cz = pz / mt;
         for i in 0..n {
             ax[i] -= cx;
             ay[i] -= cy;
+            az[i] -= cz;
         }
     }
 }
@@ -389,7 +415,7 @@ pub(super) fn needs_pn(b: &Bodies) -> bool {
         if b.dead[i] {
             continue;
         }
-        let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
+        let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i];
         if v2 > thresh {
             return true;
         }
@@ -397,34 +423,37 @@ pub(super) fn needs_pn(b: &Bodies) -> bool {
     false
 }
 
-/// Total mass-weighted momentum `(px, py, M)` of the live bodies.
-pub(super) fn total_momentum(b: &Bodies) -> (f64, f64, f64) {
-    let (mut px, mut py, mut mt) = (0.0, 0.0, 0.0);
+/// Total mass-weighted momentum `(px, py, pz, M)` of the live bodies.
+pub(super) fn total_momentum(b: &Bodies) -> (f64, f64, f64, f64) {
+    let (mut px, mut py, mut pz, mut mt) = (0.0, 0.0, 0.0, 0.0);
     for i in 0..b.len() {
         if b.dead[i] {
             continue;
         }
         px += b.m[i] * b.vx[i];
         py += b.m[i] * b.vy[i];
+        pz += b.m[i] * b.vz[i];
         mt += b.m[i];
     }
-    (px, py, mt)
+    (px, py, pz, mt)
 }
 
 /// Remove the momentum that the numerical scheme added since `p0` was
 /// measured. Every body gets the same velocity shift, so the centre of
 /// mass stays inertial. The block stepper uses this at the end of a
 /// block, in place of the acceleration fix in `compute_accel`.
-pub(super) fn remove_momentum_drift(b: &mut Bodies, p0: (f64, f64)) {
-    let (px, py, mt) = total_momentum(b);
+pub(super) fn remove_momentum_drift(b: &mut Bodies, p0: (f64, f64, f64)) {
+    let (px, py, pz, mt) = total_momentum(b);
     if mt <= 0.0 {
         return;
     }
     let dvx = (px - p0.0) / mt;
     let dvy = (py - p0.1) / mt;
+    let dvz = (pz - p0.2) / mt;
     for i in 0..b.len() {
         b.vx[i] -= dvx;
         b.vy[i] -= dvy;
+        b.vz[i] -= dvz;
     }
 }
 
@@ -452,13 +481,15 @@ pub(super) fn account_gw_loss(b: &mut Bodies, dt: f64) {
             }
             let rvx = b.vx[i] - b.vx[j];
             let rvy = b.vy[i] - b.vy[j];
-            let rel_v_sq = rvx * rvx + rvy * rvy;
+            let rvz = b.vz[i] - b.vz[j];
+            let rel_v_sq = rvx * rvx + rvy * rvy + rvz * rvz;
             if rel_v_sq * inv_c2 <= GW_REL_V2_MIN {
                 continue;
             }
             let dx = b.x[i] - b.x[j];
             let dy = b.y[i] - b.y[j];
-            let r2 = dx * dx + dy * dy + SOFT2;
+            let dz = b.z[i] - b.z[j];
+            let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
             let mi = b.m[i];
             let mj = b.m[j];
             let k = (32.0 / 5.0) * G * G * G * mi * mi * mj * mj * inv_c5 / (r2 * r2);
@@ -521,9 +552,11 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
         let mi = b.m[i];
         let xi = b.x[i];
         let yi = b.y[i];
+        let zi = b.z[i];
         let vxi = b.vx[i];
         let vyi = b.vy[i];
-        let vi_sq = vxi * vxi + vyi * vyi;
+        let vzi = b.vz[i];
+        let vi_sq = vxi * vxi + vyi * vyi + vzi * vzi;
 
         for j in 0..n {
             if j == i || b.dead[j] || (is_host_kind(b.kind[j]) && j < i) {
@@ -532,18 +565,21 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             let mj = b.m[j];
             let dx = xi - b.x[j];
             let dy = yi - b.y[j];
-            let r2 = dx * dx + dy * dy + SOFT2;
+            let dz = zi - b.z[j];
+            let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
             let r = r2.sqrt();
             let r_inv = 1.0 / r;
             let nxi = dx * r_inv;
             let nyi = dy * r_inv;
+            let nzi = dz * r_inv;
 
             let vxj = b.vx[j];
             let vyj = b.vy[j];
-            let vj_sq = vxj * vxj + vyj * vyj;
-            let v_dot = vxi * vxj + vyi * vyj;
-            let n_dot_vi = nxi * vxi + nyi * vyi;
-            let n_dot_vj = nxi * vxj + nyi * vyj;
+            let vzj = b.vz[j];
+            let vj_sq = vxj * vxj + vyj * vyj + vzj * vzj;
+            let v_dot = vxi * vxj + vyi * vyj + vzi * vzj;
+            let n_dot_vi = nxi * vxi + nyi * vyi + nzi * vzi;
+            let n_dot_vj = nxi * vxj + nyi * vyj + nzi * vzj;
 
             // ---- 1PN (EIH), evaluated separately for each body ----
             // n points from j to i. For body j the roles swap and n -> -n.
@@ -555,6 +591,7 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             if on(i) {
                 b.ax[i] += coeff_i * (bracket_i * nxi + vcoef_i * (vxi - vxj));
                 b.ay[i] += coeff_i * (bracket_i * nyi + vcoef_i * (vyi - vyj));
+                b.az[i] += coeff_i * (bracket_i * nzi + vcoef_i * (vzi - vzj));
             }
 
             let coeff_j = G * mi * inv_c2 * r_inv * r_inv;
@@ -565,6 +602,7 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             if on(j) {
                 b.ax[j] += coeff_j * (bracket_j * (-nxi) + vcoef_j * (vxj - vxi));
                 b.ay[j] += coeff_j * (bracket_j * (-nyi) + vcoef_j * (vyj - vyi));
+                b.az[j] += coeff_j * (bracket_j * (-nzi) + vcoef_j * (vzj - vzi));
             }
 
             // ---- 2.5PN (Peters drag) ----
@@ -574,7 +612,8 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             // far smaller than the integrator error.
             let rvx = vxi - vxj;
             let rvy = vyi - vyj;
-            let rel_v_sq = rvx * rvx + rvy * rvy;
+            let rvz = vzi - vzj;
+            let rel_v_sq = rvx * rvx + rvy * rvy + rvz * rvz;
             if rel_v_sq * inv_c2 > GW_REL_V2_MIN {
                 let r4 = r2 * r2;
                 let coeff_i = -(32.0 / 5.0) * G * G * G * mi * mj * mj * inv_c5 / r4;
@@ -582,10 +621,12 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
                 if on(i) {
                     b.ax[i] += coeff_i * rvx;
                     b.ay[i] += coeff_i * rvy;
+                    b.az[i] += coeff_i * rvz;
                 }
                 if on(j) {
                     b.ax[j] += coeff_j * rvx;
                     b.ay[j] += coeff_j * rvy;
+                    b.az[j] += coeff_j * rvz;
                 }
             }
         }
