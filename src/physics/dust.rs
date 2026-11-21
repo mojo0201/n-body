@@ -572,18 +572,27 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
 pub static DUST_STAT_NS: AtomicU64 = AtomicU64::new(0);
 pub static DUST_STAT_GRAINS: AtomicU64 = AtomicU64::new(0);
 
+/// Grains per extra stride of dust update interval, and its cap.
+const DUST_LOD_GRAINS: usize = 30_000;
+const DUST_LOD_MAX_STRIDE: usize = 4;
+
 /// Advance every field. Runs every `DUST_STEP_INTERVAL` physics steps.
 pub fn evolve(b: &mut Bodies, dt: f64) {
-    if !b.stats.steps.is_multiple_of(DUST_STEP_INTERVAL) {
+    if b.dust_fields.is_empty() {
         return;
     }
-    if b.dust_fields.is_empty() {
+    // Level of detail: dust is visual-only, so with many grains (many
+    // systems) update it less often, in proportion to the grain count.
+    let total: usize = b.dust_fields.iter().map(|f| f.grains.len()).sum();
+    let stride = (total / DUST_LOD_GRAINS).clamp(1, DUST_LOD_MAX_STRIDE) as u64;
+    let interval = DUST_STEP_INTERVAL as u64 * stride;
+    if !b.stats.steps.is_multiple_of(interval) {
         return;
     }
     let t0 = std::time::Instant::now();
     let mut fields = std::mem::take(&mut b.dust_fields);
     let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
-    let dt_field = dt * DUST_STEP_INTERVAL as f64;
+    let dt_field = dt * interval as f64;
     for f in fields.iter_mut() {
         f.step(b, dt_field);
         grind_belts(b, f, dt_field, &mut rng);

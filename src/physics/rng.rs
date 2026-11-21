@@ -70,6 +70,7 @@ pub fn seed_from_base62(s: &str) -> Option<u128> {
 /// The state is a single word. All RNG output is derived from it via the
 /// constants below; do not touch `next_u32` — its exact bit sequence is part
 /// of the reproducibility contract.
+#[derive(Clone)]
 pub struct XorShift {
     pub(super) s: u32,
 }

@@ -1484,6 +1484,7 @@ pub(super) fn append_system(dst: &mut Bodies, src: &Bodies, cx: f64, cy: f64) ->
             src.kind[i],
         );
         dst.z[idx] = src.z[i];
+        dst._pz[idx] = src.z[i];
         dst.vz[idx] = src.vz[i];
         dst.origin[idx] = src.origin[i];
         dst.bulk_density[idx] = src.bulk_density[i];
@@ -1711,6 +1712,12 @@ pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Ve
     // systemic velocity. Copy and velocity offset are separate so the
     // copy logic stays position-only (see `append_system`).
     let mut ranges = Vec::with_capacity(n);
+    // Several systems: each copy gets its own random orientation.
+    if n > 1 {
+        for (k, temp) in temps.iter_mut().enumerate() {
+            orient_system(temp, 0x50_1A2 ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+    }
     for (k, temp) in temps.iter().enumerate() {
         let (x, y, vx, vy) = slots[k];
         let (start, end) = append_system(b, temp, x, y);

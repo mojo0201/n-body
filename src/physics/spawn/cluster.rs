@@ -383,6 +383,16 @@ pub(in crate::physics) fn spawn_random_systems_impl(
     let total_bodies: usize = temps.iter().map(|t| t.0.len()).sum();
     *b = Bodies::with_capacity(total_bodies + 16);
 
+    // With several systems, each gets its own random orientation: their
+    // planes are unrelated, so they must not all lie in one shared plane. A
+    // single system keeps the reference plane.
+    if n > 1 {
+        for (k, (temp, _)) in temps.iter_mut().enumerate() {
+            let key = (seed as u64) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0A1E;
+            orient_system(temp, key);
+        }
+    }
+
     let mut infos = Vec::with_capacity(n);
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n);
     for (k, (temp, info)) in temps.iter().enumerate() {

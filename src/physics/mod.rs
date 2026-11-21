@@ -956,6 +956,7 @@ pub fn physical_radius(kind: BodyKind, m: f64) -> f64 {
 /// Short-lived visual marker for a collision or disruption. Rendered as an
 /// expanding ring; not physical, not a body. `expires_at` is precomputed as
 /// `age + life` for the renderer's fade logic.
+#[derive(Clone)]
 pub struct Flash {
     pub x: f64,
     pub y: f64,
@@ -992,6 +993,7 @@ pub enum EventKind {
 /// A single discrete event, kept in a bounded ring buffer (`EVENT_LOG_MAX`).
 /// `x` / `y` are the position *at the moment the event happened*, so a body
 /// that moves after a merger still has its merge location highlighted.
+#[derive(Clone)]
 pub struct Event {
     pub time: f64,
     pub kind: EventKind,
@@ -1047,6 +1049,7 @@ struct Spawn {
 /// invariant is maintained by `push`, `compact` and any code that writes to
 /// slices of them. Bodies marked `dead` remain in the vectors until `compact`
 /// rewrites the storage.
+#[derive(Clone)]
 pub struct Bodies {
     pub x: Vec<f64>,
     pub y: Vec<f64>,

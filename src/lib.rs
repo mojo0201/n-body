@@ -4,6 +4,7 @@
 //! simulation, renderer and UI live in modules declared here so they can
 //! be imported by `benches/`.
 
+pub mod history;
 pub mod physics;
 pub mod render;
 pub mod theme;

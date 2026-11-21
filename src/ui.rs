@@ -617,6 +617,8 @@ pub struct UiState {
     pub show_list: bool,
     pub show_help: bool,
     pub show_dock: bool,
+    /// Timeline bar along the bottom (J).
+    pub show_timeline: bool,
     /// System list window (beside the body list).
     pub show_systems: bool,
     /// Event log window.
@@ -789,6 +791,7 @@ impl UiState {
             show_list: false,
             show_help: false,
             show_dock: true,
+            show_timeline: true,
             show_systems: false,
             show_events: false,
             stats_sections: [true, true, false, true, false],
@@ -882,6 +885,8 @@ pub struct ViewInfo {
     pub mass_transfer: bool,
     /// Stellar aging speed relative to real time.
     pub aging_mult: f64,
+    /// Recorded history, once there is any.
+    pub timeline: Option<TimelineInfo>,
 }
 
 /// Body types offered by the single-body and multi-body edit menus.
@@ -921,8 +926,33 @@ pub enum Edit {
 /// This is deliberately a flat struct, not an enum-of-enums: the render
 /// loop applies actions in order in `apply_actions`, and flatness keeps
 /// the match arms simple.
+/// One timeline interaction from the UI.
+#[derive(Clone, Copy, Debug)]
+pub enum TimelineAct {
+    /// Show the recorded moment nearest this simulation time.
+    Scrub(f64),
+    /// Back to the live simulation.
+    Live,
+    Play(bool),
+    /// One recorded frame back (-1) or forward (+1).
+    Step(i32),
+}
+
+/// What the timeline bar needs to know, built once per frame.
+#[derive(Clone, Copy, Debug)]
+pub struct TimelineInfo {
+    pub t_min: f64,
+    pub t_max: f64,
+    /// `Some` while replaying: the time being shown.
+    pub t_now: Option<f64>,
+    pub playing: bool,
+    pub frames: usize,
+    pub mb: f32,
+}
+
 #[derive(Default)]
 pub struct Actions {
+    pub timeline: Option<TimelineAct>,
     pub reset: bool,
     pub toggle_pause: bool,
     pub step_once: bool,
@@ -964,6 +994,34 @@ pub struct Actions {
     pub sn_kicks: Option<bool>,
     pub mass_transfer: Option<bool>,
     pub aging_mult: Option<f64>,
+}
+
+impl Actions {
+    /// Only the actions that change how the scene is viewed, not the
+    /// simulation. Used while a timeline replay is showing.
+    pub fn view_only(self) -> Self {
+        Self {
+            toggle_pause: self.toggle_pause,
+            speed: self.speed,
+            orbits: self.orbits,
+            debris_orbits: self.debris_orbits,
+            zoom_mul: self.zoom_mul,
+            fit: self.fit,
+            view_angles: self.view_angles,
+            select: self.select,
+            center_on: self.center_on,
+            follow: self.follow,
+            cycle: self.cycle,
+            vsync: self.vsync,
+            trails: self.trails,
+            diag_visible: self.diag_visible,
+            focus: self.focus,
+            trail_age: self.trail_age,
+            trail_bodies: self.trail_bodies,
+            trail_non_rubble: self.trail_non_rubble,
+            ..Self::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1379,7 @@ pub fn draw(root: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
 
     draw_overlays(ctx, ui_state, view, b);
     status_bar(root, ui_state, view, b);
+    timeline_bar(root, ui_state, view, &mut act);
     save_toast(ctx, ui_state);
     if ui_state.show_dock {
         dock(root, ui_state, view, b, &mut act);
@@ -1555,6 +1614,95 @@ fn status_bar(root: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies
                         st.show_help = !st.show_help;
                     }
                 });
+            });
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Timeline
+// ---------------------------------------------------------------------------
+
+/// Simulation time as a readable span ("37 d", "4.2 yr", "1.3 Myr").
+fn format_sim_time(t: f64) -> String {
+    let days = t * crate::physics::time_unit_s() / 86_400.0;
+    let yr = days / 365.25;
+    let a = yr.abs();
+    if a < 1.0 {
+        format!("{:.0} d", days)
+    } else if a < 1_000.0 {
+        format!("{yr:.1} yr")
+    } else if a < 1.0e6 {
+        format!("{:.1} kyr", yr / 1e3)
+    } else {
+        format!("{:.2} Myr", yr / 1e6)
+    }
+}
+
+/// Bottom bar: scrub back through recorded history. Replays are view-only;
+/// "Live" returns to the running simulation.
+fn timeline_bar(root: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
+    let Some(tl) = view.timeline else { return };
+    if !st.show_timeline {
+        return;
+    }
+    let live = tl.t_now.is_none();
+    egui::Panel::bottom("timeline")
+        .frame(panel_frame().inner_margin(egui::Margin::symmetric(10, 4)))
+        .show(root, |ui| {
+            ui.horizontal(|ui| {
+                if ui.small_button("⏮").on_hover_text("previous frame").clicked() {
+                    act.timeline = Some(TimelineAct::Step(-1));
+                }
+                let play = if tl.playing { "⏸" } else { "▶" };
+                if ui
+                    .add_enabled(!live, egui::Button::new(play).small())
+                    .on_hover_text("play / pause the replay")
+                    .clicked()
+                {
+                    act.timeline = Some(TimelineAct::Play(!tl.playing));
+                }
+                if ui.small_button("⏭").on_hover_text("next frame").clicked() {
+                    act.timeline = Some(TimelineAct::Step(1));
+                }
+                let now = tl.t_now.unwrap_or(tl.t_max);
+                let label = if live {
+                    format!("live  t = {}", format_sim_time(tl.t_max))
+                } else {
+                    format!(
+                        "replay  t = {}  ({} ago)",
+                        format_sim_time(now),
+                        format_sim_time(tl.t_max - now)
+                    )
+                };
+                let reserve = 330.0;
+                let w = (ui.available_width() - reserve).max(80.0);
+                if tl.t_max - tl.t_min > 1e-9 {
+                    let mut t = now;
+                    ui.spacing_mut().slider_width = w;
+                    let r = ui.add(
+                        egui::Slider::new(&mut t, tl.t_min..=tl.t_max)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if r.changed() {
+                        act.timeline = Some(TimelineAct::Scrub(t));
+                    }
+                } else {
+                    ui.add_space(w);
+                }
+                ui.label(RichText::new(label).monospace());
+                if ui
+                    .selectable_label(live, "● Live")
+                    .on_hover_text("return to the running simulation")
+                    .clicked()
+                {
+                    act.timeline = Some(TimelineAct::Live);
+                }
+                ui.label(
+                    RichText::new(format!("{} frames, {:.0} MB", tl.frames, tl.mb))
+                        .weak()
+                        .small(),
+                );
             });
         });
 }

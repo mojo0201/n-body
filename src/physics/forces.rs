@@ -79,18 +79,25 @@ pub(super) fn force_direct_range(
     i: usize,
     range: std::ops::Range<usize>,
 ) -> (f64, f64, f64, f64, f64) {
-    let (xs, ys, zs, ms) = (&b.x, &b.y, &b.z, &b.m);
-    let (vxs, vys, vzs) = (&b.vx, &b.vy, &b.vz);
-    let (xi, yi, zi, mi) = (xs[i], ys[i], zs[i], ms[i]);
-    let (vxi, vyi, vzi) = (vxs[i], vys[i], vzs[i]);
+    let (xi, yi, zi, mi) = (b.x[i], b.y[i], b.z[i], b.m[i]);
+    let (vxi, vyi, vzi) = (b.vx[i], b.vy[i], b.vz[i]);
+    // Pre-slice every column to the range so the loop has no bounds checks.
+    // The summation order is unchanged, so results stay bit-identical.
+    let xs = &b.x[range.clone()];
+    let ys = &b.y[range.clone()];
+    let zs = &b.z[range.clone()];
+    let ms = &b.m[range.clone()];
+    let vxs = &b.vx[range.clone()];
+    let vys = &b.vy[range.clone()];
+    let vzs = &b.vz[range];
     let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
     let mut s_max = 0.0f64;
     let mut w_max = 0.0f64;
-    for j in range {
-        let mj = ms[j];
-        let dx = xs[j] - xi;
-        let dy = ys[j] - yi;
-        let dz = zs[j] - zi;
+    for k in 0..xs.len().min(ys.len()).min(zs.len()).min(ms.len()).min(vxs.len()).min(vys.len()).min(vzs.len()) {
+        let mj = ms[k];
+        let dx = xs[k] - xi;
+        let dy = ys[k] - yi;
+        let dz = zs[k] - zi;
         let d2 = dx * dx + dy * dy + dz * dz + SOFT2;
         let d = d2.sqrt();
         let inv = 1.0 / (d2 * d);
@@ -99,9 +106,9 @@ pub(super) fn force_direct_range(
         sy += f * dy;
         sz += f * dz;
         let s = (mi + mj) * inv;
-        let dvx = vxs[j] - vxi;
-        let dvy = vys[j] - vyi;
-        let dvz = vzs[j] - vzi;
+        let dvx = vxs[k] - vxi;
+        let dvy = vys[k] - vyi;
+        let dvz = vzs[k] - vzi;
         let w = (dvx * dvx + dvy * dvy + dvz * dvz) * inv * d;
         s_max = s_max.max(s);
         w_max = w_max.max(w);
@@ -521,6 +528,10 @@ pub(super) fn account_gw_loss(b: &mut Bodies, dt: f64) {
 /// radial-velocity terms that distinguish prograde from retrograde are
 /// omitted — but for a top-down visual sim the difference is below
 /// renderable resolution.
+/// Pairs with G(m_i+m_j)/(c² r) below this get no post-Newtonian terms. About
+/// 100 AU from a Sun-mass star; Mercury's coupling is ~2.5e-8, Neptune's ~3e-10.
+const PN_COUPLING_MIN: f64 = 1.0e-10;
+
 pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let n = b.len();
     if n < 2 {
@@ -548,6 +559,13 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let hosts: Vec<usize> = (0..n)
         .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
         .collect();
+    // Bodies sorted by x, so each host only scans the slab within its
+    // coupling cutoff instead of the whole population (matters with many
+    // systems, where almost every pair is far beyond the cutoff).
+    let mut order: Vec<u32> = (0..n as u32).filter(|&k| !b.dead[k as usize]).collect();
+    order.sort_unstable_by(|&p, &q| b.x[p as usize].total_cmp(&b.x[q as usize]));
+    let xs: Vec<f64> = order.iter().map(|&k| b.x[k as usize]).collect();
+    let m_max = order.iter().map(|&k| b.m[k as usize]).fold(0.0, f64::max);
     for &i in &hosts {
         let mi = b.m[i];
         let xi = b.x[i];
@@ -558,8 +576,12 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
         let vzi = b.vz[i];
         let vi_sq = vxi * vxi + vyi * vyi + vzi * vzi;
 
-        for j in 0..n {
-            if j == i || b.dead[j] || (is_host_kind(b.kind[j]) && j < i) {
+        let cut_max = G * (mi + m_max) * inv_c2 * (1.0 / PN_COUPLING_MIN);
+        let lo = xs.partition_point(|&x| x < xi - cut_max);
+        let hi = xs.partition_point(|&x| x <= xi + cut_max);
+        for &ju in &order[lo..hi] {
+            let j = ju as usize;
+            if j == i || (is_host_kind(b.kind[j]) && j < i) {
                 continue;
             }
             let mj = b.m[j];
@@ -567,6 +589,13 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             let dy = yi - b.y[j];
             let dz = zi - b.z[j];
             let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
+            // Far pairs: the PN terms scale as G(mi+mj)/(c² r) relative to the
+            // Newtonian force, so beyond a cutoff they sit below integrator
+            // error. This also drops every cross-system pair in a cluster.
+            let cut = G * (mi + mj) * inv_c2 * (1.0 / PN_COUPLING_MIN);
+            if r2 > cut * cut {
+                continue;
+            }
             let r = r2.sqrt();
             let r_inv = 1.0 / r;
             let nxi = dx * r_inv;

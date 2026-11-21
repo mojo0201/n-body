@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nbody_rust::history::{self, History};
 use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
-use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
+use nbody_rust::ui::{self, Actions, Edit, TimelineAct, TimelineInfo, UiState, ViewInfo};
 use nbody_rust::view::{self, View3};
 use nbody_rust::Preset;
 use winit::application::ApplicationHandler;
@@ -58,6 +59,11 @@ const PHYS_SLICE: Duration = Duration::from_millis(4);
 // State shared between the render thread and the physics thread
 // ---------------------------------------------------------------------------
 
+/// Simulation seconds per wall second at a displayed speed of 1.00x. Below 1
+/// so "normal" speed is slower than the raw rate; every speed control, the
+/// slider and the quick buttons are relative to this.
+const SPEED_SCALE: f64 = 0.5;
+
 fn lock_ok<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -73,6 +79,9 @@ struct Shared {
     phys_ns: AtomicU64,
     orbit_req: Mutex<Option<(u64, OrbitReq)>>,
     orbit_out: Mutex<Option<(u64, Vec<OrbitVertex>)>>,
+    /// Timeline snapshots, recorded by the physics thread. Lock order is
+    /// always `bodies` then `history`.
+    history: Mutex<History>,
 }
 
 impl Shared {
@@ -82,12 +91,13 @@ impl Shared {
             render_wants: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             paused: AtomicBool::new(paused),
-            speed_bits: AtomicU64::new(speed.to_bits()),
+            speed_bits: AtomicU64::new((speed * SPEED_SCALE).to_bits()),
             clear_accum: AtomicBool::new(false),
             behind: AtomicBool::new(false),
             phys_ns: AtomicU64::new(0),
             orbit_req: Mutex::new(None),
             orbit_out: Mutex::new(None),
+            history: Mutex::new(History::new(history::DEFAULT_CAP_MB)),
         }
     }
 
@@ -151,6 +161,12 @@ fn physics_loop(sh: Arc<Shared>) {
 
         let mut worked = false;
 
+        // Seed the timeline with the starting state, even while paused.
+        if lock_ok(&sh.history).is_empty() {
+            let b = lock_ok(&sh.bodies);
+            lock_ok(&sh.history).maybe_record(&b);
+        }
+
         let req = lock_ok(&sh.orbit_req).take();
         if let Some((id, req)) = req {
             sh.yield_to_render();
@@ -174,6 +190,7 @@ fn physics_loop(sh: Arc<Shared>) {
                     break;
                 }
             }
+            lock_ok(&sh.history).maybe_record(&b);
             drop(b);
             sh.phys_ns
                 .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -506,6 +523,12 @@ impl TrailState {
     }
 }
 
+/// A timeline replay in progress: the simulation time being shown.
+struct Replay {
+    time: f64,
+    playing: bool,
+}
+
 struct SimState {
     paused: bool,
     speed: f64,
@@ -536,6 +559,12 @@ struct SimState {
     show_orbits: bool,
     show_debris_orbits: bool,
     orbit_buf_valid: bool,
+    /// Timeline replay: `Some` while viewing a recorded moment instead of the live state.
+    replay: Option<Replay>,
+    /// The snapshot being shown, as an owned `Bodies` swapped in while rendering.
+    replay_cache: Option<(u64, Bodies)>,
+    /// Frame id and zoom the replay orbit lines were last built for.
+    replay_orbit: (u64, f32),
     last_orbit_update: Instant,
     last_orbit_zoom: f32,
     last_orbit_cam: [f64; 2],
@@ -603,6 +632,9 @@ impl SimState {
             show_orbits: true,
             show_debris_orbits: false,
             orbit_buf_valid: false,
+            replay: None,
+            replay_cache: None,
+            replay_orbit: (u64::MAX, 0.0),
             last_orbit_update: Instant::now(),
             last_orbit_zoom: 0.7,
             last_orbit_cam: [0.0; 2],
@@ -645,7 +677,100 @@ impl SimState {
     /// the Solar preset takes the body count from the spawn (13 planets +
     /// ~200 belt bodies, not the old hard-coded 9). `seed` is used by both:
     /// `Random` uses it as the RNG seed, `Solar` as the planet-phase seed.
+    /// Leave replay and return to the live simulation.
+    fn exit_replay(&mut self) {
+        if self.replay.take().is_some() {
+            self.replay_cache = None;
+            self.orbit_buf_valid = false;
+            self.trail.clear();
+        }
+    }
+
+    /// While replaying, swap the recorded snapshot into `b` for this frame and
+    /// return its id. The caller must call `leave_replay` before releasing the
+    /// lock, so the physics thread never sees the snapshot.
+    fn enter_replay(&mut self, shared: &Shared, b: &mut Bodies, frame_dt: f64) -> Option<u64> {
+        let (id, arc) = {
+            let rp = self.replay.as_mut()?;
+            let hist = lock_ok(&shared.history);
+            let Some((t_min, t_max)) = hist.span() else {
+                drop(hist);
+                self.exit_replay();
+                return None;
+            };
+            if rp.playing {
+                rp.time += frame_dt * self.speed * SPEED_SCALE;
+                if rp.time >= t_max {
+                    drop(hist);
+                    self.exit_replay();
+                    return None;
+                }
+            }
+            rp.time = rp.time.clamp(t_min, t_max);
+            let f = hist.nearest(rp.time)?;
+            (f.id, f.state.clone())
+        };
+        if self.replay_cache.as_ref().map(|c| c.0) != Some(id) {
+            self.replay_cache = Some((id, (*arc).clone()));
+        }
+        let cache = self.replay_cache.as_mut()?;
+        std::mem::swap(b, &mut cache.1);
+        Some(id)
+    }
+
+    fn leave_replay(&mut self, b: &mut Bodies) {
+        if let Some(cache) = self.replay_cache.as_mut() {
+            std::mem::swap(b, &mut cache.1);
+        }
+    }
+
+    fn handle_timeline(&mut self, act: TimelineAct, shared: &Shared) {
+        let hist = lock_ok(&shared.history);
+        let Some((t_min, t_max)) = hist.span() else {
+            return;
+        };
+        match act {
+            TimelineAct::Live => {
+                drop(hist);
+                self.exit_replay();
+            }
+            TimelineAct::Scrub(t) => {
+                let t = t.clamp(t_min, t_max);
+                match self.replay.as_mut() {
+                    Some(rp) => {
+                        rp.time = t;
+                        rp.playing = false;
+                    }
+                    None => {
+                        self.replay = Some(Replay { time: t, playing: false });
+                        self.follow_smooth = None;
+                    }
+                }
+            }
+            TimelineAct::Play(on) => {
+                if let Some(rp) = self.replay.as_mut() {
+                    rp.playing = on;
+                }
+            }
+            TimelineAct::Step(dir) => {
+                let now = self.replay.as_ref().map_or(t_max, |r| r.time);
+                if let Some(t) = hist.neighbour_time(now, dir) {
+                    match self.replay.as_mut() {
+                        Some(rp) => {
+                            rp.time = t;
+                            rp.playing = false;
+                        }
+                        None => self.replay = Some(Replay { time: t, playing: false }),
+                    }
+                }
+            }
+        }
+    }
+
     fn reset_with(&mut self, b: &mut Bodies, shared: &Shared, count: usize, seed: u128) {
+        lock_ok(&shared.history).clear();
+        self.replay = None;
+        self.replay_cache = None;
         self.seed = seed;
         match self.preset {
             Preset::Random => {
@@ -747,6 +872,9 @@ impl SimState {
     /// The file is read and parsed *before* the bodies lock is taken, so a slow
     /// disk never stalls the physics thread. The caller must NOT hold the lock.
     fn load_game(&mut self, name: &str, ui_state: &mut UiState, shared: &Shared) {
+        lock_ok(&shared.history).clear();
+        self.replay = None;
+        self.replay_cache = None;
         // Only a plain save name may reach the file system.
         if physics::sanitize_save_name(name).as_deref() != Some(name) {
             ui_state.set_save_msg("Load failed: invalid save name.", false);
@@ -1591,20 +1719,28 @@ impl ApplicationHandler for App {
                                     self.sim.follow = !self.sim.follow;
                                 }
                             }
+                            "j" => {
+                                self.ui.show_timeline = !self.ui.show_timeline;
+                            }
                             "t" => {
                                 // Back to the top-down view.
                                 self.sim.yaw = 0.0;
                                 self.sim.pitch = 0.0;
                             }
-                            "n" => {
-                                let b = self.shared.lock_for_render();
-                                self.sim.cycle_selection(&b, 1);
+                            "n" | "p" => {
+                                let dir = if &*c == "n" { 1 } else { -1 };
+                                if self.sim.replay.is_some() {
+                                    // Cycle through the bodies of the shown snapshot.
+                                    if let Some(cache) = self.sim.replay_cache.take() {
+                                        self.sim.cycle_selection(&cache.1, dir);
+                                        self.sim.replay_cache = Some(cache);
+                                    }
+                                } else {
+                                    let b = self.shared.lock_for_render();
+                                    self.sim.cycle_selection(&b, dir);
+                                }
                             }
-                            "p" => {
-                                let b = self.shared.lock_for_render();
-                                self.sim.cycle_selection(&b, -1);
-                            }
-                            "." => {
+                            "." if self.sim.replay.is_none() => {
                                 let mut b = self.shared.lock_for_render();
                                 physics::advance(&mut b, physics::DT);
                             }
@@ -1630,9 +1766,14 @@ impl ApplicationHandler for App {
                 } else if self.sim.dragging {
                     self.sim.dragging = false;
                     if self.sim.moved_px < CLICK_SLOP_PX {
-                        let hit = {
-                            let b = self.shared.lock_for_render();
-                            self.sim.pick(&b, self.sim.cursor, vp)
+                        let hit = match &self.sim.replay_cache {
+                            Some((_, rb)) if self.sim.replay.is_some() => {
+                                self.sim.pick(rb, self.sim.cursor, vp)
+                            }
+                            _ => {
+                                let b = self.shared.lock_for_render();
+                                self.sim.pick(&b, self.sim.cursor, vp)
+                            }
                         };
                         self.sim.selected = hit;
                         if hit.is_none() {
@@ -1783,6 +1924,9 @@ impl ApplicationHandler for App {
                 // GPU upload) runs after the lock drops.
                 #[allow(unused_assignments)]
                 let mut orbit_out_taken: Option<(u64, Vec<OrbitVertex>)> = None;
+                // Replay: the recorded frame shown this redraw, if any.
+                #[allow(unused_assignments)]
+                let mut replaying: Option<u64> = None;
 
                 {
                     // Time spent waiting for the physics thread to release the
@@ -1790,6 +1934,9 @@ impl ApplicationHandler for App {
                     let t_wait0 = Instant::now();
                     let mut b = self.shared.lock_for_render();
                     let t_held0 = Instant::now();
+                    // Replay: show a recorded snapshot in place of the live
+                    // state. It is swapped back before this lock is released.
+                    replaying = self.sim.enter_replay(&self.shared, &mut b, frame_dt);
                     self.sim.t_wait_accum += t_wait0.elapsed().as_secs_f64() * 1e6;
 
                     self.sim.fps_frames += 1;
@@ -1843,7 +1990,9 @@ impl ApplicationHandler for App {
                         self.sim.follow = false;
                     }
 
-                    self.ui.diag.maybe_sample(&b);
+                    if replaying.is_none() {
+                        self.ui.diag.maybe_sample(&b);
+                    }
 
                     let effective_systems = if self.sim.preset == Preset::Random
                         && self.sim.last_loaded_preset.is_none()
@@ -1883,10 +2032,29 @@ impl ApplicationHandler for App {
                         sn_kicks: self.sim.sn_kicks,
                         mass_transfer: self.sim.mass_transfer,
                         aging_mult: self.sim.aging_mult,
+                        timeline: {
+                            let hist = lock_ok(&self.shared.history);
+                            hist.span().map(|(t_min, t_max)| TimelineInfo {
+                                t_min,
+                                t_max,
+                                t_now: self.sim.replay.as_ref().map(|r| r.time),
+                                playing: self.sim.replay.as_ref().is_some_and(|r| r.playing),
+                                frames: hist.len(),
+                                mb: hist.megabytes(),
+                            })
+                        },
                     };
                     full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
                         actions = ui::draw(ui, &mut self.ui, &view_info, &b);
                     });
+                    if let Some(t) = actions.timeline.take() {
+                        self.sim.handle_timeline(t, &self.shared);
+                    }
+                    // A replay is view-only: edits, spawns, resets and loads
+                    // are dropped; camera, selection and display options stay.
+                    if replaying.is_some() {
+                        actions = actions.view_only();
+                    }
                     self.sim
                         .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
                     trail_snapshot = self.sim.trail.snapshot(&b, self.sim.follow_smooth);
@@ -1898,20 +2066,40 @@ impl ApplicationHandler for App {
                         .merges
                         .wrapping_add(b.stats.impacts)
                         .wrapping_add(b.stats.tidal);
-                    if self.sim.pause_on_event
+                    if replaying.is_none()
+                        && self.sim.pause_on_event
                         && !self.sim.paused
                         && pause_events > self.sim.last_pause_events
                     {
                         self.sim.paused = true;
                     }
-                    self.sim.last_pause_events = pause_events;
+                    if replaying.is_none() {
+                        self.sim.last_pause_events = pause_events;
+                    }
 
                     self.shared.paused.store(self.sim.paused, Ordering::Relaxed);
                     self.shared
                         .speed_bits
-                        .store(self.sim.speed.to_bits(), Ordering::Relaxed);
+                        .store((self.sim.speed * SPEED_SCALE).to_bits(), Ordering::Relaxed);
 
                     orbit_out_taken = lock_ok(&self.shared.orbit_out).take();
+                    if let Some(fid) = replaying {
+                        // Orbit lines for the recorded frame, built here from
+                        // the snapshot; the physics thread's live lines are dropped.
+                        orbit_out_taken = None;
+                        let key = (fid, self.sim.zoom);
+                        if self.sim.replay_orbit != key || !self.sim.orbit_buf_valid {
+                            let segs = physics::compute_orbit_segments(
+                                &b,
+                                self.sim.zoom as f64,
+                                self.sim.show_orbits,
+                                self.sim.show_debris_orbits,
+                            );
+                            orbit_out_taken = Some((0, render::segments_to_vertices(&segs)));
+                            self.sim.replay_orbit = key;
+                            self.sim.orbit_buf_valid = true;
+                        }
+                    }
                     let events_total = b
                         .stats
                         .merges
@@ -1928,9 +2116,10 @@ impl ApplicationHandler for App {
                     let events_changed = events_total != self.sim.last_orbit_events;
                     let stale = !self.sim.paused
                         && self.sim.last_orbit_update.elapsed().as_millis() > ORBIT_REFRESH_MS;
-                    if !self.sim.orbit_buf_valid
+                    if replaying.is_none()
+                        && (!self.sim.orbit_buf_valid
                         || (orbits_visible
-                            && (zoom_changed || cam_moved || events_changed || stale))
+                            && (zoom_changed || cam_moved || events_changed || stale)))
                     {
                         self.sim.orbit_posted += 1;
                         *lock_ok(&self.shared.orbit_req) = Some((
@@ -1969,6 +2158,9 @@ impl ApplicationHandler for App {
                         self.sim.last_comet_verts = comet_tail_verts.len();
                     }
                     self.sim.t_held_accum += t_held0.elapsed().as_secs_f64() * 1e6;
+                    if replaying.is_some() {
+                        self.sim.leave_replay(&mut b);
+                    }
                 }
 
                 // ---- Everything below runs WITHOUT the bodies lock. ----
@@ -1991,7 +2183,13 @@ impl ApplicationHandler for App {
                 gfx.renderer.upload_instances(&gfx.device, &gfx.queue);
                 gfx.renderer
                     .set_comet_tail_vertices(&gfx.device, &gfx.queue, &comet_tail_verts);
-                if self.sim.trail.cfg.enabled {
+                if replaying.is_some() {
+                    // Trails belong to the live run; hide them while replaying.
+                    if gfx.renderer.trail_count() > 0 {
+                        gfx.renderer
+                            .set_trail_vertices(&gfx.device, &gfx.queue, &[]);
+                    }
+                } else if self.sim.trail.cfg.enabled {
                     self.sim.trail.update(&trail_snapshot);
                     let verts = self.sim.trail.build_vertices(cam_view.cam);
                     gfx.renderer

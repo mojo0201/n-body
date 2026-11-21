@@ -450,6 +450,49 @@ pub(super) fn tilt_isotropic(key: u64) -> (f64, f64) {
     (inc, r.next_f64() * TAU)
 }
 
+/// Rotation matrix taking a system's own frame to a random orientation in
+/// space (isotropic pole, uniform spin). `None` when inclinations are off, so
+/// the system stays in the reference plane.
+pub(super) fn random_orientation(key: u64) -> Option<[[f64; 3]; 3]> {
+    if inclination_scale() <= 0.0 {
+        return None;
+    }
+    let (inc, node) = tilt_isotropic(key);
+    let spin = tilt_rng(key ^ 0x5B1D_0F5E).next_f64() * TAU;
+    let rz = |a: f64| {
+        let (s, c) = a.sin_cos();
+        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+    };
+    let (si, ci) = inc.sin_cos();
+    let rx = [[1.0, 0.0, 0.0], [0.0, ci, -si], [0.0, si, ci]];
+    let mul = |a: [[f64; 3]; 3], b: [[f64; 3]; 3]| {
+        let mut o = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                o[i][j] = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+            }
+        }
+        o
+    };
+    Some(mul(rz(node), mul(rx, rz(spin))))
+}
+
+/// Rotate a whole system (positions and velocities about the origin) into a
+/// random orientation. No-op when inclinations are off.
+pub(in crate::physics) fn orient_system(temp: &mut Bodies, key: u64) {
+    let Some(r) = random_orientation(key) else {
+        return;
+    };
+    let rot = |v: [f64; 3]| [0, 1, 2].map(|i| r[i][0] * v[0] + r[i][1] * v[1] + r[i][2] * v[2]);
+    for i in 0..temp.len() {
+        let p = rot([temp.x[i], temp.y[i], temp.z[i]]);
+        let v = rot([temp.vx[i], temp.vy[i], temp.vz[i]]);
+        (temp.x[i], temp.y[i], temp.z[i]) = (p[0], p[1], p[2]);
+        (temp._px[i], temp._py[i], temp._pz[i]) = (p[0], p[1], p[2]);
+        (temp.vx[i], temp.vy[i], temp.vz[i]) = (v[0], v[1], v[2]);
+    }
+}
+
 /// Push a body with a full 3D state.
 pub(super) fn push3(
     b: &mut Bodies,
@@ -614,9 +657,12 @@ pub(super) fn push_kepler_about(
     let omega = rng.next_f64() * TAU;
     let mean_anom = rng.next_f64() * TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
-    // Multi-planet systems are nearly coplanar (Kepler multis ~1-2 degrees,
-    // the Solar System ~3): Rayleigh with sigma 1.5 degrees about the mid-plane.
-    let (inc, node) = tilt_rayleigh(tilt_key(&[omega, mean_anom, a]), 1.5);
+    // Planetary systems are nearly coplanar, but how flat varies from star to
+    // star: Kepler multis sit within ~1-2 degrees, the Solar System ~3, and
+    // dynamically hotter systems reach several degrees. Each system draws its
+    // own spread, log-uniform from 0.7 to 4.2 degrees, keyed on its star's mass.
+    let sigma = 0.7 * 6f64.powf(tilt_rng(tilt_key(&[mc])).next_f64());
+    let (inc, node) = tilt_rayleigh(tilt_key(&[omega, mean_anom, a]), sigma);
     let (x, y, z, vx, vy, vz) = kepler_state_incl(G * (mc + m), a, e, nu, omega, inc, node);
     push3(b, [cx + x, cy + y, z], [cvx + vx, cvy + vy, vz], m, kind)
 }
