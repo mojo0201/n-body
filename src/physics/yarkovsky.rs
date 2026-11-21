@@ -89,10 +89,12 @@ pub(super) fn yarkovsky(b: &mut Bodies, dt: f64) {
         }
         let dx = b.x[j] - b.x[h];
         let dy = b.y[j] - b.y[h];
+        let dz = b.z[j] - b.z[h];
         let dvx = b.vx[j] - b.vx[h];
         let dvy = b.vy[j] - b.vy[h];
-        let v = (dvx * dvx + dvy * dvy).sqrt();
-        let d2 = dx * dx + dy * dy;
+        let dvz = b.vz[j] - b.vz[h];
+        let v = (dvx * dvx + dvy * dvy + dvz * dvz).sqrt();
+        let d2 = dx * dx + dy * dy + dz * dz;
         if !(v > 0.0) || !(d2 > 0.0) {
             continue;
         }
@@ -106,11 +108,12 @@ pub(super) fn yarkovsky(b: &mut Bodies, dt: f64) {
         // SI → simulation units, with the sign of the (hidden) spin.
         let a_sim = spin_sign(b.id[j] as u64) * a_si * boost * tu * tu / len_m;
         let dv = a_sim * dt;
-        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
+        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j]);
         b.vx[j] += dv * dvx / v;
         b.vy[j] += dv * dvy / v;
+        b.vz[j] += dv * dvz / v;
         if b.e_pre.is_none() {
-            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j]);
+            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j]);
             b.stats.energy_offset += ke1 - ke0;
         }
     }

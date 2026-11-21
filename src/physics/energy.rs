@@ -121,9 +121,10 @@ fn potential_energy(b: &Bodies, n: usize) -> f64 {
     pe
 }
 
-/// Total angular momentum (z component only until the vector form lands in
-/// the 3D work) about the center of mass, including intrinsic
-/// spin.  `L = Σ m_i (r_i - R) × (v_i - V) + Σ spin_i`.
+/// Total angular momentum, z component, about the center of mass, including
+/// intrinsic spin (spin is a scalar about +z).  `L_z = Σ m_i [(r_i - R) × (v_i - V)]_z + Σ spin_i`.
+/// This is the quantity collisions and tides exchange with spin. See
+/// `total_angular_momentum_vec` for the full vector.
 ///
 /// Two passes on purpose.  The algebraically equivalent one-pass form
 /// `L = Σ m_i r_i × v_i − M · R × V` suffers catastrophic cancellation
@@ -234,4 +235,37 @@ pub fn energy_dissipated_pct(b: &Bodies) -> Option<f64> {
         return None;
     }
     Some(b.stats.energy_offset / e0.abs() * 100.0)
+}
+
+/// Full angular-momentum vector about the centre of mass: the orbital
+/// `Σ m_i (r_i - R) × (v_i - V)`, with every body's scalar spin added to the z
+/// component. Magnitude is the number to watch for conservation when orbits are
+/// inclined.
+pub fn total_angular_momentum_vec(b: &Bodies) -> [f64; 3] {
+    let n = b.len();
+    let mt: f64 = b.m.iter().take(n).sum();
+    if n == 0 || mt <= 0.0 {
+        return [0.0; 3];
+    }
+    let (mut mx, mut my, mut mz, mut mvx, mut mvy, mut mvz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for i in 0..n {
+        let mi = b.m[i];
+        mx += mi * b.x[i];
+        my += mi * b.y[i];
+        mz += mi * b.z[i];
+        mvx += mi * b.vx[i];
+        mvy += mi * b.vy[i];
+        mvz += mi * b.vz[i];
+    }
+    let (cx, cy, cz, vx, vy, vz) = (mx / mt, my / mt, mz / mt, mvx / mt, mvy / mt, mvz / mt);
+    let mut l = [0.0f64; 3];
+    for i in 0..n {
+        let mi = b.m[i];
+        let (dx, dy, dz) = (b.x[i] - cx, b.y[i] - cy, b.z[i] - cz);
+        let (dvx, dvy, dvz) = (b.vx[i] - vx, b.vy[i] - vy, b.vz[i] - vz);
+        l[0] += mi * (dy * dvz - dz * dvy);
+        l[1] += mi * (dz * dvx - dx * dvz);
+        l[2] += mi * (dx * dvy - dy * dvx) + b.spin[i];
+    }
+    l
 }

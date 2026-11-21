@@ -4,6 +4,8 @@
 use nbody_rust::physics::*;
 
 fn main() {
+    // The baseline pins the planar (coplanar) physics.
+    set_inclination_scale(0.0);
     for seed in [1u128, 2, 3, 7, 11, 42, 99, 1234] {
         let mut b = Bodies::with_capacity(400);
         spawn_system(&mut b, 400, seed);

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use bytemuck::{Pod, Zeroable};
 
 use crate::physics::{self, Bodies, BodyClass, BodyKind, BodyOrigin};
+use crate::view::View3;
 
 /// Fields the dust centre uniform can hold. Must match `DustFields` in the WGSL.
 pub const MAX_DUST_FIELDS: usize = 256;
@@ -51,57 +52,60 @@ const DUST_UPLOAD_MIN: Duration = Duration::from_millis(100);
 // GPU structs
 // ---------------------------------------------------------------------------
 
-/// Mirrors `struct Camera` in `render.wgsl` (32 bytes, 16-aligned).
+/// Mirrors `struct Camera` in `render.wgsl` (80 bytes, 16-aligned).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct CameraUniform {
-    pub pos: [f32; 2],
+    /// Focus point (zero for the relative camera).
+    pub pos: [f32; 3],
     pub zoom: f32,
-    _pad0: f32,
     pub viewport: [f32; 2],
     _pad1: [f32; 2],
+    /// Rows of the world -> view rotation, each padded to a `vec4`.
+    pub rot: [[f32; 4]; 3],
 }
 
-/// One body as an instanced quad. Offsets: pos 0, radius 8, lit 12,
-/// color 16, light_angle 28; stride 32 (`vec3` needs 16-byte alignment).
+/// One body as an instanced quad. Offsets: pos 0, radius 12, color 16,
+/// lit 28, light 32; stride 48.
 ///
 /// `lit` is 1 for a body that a star lights (planets) and 0 for a body that
-/// shines or is not shaded. `light_angle` is the direction from the body to
-/// its star, in world axes, in radians.
+/// shines or is not shaded. `light` is the unit direction from the body to
+/// its star, in world axes.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct BodyInstance {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub radius: f32,
-    pub lit: f32,
     pub color: [f32; 3],
-    pub light_angle: f32,
+    pub lit: f32,
+    pub light: [f32; 3],
+    pub _pad: f32,
 }
 
-/// One endpoint of an orbit or trail segment (`Unorm8x4` colour), stride 12.
+/// One endpoint of an orbit or trail segment (`Unorm8x4` colour), stride 16.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct OrbitVertex {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub color: [u8; 4],
 }
 
-/// One collision flash. Stride 16.
+/// One collision flash. Stride 20.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct FlashInstance {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub radius: f32,
     pub progress: f32,
 }
 
 /// One dust grain. `pos` is relative to the field's primary at upload time,
 /// `weight` is the tracer mass in Earth masses, `field` indexes the centre
-/// uniform. Offsets: pos 0, weight 8, field 12; stride 16.
+/// uniform. Offsets: pos 0, weight 12, field 16; stride 20.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct DustVertex {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub weight: f32,
     pub field: u32,
 }
@@ -115,7 +119,7 @@ pub struct OrbitReq {
     pub debris: bool,
     // Reserved for future culling. Currently unused by the builder.
     #[allow(dead_code)]
-    pub cam: [f64; 2],
+    pub cam: [f64; 3],
     #[allow(dead_code)]
     pub viewport: [f32; 2],
 }
@@ -127,7 +131,7 @@ pub struct OrbitReq {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct GlowInstance {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub radius: f32,
     pub intensity: f32,
     pub color: [f32; 3],
@@ -138,7 +142,7 @@ pub struct GlowInstance {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct BlackHoleInstance {
-    pub pos: [f32; 2],
+    pub pos: [f32; 3],
     pub radius: f32,
     /// 0..1 strength of the accretion disk; 0 draws only the shadow.
     pub accretion: f32,
@@ -391,13 +395,16 @@ pub fn body_color(b: &Bodies, i: usize) -> [f32; 3] {
 /// world coordinates for the additive comet pipeline; alpha fades to zero at
 /// the tip. Tail length is at least 12 px so a comet stays readable when the
 /// view is zoomed out.
-pub fn build_comet_tails(b: &Bodies, zoom: f32) -> Vec<OrbitVertex> {
+pub fn build_comet_tails(b: &Bodies, view: &View3) -> Vec<OrbitVertex> {
     let mut out = Vec::new();
     if !b.parent_cache_valid {
         return out;
     }
     let au = physics::au_in_gm();
-    let z = zoom.max(1e-6) as f64;
+    let z = view.zoom.max(1e-6);
+    // Tails are flat ribbons that face the viewer: their width runs along
+    // `tail × view_dir`.
+    let vd = view.view_dir();
     for i in 0..b.len() {
         if b.dead[i] || b.origin[i] != BodyOrigin::Comet {
             continue;
@@ -410,7 +417,8 @@ pub fn build_comet_tails(b: &Bodies, zoom: f32) -> Vec<OrbitVertex> {
         }
         let dx = b.x[i] - b.x[h];
         let dy = b.y[i] - b.y[h];
-        let d = dx.hypot(dy);
+        let dz = b.z[i] - b.z[h];
+        let d = dx.hypot(dy).hypot(dz);
         if !(d > 0.0) {
             continue;
         }
@@ -419,28 +427,43 @@ pub fn build_comet_tails(b: &Bodies, zoom: f32) -> Vec<OrbitVertex> {
         if act < 0.02 {
             continue;
         }
-        let (ux, uy) = (dx / d, dy / d); // away from the host
+        let (ux, uy, uz) = (dx / d, dy / d, dz / d); // away from the host
         let len = (0.5 * au).max(12.0 / z) * act;
         // Velocity direction relative to the host, for the curved dust tail.
-        let (vx, vy) = (b.vx[i] - b.vx[h], b.vy[i] - b.vy[h]);
-        let v = vx.hypot(vy).max(1e-30);
-        let (mut tx, mut ty) = (ux - 0.4 * vx / v, uy - 0.4 * vy / v);
-        let tn = tx.hypot(ty).max(1e-30);
+        let (vx, vy, vz) = (b.vx[i] - b.vx[h], b.vy[i] - b.vy[h], b.vz[i] - b.vz[h]);
+        let v = vx.hypot(vy).hypot(vz).max(1e-30);
+        let (mut tx, mut ty, mut tz) = (ux - 0.4 * vx / v, uy - 0.4 * vy / v, uz - 0.4 * vz / v);
+        let tn = tx.hypot(ty).hypot(tz).max(1e-30);
         tx /= tn;
         ty /= tn;
-        let mut tri = |dirx: f64, diry: f64, l: f64, w: f64, col: [u8; 3], a: f64| {
-            let (nx, ny) = (-diry, dirx);
-            let (cx, cy) = (b.x[i], b.y[i]);
+        tz /= tn;
+        let mut tri = |dir: [f64; 3], l: f64, w: f64, col: [u8; 3], a: f64| {
+            // Width direction: perpendicular to the tail and to the line of sight.
+            let mut n = [
+                dir[1] * vd[2] - dir[2] * vd[1],
+                dir[2] * vd[0] - dir[0] * vd[2],
+                dir[0] * vd[1] - dir[1] * vd[0],
+            ];
+            let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if nl > 1e-9 {
+                n = [n[0] / nl, n[1] / nl, n[2] / nl];
+            } else {
+                n = [-dir[1], dir[0], 0.0]; // tail along the line of sight
+            }
+            let (cx, cy, cz) = (b.x[i], b.y[i], b.z[i]);
             let alpha = (a * act * 255.0).clamp(0.0, 255.0) as u8;
             let base = [col[0], col[1], col[2], alpha];
             let tip = [col[0], col[1], col[2], 0];
-            out.push(OrbitVertex { pos: [(cx + nx * w) as f32, (cy + ny * w) as f32], color: base });
-            out.push(OrbitVertex { pos: [(cx - nx * w) as f32, (cy - ny * w) as f32], color: base });
-            out.push(OrbitVertex { pos: [(cx + dirx * l) as f32, (cy + diry * l) as f32], color: tip });
+            let p = |s: f64, k: [f64; 3]| -> [f32; 3] {
+                [(cx + k[0] * s) as f32, (cy + k[1] * s) as f32, (cz + k[2] * s) as f32]
+            };
+            out.push(OrbitVertex { pos: p(w, n), color: base });
+            out.push(OrbitVertex { pos: p(-w, n), color: base });
+            out.push(OrbitVertex { pos: p(l, dir), color: tip });
         };
         let w_min = 1.0 / z;
-        tri(ux, uy, len, (0.03 * len).max(w_min), [120, 170, 255], 0.45);
-        tri(tx, ty, 0.65 * len, (0.10 * len).max(1.5 * w_min), [255, 238, 200], 0.30);
+        tri([ux, uy, uz], len, (0.03 * len).max(w_min), [120, 170, 255], 0.45);
+        tri([tx, ty, tz], 0.65 * len, (0.10 * len).max(1.5 * w_min), [255, 238, 200], 0.30);
     }
     out
 }
@@ -456,19 +479,21 @@ impl BodyInstance {
         color: [f32; 3],
         x: f64,
         y: f64,
+        z: f64,
         r: f64,
         zoom: f32,
     ) -> Self {
-        if !x.is_finite() || !y.is_finite() || !r.is_finite() {
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() || !r.is_finite() {
             return Self {
-                pos: [1e12, 1e12],
+                pos: [1e12, 1e12, 0.0],
                 radius: 0.0,
-                lit: 0.0,
                 color: [0.0; 3],
-                light_angle: 0.0,
+                lit: 0.0,
+                light: [0.0; 3],
+                _pad: 0.0,
             };
         }
-        let z = zoom.max(1e-6);
+        let zf = zoom.max(1e-6);
         let rubble = origin != BodyOrigin::Spawned;
         let min_px: f64 = match kind {
             BodyKind::Star => 3.0,
@@ -496,24 +521,25 @@ impl BodyInstance {
                 }
             }
         };
-        let world_min = min_px / z as f64;
+        let world_min = min_px / zf as f64;
         let disp_r = r.max(world_min) as f32;
         Self {
-            pos: [x as f32, y as f32],
+            pos: [x as f32, y as f32, z as f32],
             radius: disp_r,
-            lit: 0.0,
             color,
-            light_angle: 0.0,
+            lit: 0.0,
+            light: [0.0; 3],
+            _pad: 0.0,
         }
     }
 
-    /// Shade this body as a sphere lit by a star at `angle` radians (world
-    /// axes, pointing from the body to the star). Planets use this.
+    /// Shade this body as a sphere lit from direction `dir` (world axes, unit
+    /// vector from the body to the star). Planets use this.
     #[inline]
-    pub fn with_light(mut self, angle: f64) -> Self {
-        if angle.is_finite() {
+    pub fn with_light(mut self, dir: [f64; 3]) -> Self {
+        if dir.iter().all(|c| c.is_finite()) {
             self.lit = 1.0;
-            self.light_angle = angle as f32;
+            self.light = [dir[0] as f32, dir[1] as f32, dir[2] as f32];
         }
         self
     }
@@ -524,7 +550,7 @@ impl BodyInstance {
 // ---------------------------------------------------------------------------
 
 /// Flatten `(start, end, color)` segments into a line-list vertex buffer.
-pub fn segments_to_vertices(segs: &[([f32; 2], [f32; 2], [u8; 4])]) -> Vec<OrbitVertex> {
+pub fn segments_to_vertices(segs: &[([f32; 3], [f32; 3], [u8; 4])]) -> Vec<OrbitVertex> {
     let mut verts = Vec::with_capacity(segs.len() * 2);
     for (p0, p1, color) in segs {
         verts.push(OrbitVertex {
@@ -554,7 +580,7 @@ pub struct Renderer {
     instance_scratch: Vec<BodyInstance>,
     // Per-frame light sources (x, y, luminosity in L☉) and per-body
     // luminosity. Kept between frames to avoid new allocations.
-    light_scratch: Vec<(f64, f64, f64)>,
+    light_scratch: Vec<(f64, f64, f64, f64)>,
     lum_scratch: Vec<f64>,
     // Body colour computed once per frame (shared by bodies and glow).
     color_scratch: Vec<[f32; 3]>,
@@ -694,30 +720,28 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
-                    // Offset 16, not 12: `lit` fills the gap and keeps
-                    // `color` 16-aligned.
                     offset: 16,
                     shader_location: 2,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 12,
+                    offset: 28,
                     shader_location: 3,
                 },
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 28,
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 32,
                     shader_location: 4,
                 },
             ],
@@ -753,13 +777,13 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Unorm8x4,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
             ],
@@ -794,18 +818,18 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 12,
+                    offset: 16,
                     shader_location: 2,
                 },
             ],
@@ -876,18 +900,18 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Uint32,
-                    offset: 12,
+                    offset: 16,
                     shader_location: 2,
                 },
             ],
@@ -970,23 +994,23 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 12,
+                    offset: 16,
                     shader_location: 2,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
-                    offset: 16,
+                    offset: 20,
                     shader_location: 3,
                 },
             ],
@@ -1025,18 +1049,18 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[
                 wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
+                    format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
                     shader_location: 0,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 8,
+                    offset: 12,
                     shader_location: 1,
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32,
-                    offset: 12,
+                    offset: 16,
                     shader_location: 2,
                 },
             ],
@@ -1189,16 +1213,18 @@ impl Renderer {
 
     /// Upload both camera uniforms: relative (pos = 0) for bodies, flashes,
     /// dust, glow, black holes and trails; world (pos = cam) for orbit lines.
-    pub fn update_camera(&self, queue: &wgpu::Queue, cam: [f64; 2], zoom: f32, viewport: [f32; 2]) {
+    pub fn update_camera(&self, queue: &wgpu::Queue, view: &View3, viewport: [f32; 2]) {
+        let r = view.rot();
+        let row = |k: usize| [r[k][0] as f32, r[k][1] as f32, r[k][2] as f32, 0.0];
         let rel = CameraUniform {
-            pos: [0.0, 0.0],
-            zoom,
-            _pad0: 0.0,
+            pos: [0.0; 3],
+            zoom: view.zoom as f32,
             viewport,
             _pad1: [0.0; 2],
+            rot: [row(0), row(1), row(2)],
         };
         let world = CameraUniform {
-            pos: [cam[0] as f32, cam[1] as f32],
+            pos: [view.cam[0] as f32, view.cam[1] as f32, view.cam[2] as f32],
             ..rel
         };
         queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&rel));
@@ -1208,11 +1234,12 @@ impl Renderer {
     pub fn build_instances(
         &mut self,
         b: &Bodies,
-        zoom: f32,
-        cam: [f64; 2],
+        view: &View3,
         vp: [f32; 2],
-        override_body: Option<(usize, [f64; 2])>,
+        override_body: Option<(usize, [f64; 3])>,
     ) {
+        let zoom = view.zoom as f32;
+        let cam = view.cam;
         // ---- Luminosity and light sources ----
         // One pass computes each luminous body's luminosity (used for the
         // glow strength below) and lists the bodies that light planets.
@@ -1237,11 +1264,11 @@ impl Renderer {
                 continue;
             }
             self.lum_scratch[i] = l;
-            let (lx, ly) = match override_body {
-                Some((idx, [x, y])) if idx == i => (x, y),
-                _ => (b.x[i], b.y[i]),
+            let (lx, ly, lz) = match override_body {
+                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
+                _ => (b.x[i], b.y[i], b.z[i]),
             };
-            self.light_scratch.push((lx, ly, l));
+            self.light_scratch.push((lx, ly, lz, l));
         }
         // Shading a planet costs one loop over the light sources. In a
         // dense cluster that would be too slow, so planets stay flat there.
@@ -1253,22 +1280,26 @@ impl Renderer {
             self.instance_scratch
                 .reserve(n - self.instance_scratch.capacity());
         }
+        // View-space depth of each instance, for far-to-near drawing.
+        let mut depth: Vec<f64> = Vec::with_capacity(n);
         for i in 0..n {
             if b.kind[i] == BodyKind::BlackHole {
                 continue; // Handled by the dedicated pipeline
             }
-            let (bx, by) = match override_body {
-                Some((idx, [x, y])) if idx == i => (x, y),
-                _ => (b.x[i], b.y[i]),
+            let (bx, by, bz) = match override_body {
+                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
+                _ => (b.x[i], b.y[i], b.z[i]),
             };
             let color = body_color(b, i);
             self.color_scratch[i] = color;
+            depth.push(view.project([bx, by, bz])[2]);
             let mut inst = BodyInstance::new(
                 b.kind[i],
                 b.origin[i],
                 color,
                 bx - cam[0],
                 by - cam[1],
+                bz - cam[2],
                 b.r[i],
                 zoom,
             );
@@ -1276,22 +1307,31 @@ impl Renderer {
             // most light (luminosity / distance²).
             if shade_planets && matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
                 let mut best_flux = 0.0f64;
-                let mut best_angle = f64::NAN;
-                for &(lx, ly, l) in &self.light_scratch {
-                    let (dx, dy) = (lx - bx, ly - by);
-                    let d2 = dx * dx + dy * dy;
+                let mut best_dir = [f64::NAN; 3];
+                for &(lx, ly, lz, l) in &self.light_scratch {
+                    let (dx, dy, dz) = (lx - bx, ly - by, lz - bz);
+                    let d2 = dx * dx + dy * dy + dz * dz;
                     if d2 <= 0.0 {
                         continue;
                     }
                     let flux = l / d2;
                     if flux > best_flux {
                         best_flux = flux;
-                        best_angle = dy.atan2(dx);
+                        let d = d2.sqrt();
+                        best_dir = [dx / d, dy / d, dz / d];
                     }
                 }
-                inst = inst.with_light(best_angle);
+                inst = inst.with_light(best_dir);
             }
             self.instance_scratch.push(inst);
+        }
+        // Painter's order: far bodies first. A stable sort leaves a top-down
+        // (all depths equal) scene in its old index order.
+        if !view.is_top_down() || depth.iter().any(|&d| d != 0.0) {
+            let mut order: Vec<usize> = (0..self.instance_scratch.len()).collect();
+            order.sort_by(|&a, &c| depth[c].total_cmp(&depth[a]));
+            let sorted: Vec<BodyInstance> = order.iter().map(|&k| self.instance_scratch[k]).collect();
+            self.instance_scratch = sorted;
         }
         self.body_count = self.instance_scratch.len() as u32;
 
@@ -1308,7 +1348,7 @@ impl Renderer {
             for f in &b.flashes {
                 let r = f.r0.max(min_px_world);
                 self.flash_scratch.push(FlashInstance {
-                    pos: [(f.x - cam[0]) as f32, (f.y - cam[1]) as f32],
+                    pos: [(f.x - cam[0]) as f32, (f.y - cam[1]) as f32, (f.z - cam[2]) as f32],
                     radius: r as f32,
                     progress: (f.age / f.life) as f32,
                 });
@@ -1339,9 +1379,9 @@ impl Renderer {
                 1.0
             };
             let intensity = (base_intensity * lum_factor) as f32;
-            let (bx, by) = match override_body {
-                Some((idx, [x, y])) if idx == i => (x, y),
-                _ => (b.x[i], b.y[i]),
+            let (bx, by, bz) = match override_body {
+                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
+                _ => (b.x[i], b.y[i], b.z[i]),
             };
             // Halo radius in world units. The floor is 6 screen pixels for a
             // Sun-like body, smaller for a dim one and larger for a bright
@@ -1350,7 +1390,7 @@ impl Renderer {
             let r_world = (b.r[i] * halo_mult).max(floor_px / zoom.max(1e-6) as f64);
             let color = self.color_scratch[i];
             self.glow_scratch.push(GlowInstance {
-                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
+                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
                 radius: r_world as f32,
                 intensity,
                 color,
@@ -1365,9 +1405,9 @@ impl Renderer {
             if b.kind[i] != BodyKind::BlackHole {
                 continue;
             }
-            let (bx, by) = match override_body {
-                Some((idx, [x, y])) if idx == i => (x, y),
-                _ => (b.x[i], b.y[i]),
+            let (bx, by, bz) = match override_body {
+                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
+                _ => (b.x[i], b.y[i], b.z[i]),
             };
             // `r` is the event horizon (Schwarzschild radius). The shader draws
             // the shadow at BH_SHADOW_IN_RS times this, and the disk beyond it.
@@ -1375,7 +1415,7 @@ impl Renderer {
             // does not vanish at wide zoom.
             let r_world = b.r[i].max(4.0 / (BH_SHADOW_IN_RS * zoom.max(1e-6) as f64));
             self.blackhole_scratch.push(BlackHoleInstance {
-                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32],
+                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
                 radius: r_world as f32,
                 accretion: physics::accretion_level(b, i) as f32,
             });
@@ -1394,7 +1434,8 @@ impl Renderer {
             if f.primary >= n || f.grains.is_empty() {
                 continue;
             }
-            let (dx, dy) = (b.x[f.primary] - cam[0], b.y[f.primary] - cam[1]);
+            let c = view.project([b.x[f.primary], b.y[f.primary], b.z[f.primary]]);
+            let (dx, dy) = (c[0], c[1]);
             let ext = f.extent_gm;
             if ext * z >= DUST_MIN_PX && dx.abs() - ext < hw && dy.abs() - ext < hh {
                 visible.push(i);
@@ -1417,10 +1458,10 @@ impl Renderer {
             self.dust_scratch.reserve(total / stride + 1);
             for (slot, &i) in visible.iter().enumerate() {
                 let f = &b.dust_fields[i];
-                let (px, py) = (b.x[f.primary], b.y[f.primary]);
+                let (px, py, pz) = (b.x[f.primary], b.y[f.primary], b.z[f.primary]);
                 self.dust_scratch
                     .extend(f.grains.iter().step_by(stride).map(|g| DustVertex {
-                        pos: [(g.x - px) as f32, (g.y - py) as f32],
+                        pos: [(g.x - px) as f32, (g.y - py) as f32, (g.z - pz) as f32],
                         weight: g.mass as f32,
                         field: slot as u32,
                     }));
@@ -1441,7 +1482,7 @@ impl Renderer {
                     self.dust_centres[slot] = [
                         (b.x[f.primary] - cam[0]) as f32,
                         (b.y[f.primary] - cam[1]) as f32,
-                        0.0,
+                        (b.z[f.primary] - cam[2]) as f32,
                         0.0,
                     ];
                 }

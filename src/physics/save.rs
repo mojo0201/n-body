@@ -133,7 +133,8 @@ pub struct DustSave {
     pub version: u64,
     /// One grain per row: `[x, y, vx, vy, mass, size_um, ttl]`.
     /// `ttl == f64::MAX` stands for "never expires".
-    pub grains: Vec<[f64; 7]>,
+    /// `[x, y, vx, vy, mass, size, ttl]`, plus `z, vz` appended in v2 saves.
+    pub grains: Vec<Vec<f64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -150,6 +151,13 @@ pub struct EventSave {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppSave {
     pub cam: [f64; 2],
+    /// Focus height and view angles; absent in older saves (top-down view).
+    #[serde(default)]
+    pub cam_z: f64,
+    #[serde(default)]
+    pub yaw: f64,
+    #[serde(default)]
+    pub pitch: f64,
     pub zoom: f32,
     pub speed: f64,
     pub paused: bool,
@@ -331,7 +339,7 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
             } else {
                 f64::MAX
             };
-            grains.push([g.x, g.y, g.vx, g.vy, g.mass, g.size_um, ttl]);
+            grains.push(vec![g.x, g.y, g.vx, g.vy, g.mass, g.size_um, ttl, g.z, g.vz]);
         }
         dust.push(DustSave {
             primary,
@@ -532,7 +540,12 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
         need_finite("a dust field", &[d.extent_gm])?;
         let mut grains = Vec::with_capacity(d.grains.len());
         for g in &d.grains {
+            if g.len() != 7 && g.len() != 9 {
+                return Err("a dust grain has the wrong number of values".to_string());
+            }
             need_finite("a dust grain", &g[..6])?;
+            let (gz, gvz) = if g.len() == 9 { (g[7], g[8]) } else { (0.0, 0.0) };
+            need_finite("a dust grain", &[gz, gvz])?;
             if !g[6].is_finite() {
                 return Err("a dust grain has a lifetime that is not valid".to_string());
             }
@@ -544,8 +557,10 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
             grains.push(Grain {
                 x: g[0],
                 y: g[1],
+                z: gz,
                 vx: g[2],
                 vy: g[3],
+                vz: gvz,
                 mass: g[4],
                 size_um: g[5],
                 ttl,
@@ -681,6 +696,9 @@ mod tests {
     fn test_app() -> AppSave {
         AppSave {
             cam: [1.5, -2.5],
+            cam_z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
             zoom: 0.7,
             speed: 1.0,
             paused: false,

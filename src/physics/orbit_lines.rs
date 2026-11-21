@@ -36,14 +36,27 @@ pub(super) fn orbit_trig() -> &'static (Vec<f64>, Vec<f64>) {
 /// The center already includes the reference-body offset, so emitting a point
 /// is a single rotation about `(cx, cy)` with no further translation.
 struct OrbitEllipse {
-    cx: f64,
-    cy: f64,
+    /// Centre of the ellipse.
+    c: [f64; 3],
+    /// Semi-major axis (a) times the unit vector toward periapsis.
+    pa: [f64; 3],
+    /// Semi-minor axis (b) times the in-plane unit vector 90° ahead of it.
+    qb: [f64; 3],
     a: f64,
-    b_ax: f64,
-    cr: f64,
-    sr: f64,
     n_pts: usize,
     stride: usize,
+}
+
+impl OrbitEllipse {
+    /// Point at table angle index `idx`.
+    #[inline]
+    fn point(&self, cos_t: f64, sin_t: f64) -> [f64; 3] {
+        [
+            self.c[0] + cos_t * self.pa[0] + sin_t * self.qb[0],
+            self.c[1] + cos_t * self.pa[1] + sin_t * self.qb[1],
+            self.c[2] + cos_t * self.pa[2] + sin_t * self.qb[2],
+        ]
+    }
 }
 
 /// Solve the two-body problem for body `i` relative to a reference state and
@@ -60,22 +73,26 @@ fn compute_orbit_ellipse(
     i: usize,
     sx: f64,
     sy: f64,
+    sz: f64,
     svx: f64,
     svy: f64,
+    svz: f64,
     sm: f64,
     zoom: f64,
 ) -> Option<OrbitEllipse> {
     // Relative state vector and squared distance.
     let dx = b.x[i] - sx;
     let dy = b.y[i] - sy;
+    let dz = b.z[i] - sz;
     let dvx = b.vx[i] - svx;
     let dvy = b.vy[i] - svy;
-    let r2 = dx * dx + dy * dy;
+    let dvz = b.vz[i] - svz;
+    let r2 = dx * dx + dy * dy + dz * dz;
     if r2 < 1e-18 {
         return None;
     }
     let r = r2.sqrt();
-    let v2 = dvx * dvx + dvy * dvy;
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (sm + b.m[i]);
 
     // Reciprocal semi-major axis from the vis-viva equation.
@@ -90,26 +107,37 @@ fn compute_orbit_ellipse(
     }
 
     // Eccentricity vector points at periapsis; its magnitude is `e`.
-    let rv = dx * dvx + dy * dvy;
+    let rv = dx * dvx + dy * dvy + dz * dvz;
     let km = v2 - mu / r;
     let ex = (km * dx - rv * dvx) / mu;
     let ey = (km * dy - rv * dvy) / mu;
-    let e2 = ex * ex + ey * ey;
+    let ez = (km * dz - rv * dvz) / mu;
+    let e2 = ex * ex + ey * ey + ez * ez;
     // Reject e >= 0.9999 (near-parabolic) using e² to skip a sqrt.
     if e2 >= 0.9999 * 0.9999 {
         return None;
     }
 
-    // Semi-minor axis and the orientation of the major axis.
+    // Semi-minor axis, and the in-plane frame: p̂ toward periapsis (or the
+    // current position for a circle), q̂ = ĥ × p̂ with h = r × v.
     let b_ax = a * (1.0 - e2).sqrt();
-    let rot = ey.atan2(ex);
-    let cr = rot.cos();
-    let sr = rot.sin();
+    let e_len = e2.sqrt();
+    let (px, py, pz) = if e_len > 1e-9 {
+        (ex / e_len, ey / e_len, ez / e_len)
+    } else {
+        (dx / r, dy / r, dz / r)
+    };
+    let (hx, hy, hz) = (dy * dvz - dz * dvy, dz * dvx - dx * dvz, dx * dvy - dy * dvx);
+    let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+    let (qx, qy, qz) = if hn > 1e-30 {
+        let (hx, hy, hz) = (hx / hn, hy / hn, hz / hn);
+        (hy * pz - hz * py, hz * px - hx * pz, hx * py - hy * px)
+    } else {
+        (-py, px, 0.0) // radial plunge: any perpendicular will do
+    };
 
-    // The ellipse is centered at -a·ê from the focus (reference body);
-    // folding in (sx, sy) makes this the final world-space center.
-    let cx = -a * ex + sx;
-    let cy = -a * ey + sy;
+    // The ellipse is centred at -a·p̂·e from the focus (reference body).
+    let c = [-a * ex + sx, -a * ey + sy, -a * ez + sz];
 
     // Resolution: one sample per ~20 screen pixels of arc length, clamped to
     // [32, ORBIT_TABLE_SIZE] and rounded to a power of two so the stride into
@@ -120,12 +148,10 @@ fn compute_orbit_ellipse(
     let stride = ORBIT_TABLE_SIZE / n_pts;
 
     Some(OrbitEllipse {
-        cx,
-        cy,
+        c,
+        pa: [px * a, py * a, pz * a],
+        qb: [qx * b_ax, qy * b_ax, qz * b_ax],
         a,
-        b_ax,
-        cr,
-        sr,
         n_pts,
         stride,
     })
@@ -139,24 +165,20 @@ pub fn osculating_ellipse(
     i: usize,
     sx: f64,
     sy: f64,
+    sz: f64,
     svx: f64,
     svy: f64,
+    svz: f64,
     sm: f64,
     zoom: f64,
-) -> Option<Vec<[f32; 2]>> {
-    let el = compute_orbit_ellipse(b, i, sx, sy, svx, svy, sm, zoom)?;
+) -> Option<Vec<[f32; 3]>> {
+    let el = compute_orbit_ellipse(b, i, sx, sy, sz, svx, svy, svz, sm, zoom)?;
     let (sin_t, cos_t) = orbit_trig();
     let mut pts = Vec::with_capacity(el.n_pts);
     for k in 0..el.n_pts {
-        // Rotate the unit-circle sample by the major-axis orientation and
-        // scale by (a, b); the center already accounts for the offset.
         let idx = k * el.stride;
-        let ct = cos_t[idx] * el.a;
-        let st = sin_t[idx] * el.b_ax;
-        pts.push([
-            (el.cx + ct * el.cr - st * el.sr) as f32,
-            (el.cy + ct * el.sr + st * el.cr) as f32,
-        ]);
+        let p = el.point(cos_t[idx], sin_t[idx]);
+        pts.push([p[0] as f32, p[1] as f32, p[2] as f32]);
     }
     Some(pts)
 }
@@ -172,7 +194,7 @@ pub fn compute_orbit_segments(
     zoom: f64,
     show_planets: bool,
     show_debris: bool,
-) -> Vec<([f32; 2], [f32; 2], [u8; 4])> {
+) -> Vec<([f32; 3], [f32; 3], [u8; 4])> {
     if !show_planets && !show_debris {
         return Vec::new();
     }
@@ -185,8 +207,10 @@ pub fn compute_orbit_segments(
     };
     let sx = b.x[si];
     let sy = b.y[si];
+    let sz = b.z[si];
     let svx = b.vx[si];
     let svy = b.vy[si];
+    let svz = b.vz[si];
     let sm = b.m[si];
     let ctx = build_parent_context(b);
     let hosts = &ctx.hosts;
@@ -250,10 +274,15 @@ pub fn compute_orbit_segments(
         }
 
         // Use the nearest host (or the primary) as the two-body focus.
-        let (rx, ry, rvx, rvy, rm) =
-            orbit_reference_cached(b, hosts, &ctx.partners, i, (sx, sy, svx, svy, sm));
+        let (rx, ry, rz, rvx, rvy, rvz, rm) = orbit_reference_cached(
+            b,
+            hosts,
+            &ctx.partners,
+            i,
+            (sx, sy, sz, svx, svy, svz, sm),
+        );
 
-        let Some(el) = compute_orbit_ellipse(b, i, rx, ry, rvx, rvy, rm, zoom) else {
+        let Some(el) = compute_orbit_ellipse(b, i, rx, ry, rz, rvx, rvy, rvz, rm, zoom) else {
             continue;
         };
 
@@ -273,24 +302,18 @@ pub fn compute_orbit_segments(
         };
 
         // Emit the closed loop as N segments. Start from the sample at
-        // idx = 0 (angle 0 ⇒ ct = a, st = 0) so the wrap-around edge reuses
-        // the first point without recomputing it.
-        let first_px = (el.cx + el.a * el.cr) as f32;
-        let first_py = (el.cy + el.a * el.sr) as f32;
-        let mut px_prev = first_px;
-        let mut py_prev = first_py;
-
+        // idx = 0 (angle 0) so the wrap-around edge reuses the first point.
+        let f = el.point(1.0, 0.0);
+        let first = [f[0] as f32, f[1] as f32, f[2] as f32];
+        let mut prev = first;
         for k in 1..el.n_pts {
             let idx = k * el.stride;
-            let ct = cos_t[idx] * el.a;
-            let st = sin_t[idx] * el.b_ax;
-            let px = (el.cx + ct * el.cr - st * el.sr) as f32;
-            let py = (el.cy + ct * el.sr + st * el.cr) as f32;
-            segs.push(([px_prev, py_prev], [px, py], color));
-            px_prev = px;
-            py_prev = py;
+            let p = el.point(cos_t[idx], sin_t[idx]);
+            let cur = [p[0] as f32, p[1] as f32, p[2] as f32];
+            segs.push((prev, cur, color));
+            prev = cur;
         }
-        segs.push(([px_prev, py_prev], [first_px, first_py], color));
+        segs.push((prev, first, color));
     }
     segs
 }

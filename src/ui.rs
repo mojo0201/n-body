@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use egui::{Align2, Color32, FontId, RichText, Stroke};
 
 use crate::physics::{self as ph, Bodies, BodyKind, BodyOrigin, EventKind};
+use crate::view::View3;
 use crate::theme::{bold_mono, install_fonts, medium, theme};
 
 // ---------------------------------------------------------------------------
@@ -848,7 +849,10 @@ pub struct ViewInfo {
     pub fps: f32,
     pub steps_per_sec: f32,
     pub zoom: f32,
-    pub cam: [f64; 2],
+    pub cam: [f64; 3],
+    /// View angles in radians: yaw about the sim z axis, pitch away from top-down.
+    pub yaw: f64,
+    pub pitch: f64,
     pub viewport_px: [f32; 2],
     pub ppp: f32,
     pub seed: u128,
@@ -864,7 +868,7 @@ pub struct ViewInfo {
     pub show_debris_orbits: bool,
     pub follow: bool,
     pub selected: Option<u64>,
-    pub follow_smooth: Option<(u64, [f64; 2])>,
+    pub follow_smooth: Option<(u64, [f64; 3])>,
     pub preset: crate::Preset,
     pub vsync: bool,
     pub behind: bool,
@@ -929,6 +933,8 @@ pub struct Actions {
     pub debris_orbits: Option<bool>,
     pub zoom_mul: Option<f32>,
     pub fit: bool,
+    /// New view angles `(yaw, pitch)` in radians.
+    pub view_angles: Option<(f64, f64)>,
     pub select: Option<Option<u64>>,
     pub center_on: Option<[f64; 2]>,
     pub follow: Option<bool>,
@@ -1358,10 +1364,10 @@ pub fn draw(root: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
 /// (logical pixels), so the result is divided by `ppp`. The `viewport_px`
 /// field name is a bit of a misnomer — it's pixels, but we're converting
 /// to points here.
-fn world_to_screen(view: &ViewInfo, x: f64, y: f64) -> egui::Pos2 {
-    let px = view.viewport_px[0] as f64 * 0.5 + (x - view.cam[0]) * view.zoom as f64;
-    let py = view.viewport_px[1] as f64 * 0.5 + (y - view.cam[1]) * view.zoom as f64;
-    egui::pos2(px as f32 / view.ppp, py as f32 / view.ppp)
+fn world_to_screen(view: &ViewInfo, x: f64, y: f64, z: f64) -> egui::Pos2 {
+    let v = View3::new(view.cam, view.yaw, view.pitch, view.zoom as f64);
+    let p = v.to_screen([x, y, z], view.viewport_px);
+    egui::pos2(p[0] as f32 / view.ppp, p[1] as f32 / view.ppp)
 }
 
 /// Snap a length to a "nice" value (1, 2, 5 × 10^k) for the scale bar.
@@ -1386,13 +1392,13 @@ fn nice_length(target: f64) -> f64 {
 /// returns the smoothed position from `ViewInfo::follow_smooth`; for
 /// everything else it returns the raw physics position.
 #[inline]
-fn drawn_pos(view: &ViewInfo, b: &Bodies, i: usize) -> (f64, f64) {
+fn drawn_pos(view: &ViewInfo, b: &Bodies, i: usize) -> (f64, f64, f64) {
     if let Some((id, pos)) = view.follow_smooth {
         if b.id[i] == id {
-            return (pos[0], pos[1]);
+            return (pos[0], pos[1], pos[2]);
         }
     }
-    (b.x[i], b.y[i])
+    (b.x[i], b.y[i], b.z[i])
 }
 
 /// Draw the selection ring, labels, and scale bar. All three are drawn on
@@ -1405,8 +1411,8 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
     // Selection ring.
     if let Some(id) = view.selected {
         if let Some(i) = b.index_of_id(id) {
-            let (bx, by) = drawn_pos(view, b, i);
-            let c = world_to_screen(view, bx, by);
+            let (bx, by, bz) = drawn_pos(view, b, i);
+            let c = world_to_screen(view, bx, by, bz);
             let r_px = (b.r[i] * view.zoom as f64) as f32 / view.ppp;
             // Ring is 5 points outside the body, or 5 points outside a
             // 5-point minimum — so a tiny body still gets a visible ring.
@@ -1432,8 +1438,8 @@ fn draw_overlays(ctx: &egui::Context, st: &UiState, view: &ViewInfo, b: &Bodies)
             if b.origin[i] != BodyOrigin::Spawned {
                 continue;
             }
-            let (bx, by) = drawn_pos(view, b, i);
-            let c = world_to_screen(view, bx, by);
+            let (bx, by, bz) = drawn_pos(view, b, i);
+            let c = world_to_screen(view, bx, by, bz);
             // Cull off-screen labels — `painter.text` still does layout
             // work even for off-screen glyphs on some backends.
             if !screen.contains(c) {
@@ -1872,7 +1878,26 @@ fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut 
             {
                 act.fit = true;
             }
+            if ui
+                .button("Top-down")
+                .on_hover_text("look straight down the z axis (T)")
+                .clicked()
+            {
+                act.view_angles = Some((0.0, 0.0));
+            }
         });
+        // Tilt the camera to see inclined orbits. Right-drag in the scene
+        // does the same.
+        let (mut yaw_deg, mut pitch_deg) = (view.yaw.to_degrees(), view.pitch.to_degrees());
+        let c1 = ui
+            .add(egui::Slider::new(&mut pitch_deg, -89.0..=89.0).text("tilt°"))
+            .changed();
+        let c2 = ui
+            .add(egui::Slider::new(&mut yaw_deg, -180.0..=180.0).text("spin°"))
+            .changed();
+        if c1 || c2 {
+            act.view_angles = Some((yaw_deg.to_radians(), pitch_deg.to_radians()));
+        }
         let mut orbits = view.show_orbits;
         if ui.checkbox(&mut orbits, "orbit lines (O)").changed() {
             act.orbits = Some(orbits);

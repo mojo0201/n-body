@@ -202,9 +202,15 @@ pub(in crate::physics) fn spawn_belt_body(
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
     let omega = rng.next_f64() * std::f64::consts::TAU;
     let (cx, cy, cvx, cvy, mc) = centre;
-    let (x, y, vx, vy) = kepler_state(G * mc, a_au * au_in_gm(), e, nu, omega);
+    let key = tilt_key(&[mean_anom, omega, a_au]);
+    let (inc, node) = match population_sigma_deg(origin, a_au) {
+        Some(sigma) => tilt_rayleigh(key, sigma),
+        None => tilt_isotropic(key),
+    };
+    let (x, y, z, vx, vy, vz) =
+        kepler_state_incl(G * mc, a_au * au_in_gm(), e, nu, omega, inc, node);
     let kind = classify_small_body(m);
-    let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
+    let i = push3(b, [cx + x, cy + y, z], [cvx + vx, cvy + vy, vz], m, kind);
     b.origin[i] = origin;
     b.class[i] = class_for(origin, a_au, snow_line_au);
     b.bulk_density[i] = draw_density(rng, b.class[i]);
@@ -283,9 +289,13 @@ pub(in crate::physics) fn spawn_trojan(
     let jitter = (rng.next_f64() - 0.5) * 0.7; // ±20 degrees
     let omega = giant_angle + lead * std::f64::consts::PI / 3.0 + jitter;
     let (cx, cy, cvx, cvy, mc) = centre;
-    let (x, y, vx, vy) = kepler_state(G * mc, a_gm, e, 0.0, omega);
+    let (inc, node) = tilt_rayleigh(
+        tilt_key(&[omega, a_gm, e]),
+        population_sigma_deg(BodyOrigin::Trojan, 0.0).unwrap_or(12.0),
+    );
+    let (x, y, z, vx, vy, vz) = kepler_state_incl(G * mc, a_gm, e, 0.0, omega, inc, node);
     let kind = classify_small_body(m);
-    let i = b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind);
+    let i = push3(b, [cx + x, cy + y, z], [cvx + vx, cvy + vy, vz], m, kind);
     b.origin[i] = BodyOrigin::Trojan;
     // Trojan clouds are icy planetesimals trapped at L4/L5.
     b.class[i] = BodyClass::Icy;

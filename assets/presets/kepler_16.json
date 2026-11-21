@@ -22,6 +22,7 @@
             "host": "barycentre",
             "a_au": 0.7048,
             "e": 0.0069,
+            "inc_deg": 0.31,
             "m_earth": 105.8,
             "density_gcc": 0.964
         }

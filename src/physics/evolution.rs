@@ -472,26 +472,31 @@ pub(super) fn transfer_mass(b: &mut Bodies, d: usize, a: usize, dm: f64) -> bool
     let m_d = b.m[d] - dm;
     let m_a_old = b.m[a];
     let m_a = m_a_old + dm_acc;
-    let (vdx, vdy) = (b.vx[d], b.vy[d]);
+    let (vdx, vdy, vdz) = (b.vx[d], b.vy[d], b.vz[d]);
 
     // New accretor velocity from momentum mixing.
     let vax = (m_a_old * b.vx[a] + dm_acc * vdx) / m_a;
     let vay = (m_a_old * b.vy[a] + dm_acc * vdy) / m_a;
+    let vaz = (m_a_old * b.vz[a] + dm_acc * vdz) / m_a;
 
     // Tangential component of the donor velocity relative to the
     // accretor, used to build the corrective impulse pair.
     let sx = b.x[d] - b.x[a];
     let sy = b.y[d] - b.y[a];
-    let s = sx.hypot(sy).max(1e-12);
-    let (hx, hy) = (sx / s, sy / s);
-    let along = vdx * hx + vdy * hy;
+    let sz = b.z[d] - b.z[a];
+    let s = sx.hypot(sy).hypot(sz).max(1e-12);
+    let (hx, hy, hz) = (sx / s, sy / s, sz / s);
+    let along = vdx * hx + vdy * hy + vdz * hz;
     let px = dm_acc * (vdx - along * hx);
     let py = dm_acc * (vdy - along * hy);
+    let pz = dm_acc * (vdz - along * hz);
 
     b.vx[d] += px / m_d;
     b.vy[d] += py / m_d;
+    b.vz[d] += pz / m_d;
     b.vx[a] = vax - px / m_a;
     b.vy[a] = vay - py / m_a;
+    b.vz[a] = vaz - pz / m_a;
 
     b.set_mass(d, m_d);
     if b.kind[a] == BodyKind::Star {
@@ -506,7 +511,7 @@ pub(super) fn transfer_mass(b: &mut Bodies, d: usize, a: usize, dm: f64) -> bool
     match b.kind[a] {
         BodyKind::WhiteDwarf if m_a > WD_M_MAX => {
             let text = format!("{} exploded as a Type Ia supernova", tag(b, a));
-            flash_at(b, x, y, 5.0);
+            flash_at(b, x, y, b.z[a], 5.0);
             b.log(EventKind::Evolve, text, x, y);
             b.dead[a] = true;
             return true;
@@ -568,7 +573,10 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
         let reach = MT_NEAR_RADII * rd;
         let near = hosts
             .iter()
-            .any(|&k| k != d && (b.x[k] - b.x[d]).hypot(b.y[k] - b.y[d]) < reach);
+            .any(|&k| {
+                k != d
+                    && (b.x[k] - b.x[d]).hypot(b.y[k] - b.y[d]).hypot(b.z[k] - b.z[d]) < reach
+            });
         let partner = if near {
             binary_partner_in(b, &hosts, d)
         } else {
@@ -578,7 +586,7 @@ pub(super) fn mass_transfer_step(b: &mut Bodies, dt: f64) -> bool {
         // Overflow fraction x ∈ (0, 1]: how far inside the Roche lobe
         // the donor's surface has moved. 0 means it exactly fills.
         let overflow = partner.filter(|&a| !b.dead[a]).and_then(|a| {
-            let sep = (b.x[a] - b.x[d]).hypot(b.y[a] - b.y[d]);
+            let sep = (b.x[a] - b.x[d]).hypot(b.y[a] - b.y[d]).hypot(b.z[a] - b.z[d]);
             let x = ((rd - roche_lobe_radius(sep, b.m[d], b.m[a])) / rd).clamp(0.0, 1.0);
             (x > 0.0).then_some((a, x))
         });
@@ -696,10 +704,10 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
         .collect();
 
     // Host state at the start of the expansion.
-    let (sx, sy, svx, svy) = (b.x[i], b.y[i], b.vx[i], b.vy[i]);
+    let (sx, sy, sz, svx, svy, svz) = (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i]);
 
-    // (dx, dy, dvx, dvy) to apply to each body.
-    let mut delta: Vec<Option<[f64; 4]>> = vec![None; n];
+    // (dx, dy, dz, dvx, dvy, dvz) to apply to each body.
+    let mut delta: Vec<Option<[f64; 6]>> = vec![None; n];
     for k in 0..n {
         if k == i || b.dead[k] {
             continue;
@@ -707,7 +715,7 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
         let direct = if is_host_kind(b.kind[k]) {
             // Close bound stellar companion only; wide pairs may be
             // other systems.
-            (b.x[k] - sx).hypot(b.y[k] - sy) < ADIABATIC_COMPANION_MAX_GM
+            (b.x[k] - sx).hypot(b.y[k] - sy).hypot(b.z[k] - sz) < ADIABATIC_COMPANION_MAX_GM
                 && binary_partner_in(b, &hosts, k) == Some(i)
         } else {
             parents[k] == Some(i)
@@ -719,19 +727,21 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
         // Two-body parameter: include the satellite's own mass in the
         // total, so a massive companion shrinks less than a light one.
         let rho = (m_new + b.m[k]) / (m_old + b.m[k]);
-        let (rx, ry) = (b.x[k] - sx, b.y[k] - sy);
-        let (rvx, rvy) = (b.vx[k] - svx, b.vy[k] - svy);
+        let (rx, ry, rz) = (b.x[k] - sx, b.y[k] - sy, b.z[k] - sz);
+        let (rvx, rvy, rvz) = (b.vx[k] - svx, b.vy[k] - svy, b.vz[k] - svz);
         delta[k] = Some([
             rx / rho - rx,
             ry / rho - ry,
+            rz / rho - rz,
             rvx * rho - rvx,
             rvy * rho - rvy,
+            rvz * rho - rvz,
         ]);
     }
 
     // Satellites of a moved body ride along with it. Their own orbit
     // around their parent is preserved because both get the same delta.
-    let mut ride: Vec<Option<[f64; 4]>> = vec![None; n];
+    let mut ride: Vec<Option<[f64; 6]>> = vec![None; n];
     for k in 0..n {
         if k == i || b.dead[k] || delta[k].is_some() {
             continue;
@@ -747,10 +757,13 @@ pub(super) fn adiabatic_expand(b: &mut Bodies, i: usize, m_old: f64, m_new: f64)
         if let Some(d) = delta[k].or(ride[k]) {
             b.x[k] += d[0];
             b.y[k] += d[1];
-            b.vx[k] += d[2];
-            b.vy[k] += d[3];
+            b.z[k] += d[2];
+            b.vx[k] += d[3];
+            b.vy[k] += d[4];
+            b.vz[k] += d[5];
             b._px[k] = b.x[k];
             b._py[k] = b.y[k];
+            b._pz[k] = b.z[k];
         }
     }
 }
@@ -784,7 +797,7 @@ pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
     match kind {
         BodyKind::WhiteDwarf => {
             let text = format!("{} shed its envelope and became {}", before, tag(b, i));
-            flash_at(b, x, y, 1.0);
+            flash_at(b, x, y, b.z[i], 1.0);
             b.log(EventKind::Evolve, text, x, y);
         }
         _ => {
@@ -794,7 +807,7 @@ pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
                 "neutron star"
             };
             let text = format!("{} exploded as a supernova and left a {}", before, what);
-            flash_at(b, x, y, 5.0);
+            flash_at(b, x, y, b.z[i], 5.0);
             b.log(EventKind::Evolve, text, x, y);
             if b.sn_kicks {
                 // Same momentum kick for BH as for NS, so heavier
@@ -805,11 +818,17 @@ pub(super) fn become_remnant(b: &mut Bodies, i: usize) {
                 let ky = sample_normal(&mut b.rng, 0.0, sigma);
                 b.vx[i] += kx;
                 b.vy[i] += ky;
+                // The third component is drawn only in a non-planar system,
+                // so planar runs keep their random stream.
+                if (0..b.len()).any(|k| b.z[k] != 0.0 || b.vz[k] != 0.0) {
+                    b.vz[i] += sample_normal(&mut b.rng, 0.0, sigma);
+                }
             }
         }
     }
     b._px[i] = b.x[i];
     b._py[i] = b.y[i];
+    b._pz[i] = b.z[i];
     b.parent_cache_valid = false;
 }
 

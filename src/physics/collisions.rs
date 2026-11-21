@@ -16,10 +16,11 @@ use super::*;
 pub(super) const HOT_GRID_MIN: usize = 24;
 
 /// Queue a short-lived visual flash. Purely cosmetic; never affects physics.
-pub(super) fn flash_at(b: &mut Bodies, x: f64, y: f64, r0: f64) {
+pub(super) fn flash_at(b: &mut Bodies, x: f64, y: f64, z: f64, r0: f64) {
     b.flashes.push(Flash {
         x,
         y,
+        z,
         r0,
         age: 0.0,
         life: FLASH_LIFE,
@@ -37,13 +38,16 @@ pub(super) fn flash_at(b: &mut Bodies, x: f64, y: f64, r0: f64) {
 pub(super) fn impact_offset(b: &Bodies, i: usize, j: usize) -> f64 {
     let dx = b.x[j] - b.x[i];
     let dy = b.y[j] - b.y[i];
+    let dz = b.z[j] - b.z[i];
     let vx = b.vx[j] - b.vx[i];
     let vy = b.vy[j] - b.vy[i];
-    let v = (vx * vx + vy * vy).sqrt();
+    let vz = b.vz[j] - b.vz[i];
+    let v = (vx * vx + vy * vy + vz * vz).sqrt();
     if v <= 0.0 {
         return 0.0;
     }
-    (dx * vy - dy * vx).abs() / v
+    let (cx, cy, cz) = (dy * vz - dz * vy, dz * vx - dx * vz, dx * vy - dy * vx);
+    (cx * cx + cy * cy + cz * cz).sqrt() / v
 }
 
 /// Convenience wrapper that computes `rr = r_i + r_j` internally. Prefer
@@ -64,7 +68,8 @@ pub(super) fn pair_hit_rr(b: &Bodies, i: usize, j: usize, rr: f64, sweep: bool) 
     let rr2 = rr * rr;
     let dx = b.x[j] - b.x[i];
     let dy = b.y[j] - b.y[i];
-    if dx * dx + dy * dy < rr2 {
+    let dz = b.z[j] - b.z[i];
+    if dx * dx + dy * dy + dz * dz < rr2 {
         return true;
     }
     if !sweep {
@@ -72,19 +77,22 @@ pub(super) fn pair_hit_rr(b: &Bodies, i: usize, j: usize, rr: f64, sweep: bool) 
     }
     let x0 = b._px[j] - b._px[i];
     let y0 = b._py[j] - b._py[i];
+    let z0 = b._pz[j] - b._pz[i];
     let ex = dx - x0;
     let ey = dy - y0;
-    let e2 = ex * ex + ey * ey;
+    let ez = dz - z0;
+    let e2 = ex * ex + ey * ey + ez * ez;
     if e2 <= 0.0 || e2.is_nan() {
         return false;
     }
-    let t = -(x0 * ex + y0 * ey) / e2;
+    let t = -(x0 * ex + y0 * ey + z0 * ez) / e2;
     if t <= 0.0 || t >= 1.0 {
         return false;
     }
     let cx = x0 + t * ex;
     let cy = y0 + t * ey;
-    cx * cx + cy * cy < rr2
+    let cz = z0 + t * ez;
+    cx * cx + cy * cy + cz * cz < rr2
 }
 
 /// 64-bit hash of the integer grid cell `(cx, cy)`. Two independent
@@ -144,7 +152,7 @@ pub(super) fn find_collisions(b: &Bodies, sweep: bool, dt: f64) -> Vec<(usize, u
             max_cr = ri;
         }
         if sweep {
-            let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
+            let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i];
             if v2 > vmax2 {
                 vmax2 = v2;
             }
@@ -258,7 +266,8 @@ pub(super) fn find_collisions_hot(
         if sweep {
             let ddx = b.x[i] - b._px[i];
             let ddy = b.y[i] - b._py[i];
-            let d2 = ddx * ddx + ddy * ddy;
+            let ddz = b.z[i] - b._pz[i];
+            let d2 = ddx * ddx + ddy * ddy + ddz * ddz;
             if d2 > max_disp_sq {
                 max_disp_sq = d2;
             }
@@ -359,7 +368,8 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
         max_cr = max_cr.max(b.contact_r(i));
         let ddx = b.x[i] - b._px[i];
         let ddy = b.y[i] - b._py[i];
-        max_disp_sq = max_disp_sq.max(ddx * ddx + ddy * ddy);
+        let ddz = b.z[i] - b._pz[i];
+        max_disp_sq = max_disp_sq.max(ddx * ddx + ddy * ddy + ddz * ddz);
     }
     let cell = ((2.0 * max_cr + 2.0 * max_disp_sq.sqrt()) * 1.0001).max(1e-4);
     let inv = 1.0 / cell;
@@ -465,6 +475,9 @@ pub(super) fn collision_pass(b: &mut Bodies, dt: f64, hot: Option<&[usize]>) {
     let t_imm = b.time + IMMUNITY_TIME;
     for s in spawns {
         let k = b.push(s.x, s.y, s.vx, s.vy, s.m, s.kind);
+        b.z[k] = s.z;
+        b.vz[k] = s.vz;
+        b._pz[k] = s.z;
         b.imm[k] = t_imm;
         b.origin[k] = s.origin;
         b.class[k] = s.class;
@@ -544,6 +557,40 @@ pub(super) fn frag_masses(rng: &mut XorShift, n: usize, md: f64) -> Vec<f64> {
     v
 }
 
+/// Unit contact normal of a grazing pair: from the relative position `d` and
+/// relative velocity `v`, the point of closest approach lies at perpendicular
+/// offset `h` from the velocity line, and the sphere of radius `rr` is touched
+/// where the line enters it. Falls back to any perpendicular for a head-on hit.
+pub(super) fn contact_normal(
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    rr: f64,
+) -> (f64, f64, f64) {
+    let v = (vx * vx + vy * vy + vz * vz).sqrt().max(1e-12);
+    let (ux, uy, uz) = (vx / v, vy / v, vz / v);
+    let along = dx * ux + dy * uy + dz * uz;
+    let (hx, hy, hz) = (dx - along * ux, dy - along * uy, dz - along * uz);
+    let d = (hx * hx + hy * hy + hz * hz).sqrt();
+    let (hux, huy, huz) = if d > 1e-12 {
+        (hx / d, hy / d, hz / d)
+    } else {
+        let pn = (ux * ux + uy * uy).sqrt();
+        if uz == 0.0 {
+            (-uy, ux, 0.0)
+        } else if pn > 1e-12 {
+            (-uy / pn, ux / pn, 0.0)
+        } else {
+            (1.0, 0.0, 0.0)
+        }
+    };
+    let s = (rr * rr - d * d).max(0.0).sqrt();
+    ((d * hux - s * ux) / rr, (d * huy - s * uy) / rr, (d * huz - s * uz) / rr)
+}
+
 /// Grazing, non-merging encounter: the small body keeps (most of) its mass
 /// and continues roughly along its incoming direction, deflected by the
 /// usual elastic impulse. `bb` sets the stripped fraction through
@@ -555,29 +602,24 @@ pub(super) fn frag_masses(rng: &mut XorShift, n: usize, md: f64) -> Vec<f64> {
 pub(super) fn hit_and_run(b: &mut Bodies, big: usize, small: usize, rr: f64, bb: f64, ratio: f64) {
     mark_energy(b);
     let l_before = pair_l(b, big, small);
-    let (dx, dy) = (b.x[small] - b.x[big], b.y[small] - b.y[big]);
-    let (vx, vy) = (b.vx[small] - b.vx[big], b.vy[small] - b.vy[big]);
-    let v = (vx * vx + vy * vy).sqrt().max(1e-12);
-    let (ux, uy) = (vx / v, vy / v);
-    let along = dx * ux + dy * uy;
-    let (hx, hy) = (dx - along * ux, dy - along * uy);
-    let d = (hx * hx + hy * hy).sqrt();
-    let (hux, huy) = if d > 1e-12 {
-        (hx / d, hy / d)
-    } else {
-        (-uy, ux)
-    };
-    let s = (rr * rr - d * d).max(0.0).sqrt();
-    let (nx, ny) = ((d * hux - s * ux) / rr, (d * huy - s * uy) / rr);
-    let vn = vx * nx + vy * ny;
+    let (dx, dy, dz) = (b.x[small] - b.x[big], b.y[small] - b.y[big], b.z[small] - b.z[big]);
+    let (vx, vy, vz) = (
+        b.vx[small] - b.vx[big],
+        b.vy[small] - b.vy[big],
+        b.vz[small] - b.vz[big],
+    );
+    let (nx, ny, nz) = contact_normal(dx, dy, dz, vx, vy, vz, rr);
+    let vn = vx * nx + vy * ny + vz * nz;
     let (mb, ms) = (b.m[big], b.m[small]);
     let mtot = mb + ms;
     if vn < 0.0 {
         let dv = -(1.0 + HIT_RUN_RESTITUTION) * vn;
         b.vx[small] += mb / mtot * dv * nx;
         b.vy[small] += mb / mtot * dv * ny;
+        b.vz[small] += mb / mtot * dv * nz;
         b.vx[big] -= ms / mtot * dv * nx;
         b.vy[big] -= ms / mtot * dv * ny;
+        b.vz[big] -= ms / mtot * dv * nz;
     }
     let alpha = interact_frac(b.contact_r(big), b.contact_r(small), bb);
     let mt = (HIT_RUN_LOSS * alpha * ms).min(0.5 * ms);
@@ -590,14 +632,19 @@ pub(super) fn hit_and_run(b: &mut Bodies, big: usize, small: usize, rr: f64, bb:
         let cy0 = (mb * b.y[big] + ms * b.y[small]) / mtot;
         let cx1 = (nb * b.x[big] + (ms - mt) * b.x[small]) / mtot;
         let cy1 = (nb * b.y[big] + (ms - mt) * b.y[small]) / mtot;
+        let cz0 = (mb * b.z[big] + ms * b.z[small]) / mtot;
+        let cz1 = (nb * b.z[big] + (ms - mt) * b.z[small]) / mtot;
         for k in [big, small] {
             b.x[k] += cx0 - cx1;
             b.y[k] += cy0 - cy1;
+            b.z[k] += cz0 - cz1;
             b._px[k] = b.x[k];
             b._py[k] = b.y[k];
+            b._pz[k] = b.z[k];
         }
         b.vx[big] = (mb * b.vx[big] + mt * b.vx[small]) / nb;
         b.vy[big] = (mb * b.vy[big] + mt * b.vy[small]) / nb;
+        b.vz[big] = (mb * b.vz[big] + mt * b.vz[small]) / nb;
         b.set_mass(big, nb);
         b.set_mass(small, ms - mt);
     }
@@ -610,7 +657,8 @@ pub(super) fn hit_and_run(b: &mut Bodies, big: usize, small: usize, rr: f64, bb:
         b.x[big] + nx * b.contact_r(big),
         b.y[big] + ny * b.contact_r(big),
     );
-    flash_at(b, cx, cy, (b.contact_r(big) * 2.0).max(0.05));
+    let cz = b.z[big] + nz * b.contact_r(big);
+    flash_at(b, cx, cy, cz, (b.contact_r(big) * 2.0).max(0.05));
     b.stats.impacts += 1;
     let text = format!(
         "hit-and-run #{} × #{} at {:.1}× escape speed, b = {:.2}: {} moved to the heavy body",
@@ -631,22 +679,12 @@ pub(super) fn hit_and_run(b: &mut Bodies, big: usize, small: usize, rr: f64, bb:
 pub(super) fn rubble_bounce(b: &mut Bodies, i: usize, j: usize, rr: f64) {
     let dx = b.x[j] - b.x[i];
     let dy = b.y[j] - b.y[i];
+    let dz = b.z[j] - b.z[i];
     let dvx = b.vx[j] - b.vx[i];
     let dvy = b.vy[j] - b.vy[i];
-    let v = (dvx * dvx + dvy * dvy).sqrt().max(1e-12);
-    let (ux, uy) = (dvx / v, dvy / v);
-
-    let along = dx * ux + dy * uy;
-    let (hx, hy) = (dx - along * ux, dy - along * uy);
-    let d = (hx * hx + hy * hy).sqrt();
-    let (hux, huy) = if d > 1e-12 {
-        (hx / d, hy / d)
-    } else {
-        (-uy, ux)
-    };
-    let s = (rr * rr - d * d).max(0.0).sqrt();
-    let (nx, ny) = ((d * hux - s * ux) / rr, (d * huy - s * uy) / rr);
-    let vn = dvx * nx + dvy * ny;
+    let dvz = b.vz[j] - b.vz[i];
+    let (nx, ny, nz) = contact_normal(dx, dy, dz, dvx, dvy, dvz, rr);
+    let vn = dvx * nx + dvy * ny + dvz * nz;
     if vn >= 0.0 {
         return;
     }
@@ -658,8 +696,10 @@ pub(super) fn rubble_bounce(b: &mut Bodies, i: usize, j: usize, rr: f64) {
     let dvn = -(1.0 + RUBBLE_BOUNCE_E) * vn;
     b.vx[i] -= mj / mtot * dvn * nx;
     b.vy[i] -= mj / mtot * dvn * ny;
+    b.vz[i] -= mj / mtot * dvn * nz;
     b.vx[j] += mi / mtot * dvn * nx;
     b.vy[j] += mi / mtot * dvn * ny;
+    b.vz[j] += mi / mtot * dvn * nz;
 
     let dl = l_before - pair_l(b, i, j);
     b.spin[i] += dl * mi / mtot;
@@ -733,8 +773,10 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
     let total = b.m[keep] + b.m[kill];
     let cx = (b.m[keep] * b.x[keep] + b.m[kill] * b.x[kill]) / total;
     let cy = (b.m[keep] * b.y[keep] + b.m[kill] * b.y[kill]) / total;
+    let cz = (b.m[keep] * b.z[keep] + b.m[kill] * b.z[kill]) / total;
     let cvx = (b.m[keep] * b.vx[keep] + b.m[kill] * b.vx[kill]) / total;
     let cvy = (b.m[keep] * b.vy[keep] + b.m[kill] * b.vy[kill]) / total;
+    let cvz = (b.m[keep] * b.vz[keep] + b.m[kill] * b.vz[kill]) / total;
 
     // Reduce to the two-body problem: relative L about the centre of mass
     // becomes the survivor's spin contribution.
@@ -754,8 +796,11 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
     b.y[keep] = cy;
     b.vx[keep] = cvx;
     b.vy[keep] = cvy;
+    b.z[keep] = cz;
+    b.vz[keep] = cvz;
     b._px[keep] = cx;
     b._py[keep] = cy;
+    b._pz[keep] = cz;
     let keep_was_star = b.kind[keep] == BodyKind::Star;
     let keep_kind_before = b.kind[keep];
     let kill_kind = b.kind[kill];
@@ -852,7 +897,7 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
     b.stats.merges += 1;
     if !silent {
         let flash_r = (b.contact_r(keep) * 5.0).max(0.05);
-        flash_at(b, cx, cy, flash_r);
+        flash_at(b, cx, cy, cz, flash_r);
         b.log(EventKind::Merge, text, cx, cy);
     }
     keep
@@ -879,8 +924,8 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
         merge(b, i, j);
         return;
     }
-    let (rvx, rvy) = (b.vx[j] - b.vx[i], b.vy[j] - b.vy[i]);
-    let vrel = (rvx * rvx + rvy * rvy).sqrt();
+    let (rvx, rvy, rvz) = (b.vx[j] - b.vx[i], b.vy[j] - b.vy[i], b.vz[j] - b.vz[i]);
+    let vrel = (rvx * rvx + rvy * rvy + rvz * rvz).sqrt();
     let rr = (b.contact_r(i) + b.contact_r(j)).max(1e-6);
     let mtot = b.m[i] + b.m[j];
     let ratio = vrel / (2.0 * G * mtot / rr).sqrt();
@@ -946,13 +991,20 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     // Snapshot the pair's total L before the merge so the post-impact
     // configuration can be rebalanced to match.
     let l_before = pair_l(b, i, j);
-    let (px0, py0) = (b.x[j] - b.x[i], b.y[j] - b.y[i]);
-    // Prograde vs retrograde disk orientation, from the sign of the
-    // tangential component of the relative velocity.
-    let sense = if px0 * rvy - py0 * rvx >= 0.0 {
-        1.0
+    let (px0, py0, pz0) = (b.x[j] - b.x[i], b.y[j] - b.y[i], b.z[j] - b.z[i]);
+    // Impact plane: spanned by the relative position and velocity. Planar
+    // pairs use the xy axes and a ±1 sense (as before); otherwise the frame is
+    // right-handed about the orbit normal, so the sense is always +1.
+    let (hxv, hyv, hzv) = (py0 * rvz - pz0 * rvy, pz0 * rvx - px0 * rvz, px0 * rvy - py0 * rvx);
+    let (e1, e2, sense) = if hxv == 0.0 && hyv == 0.0 {
+        ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), if hzv >= 0.0 { 1.0 } else { -1.0 })
     } else {
-        -1.0
+        let hn = (hxv * hxv + hyv * hyv + hzv * hzv).sqrt();
+        let (nhx, nhy, nhz) = (hxv / hn, hyv / hn, hzv / hn);
+        let ln = (nhx * nhx + nhy * nhy).sqrt();
+        let e1 = (-nhy / ln, nhx / ln, 0.0);
+        let e2 = (nhy * e1.2 - nhz * e1.1, nhz * e1.0 - nhx * e1.2, nhx * e1.1 - nhy * e1.0);
+        (e1, e2, 1.0)
     };
     let idg = (b.id[i], b.id[j]);
     // Perform the merge to get a single survivor, then immediately strip
@@ -968,14 +1020,16 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
 
     let ms = frag_masses(&mut b.rng, n, md);
     // Dust source term: a bonus population, see `DUST_YIELD_FRAC`.
-    let (dust_x, dust_y) = (b.x[rem], b.y[rem]);
-    let (dust_vx, dust_vy) = (b.vx[rem], b.vy[rem]);
+    let (dust_x, dust_y, dust_z) = (b.x[rem], b.y[rem], b.z[rem]);
+    let (dust_vx, dust_vy, dust_vz) = (b.vx[rem], b.vy[rem], b.vz[rem]);
     dust::deposit(
         b,
         dust_x,
         dust_y,
+        dust_z,
         dust_vx,
         dust_vy,
+        dust_vz,
         md * DUST_YIELD_FRAC,
         None,
         1.0,
@@ -984,12 +1038,13 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     let v_esc = (2.0 * G * m_rem / r_rem.max(1e-6)).sqrt();
     let disk_share = (m_disk / md).clamp(0.0, 1.0);
     let base = b.rng.next_f64() * std::f64::consts::TAU;
-    let (rx, ry, rvx0, rvy0) = (b.x[rem], b.y[rem], b.vx[rem], b.vy[rem]);
+    let (rx, ry, rz) = (b.x[rem], b.y[rem], b.z[rem]);
+    let (rvx0, rvy0, rvz0) = (b.vx[rem], b.vy[rem], b.vz[rem]);
     let s0 = spawns.len();
     // Accumulate fragment momentum and mass-weighted offset so the survivor
     // can be pushed in the opposite direction afterward, conserving total
     // momentum and centre of mass exactly.
-    let (mut px, mut py, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0);
+    let (mut px, mut py, mut pz, mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     for (k, &mk) in ms.iter().enumerate() {
         // Disk fragments inherit the survivor's orbital frame; ejecta get
         // a radial kick scaled by `v_esc`. `disk_share` sets the fraction
@@ -998,28 +1053,40 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
         let ang = base
             + (k as f64) * std::f64::consts::TAU / n as f64
             + (b.rng.next_f64() - 0.5) * DEBRIS_ANGLE_JIT;
-        let (ux, uy) = (ang.cos(), ang.sin());
-        let (dist, wx, wy);
+        let (cs, sn) = (ang.cos(), ang.sin());
+        let ux = cs * e1.0 + sn * e2.0;
+        let uy = cs * e1.1 + sn * e2.1;
+        let uz = cs * e1.2 + sn * e2.2;
+        let tx = -sn * e1.0 + cs * e2.0;
+        let ty = -sn * e1.1 + cs * e2.1;
+        let tz = -sn * e1.2 + cs * e2.2;
+        let (dist, wx, wy, wz);
         if is_disk {
             dist = r_rem * (DISK_R_MIN + DISK_R_SPAN * b.rng.next_f64()) + planet_true_r(mk);
             let vc = (G * m_rem / dist).sqrt() * (0.9 + 0.2 * b.rng.next_f64());
-            wx = -sense * uy * vc;
-            wy = sense * ux * vc;
+            wx = sense * tx * vc;
+            wy = sense * ty * vc;
+            wz = sense * tz * vc;
         } else {
             dist = (r_rem + planet_true_r(mk)) * (1.0 + DEBRIS_GAP_FRAC);
             let kick = v_esc * (DEBRIS_KICK_MIN + DEBRIS_KICK_SPAN * b.rng.next_f64());
             wx = ux * kick;
             wy = uy * kick;
+            wz = uz * kick;
         }
         px += mk * wx;
         py += mk * wy;
+        pz += mk * wz;
         sx += mk * ux * dist;
         sy += mk * uy * dist;
+        sz += mk * uz * dist;
         spawns.push(Spawn {
             x: rx + ux * dist,
             y: ry + uy * dist,
+            z: rz + uz * dist,
             vx: rvx0 + wx,
             vy: rvy0 + wy,
+            vz: rvz0 + wz,
             m: mk,
             kind: BodyKind::Planet,
             origin: BodyOrigin::ImpactDebris,
@@ -1033,10 +1100,13 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     // Momentum- and centre-of-mass-conserving recoil of the survivor.
     b.x[rem] -= sx / m_rem;
     b.y[rem] -= sy / m_rem;
+    b.z[rem] -= sz / m_rem;
     b._px[rem] = b.x[rem];
     b._py[rem] = b.y[rem];
+    b._pz[rem] = b.z[rem];
     b.vx[rem] -= px / m_rem;
     b.vy[rem] -= py / m_rem;
+    b.vz[rem] -= pz / m_rem;
 
     // Spin absorbs whatever L the fragment population could not carry.
     let mut l_after = l_orb(b, rem);

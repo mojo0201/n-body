@@ -28,16 +28,17 @@ pub(super) fn binary_partner_in(b: &Bodies, hosts: &[usize], h: usize) -> Option
     let mh = b.m[h];
     let (xh, yh) = (b.x[h], b.y[h]);
     let (vxh, vyh) = (b.vx[h], b.vy[h]);
+    let (zh, vzh) = (b.z[h], b.vz[h]);
     let mut best: Option<(usize, f64)> = None;
     for &k in hosts {
         if k == h {
             continue;
         }
-        let (dx, dy) = (b.x[k] - xh, b.y[k] - yh);
-        let d = (dx * dx + dy * dy).sqrt().max(1e-12);
-        let (dvx, dvy) = (b.vx[k] - vxh, b.vy[k] - vyh);
+        let (dx, dy, dz) = (b.x[k] - xh, b.y[k] - yh, b.z[k] - zh);
+        let d = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-12);
+        let (dvx, dvy, dvz) = (b.vx[k] - vxh, b.vy[k] - vyh, b.vz[k] - vzh);
         // v² >= escape² ⇒ unbound, skip.
-        if dvx * dvx + dvy * dvy >= 2.0 * G * (mh + b.m[k]) / d {
+        if dvx * dvx + dvy * dvy + dvz * dvz >= 2.0 * G * (mh + b.m[k]) / d {
             continue;
         }
         if best.is_none_or(|(_, bd)| d < bd) {
@@ -53,15 +54,16 @@ pub fn binary_partner(b: &Bodies, h: usize) -> Option<usize> {
     let mh = b.m[h];
     let (xh, yh) = (b.x[h], b.y[h]);
     let (vxh, vyh) = (b.vx[h], b.vy[h]);
+    let (zh, vzh) = (b.z[h], b.vz[h]);
     let mut best: Option<(usize, f64)> = None;
     for k in 0..b.len() {
         if k == h || !is_host_kind(b.kind[k]) {
             continue;
         }
-        let (dx, dy) = (b.x[k] - xh, b.y[k] - yh);
-        let d = (dx * dx + dy * dy).sqrt().max(1e-12);
-        let (dvx, dvy) = (b.vx[k] - vxh, b.vy[k] - vyh);
-        if dvx * dvx + dvy * dvy >= 2.0 * G * (mh + b.m[k]) / d {
+        let (dx, dy, dz) = (b.x[k] - xh, b.y[k] - yh, b.z[k] - zh);
+        let d = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-12);
+        let (dvx, dvy, dvz) = (b.vx[k] - vxh, b.vy[k] - vyh, b.vz[k] - vzh);
+        if dvx * dvx + dvy * dvy + dvz * dvz >= 2.0 * G * (mh + b.m[k]) / d {
             continue;
         }
         if best.is_none_or(|(_, bd)| d < bd) {
@@ -76,8 +78,10 @@ pub fn binary_partner(b: &Bodies, h: usize) -> Option<usize> {
 pub(super) struct Barycentre {
     pub(super) x: f64,
     pub(super) y: f64,
+    pub(super) z: f64,
     pub(super) vx: f64,
     pub(super) vy: f64,
+    pub(super) vz: f64,
     pub(super) m: f64,
     /// Heavier star of the pair (lower index on a tie). Report this as the
     /// parent so every body in a circumbinary disk agrees on a single host.
@@ -93,21 +97,26 @@ pub(super) struct Barycentre {
 fn barycentre_from(b: &Bodies, h: usize, q: usize, i: usize) -> Option<Barycentre> {
     let (xh, yh, vxh, vyh, mh) = (b.x[h], b.y[h], b.vx[h], b.vy[h], b.m[h]);
     let (xq, yq, vxq, vyq, mq) = (b.x[q], b.y[q], b.vx[q], b.vy[q], b.m[q]);
-    let sep = (xq - xh).hypot(yq - yh);
+    let (zh, zq, vzh, vzq) = (b.z[h], b.z[q], b.vz[h], b.vz[q]);
+    let sep = (xq - xh).hypot(yq - yh).hypot(zq - zh);
     let m = mh + mq;
     let x = (mh * xh + mq * xq) / m;
     let y = (mh * yh + mq * yq) / m;
-    if (b.x[i] - x).hypot(b.y[i] - y) <= CIRCUMBINARY_FACTOR * sep {
+    let z = (mh * zh + mq * zq) / m;
+    if (b.x[i] - x).hypot(b.y[i] - y).hypot(b.z[i] - z) <= CIRCUMBINARY_FACTOR * sep {
         return None;
     }
     let vx = (mh * vxh + mq * vxq) / m;
     let vy = (mh * vyh + mq * vyq) / m;
+    let vz = (mh * vzh + mq * vzq) / m;
     let lead = if mh > mq || (mh == mq && h < q) { h } else { q };
     Some(Barycentre {
         x,
         y,
+        z,
         vx,
         vy,
+        vz,
         m,
         lead,
     })
@@ -169,9 +178,9 @@ fn orbit_reference_impl<F>(
     b: &Bodies,
     hosts: &[usize],
     i: usize,
-    default: (f64, f64, f64, f64, f64),
+    default: (f64, f64, f64, f64, f64, f64, f64),
     cbf: F,
-) -> (f64, f64, f64, f64, f64)
+) -> (f64, f64, f64, f64, f64, f64, f64)
 where
     F: FnOnce(usize) -> Option<Barycentre>,
 {
@@ -188,7 +197,7 @@ where
             if b.origin[i].is_belt() || b.origin[i].is_rubble() {
                 let mut best: Option<(usize, f64)> = None;
                 for &k in hosts {
-                    let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2);
+                    let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2);
                     if best.is_none_or(|(_, bd)| d2 < bd) {
                         best = Some((k, d2));
                     }
@@ -207,26 +216,26 @@ where
     }
     // A moon draws its orbit about the parent planet, not the star.
     if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet) {
-        return (b.x[p], b.y[p], b.vx[p], b.vy[p], b.m[p]);
+        return (b.x[p], b.y[p], b.z[p], b.vx[p], b.vy[p], b.vz[p], b.m[p]);
     }
     if !is_host_kind(b.kind[p]) {
         return default;
     }
     if let Some(bc) = cbf(p) {
-        return (bc.x, bc.y, bc.vx, bc.vy, bc.m);
+        return (bc.x, bc.y, bc.z, bc.vx, bc.vy, bc.vz, bc.m);
     }
-    (b.x[p], b.y[p], b.vx[p], b.vy[p], b.m[p])
+    (b.x[p], b.y[p], b.z[p], b.vx[p], b.vy[p], b.vz[p], b.m[p])
 }
 
-/// Reference frame (x, y, vx, vy, mass) for drawing the orbit of body `i`:
+/// Reference frame (x, y, z, vx, vy, vz, mass) for drawing the orbit of body `i`:
 /// the pair's barycentre for circumbinary bodies, the host star for S-type
 /// bodies, otherwise `default` (normally the primary).
 pub(super) fn orbit_reference(
     b: &Bodies,
     hosts: &[usize],
     i: usize,
-    default: (f64, f64, f64, f64, f64),
-) -> (f64, f64, f64, f64, f64) {
+    default: (f64, f64, f64, f64, f64, f64, f64),
+) -> (f64, f64, f64, f64, f64, f64, f64) {
     orbit_reference_impl(b, hosts, i, default, |p| circumbinary_frame(b, hosts, p, i))
 }
 
@@ -238,8 +247,8 @@ pub(super) fn orbit_reference_cached(
     hosts: &[usize],
     partners: &[Option<usize>],
     i: usize,
-    default: (f64, f64, f64, f64, f64),
-) -> (f64, f64, f64, f64, f64) {
+    default: (f64, f64, f64, f64, f64, f64, f64),
+) -> (f64, f64, f64, f64, f64, f64, f64) {
     orbit_reference_impl(b, hosts, i, default, |p| {
         circumbinary_frame_cached(b, partners, p, i)
     })
@@ -307,7 +316,7 @@ pub(super) fn find_parent_cached(b: &Bodies, i: usize, ctx: &ParentContext) -> O
             continue;
         }
         // `SOFT2` keeps the weight finite when a body coincides with a host.
-        let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + SOFT2;
+        let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2) + SOFT2;
         let w = b.m[k] / d2;
         if w > best {
             best = w;
@@ -328,12 +337,12 @@ pub(super) fn find_parent_cached(b: &Bodies, i: usize, ctx: &ParentContext) -> O
             if k == i || b.m[k] <= b.m[i] {
                 continue;
             }
-            let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2)).sqrt();
+            let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2) + (b.z[k] - b.z[h]).powi(2)).sqrt();
             let rh = dh * (b.m[k] / (3.0 * b.m[h])).cbrt();
             if rh <= 0.0 {
                 continue;
             }
-            let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2)).sqrt();
+            let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2)).sqrt();
             let ratio = dk / rh;
             // `<=` (not `<`) so a moon spawned at exactly
             // MOON_HILL_FRAC * r_hill is classified as a moon.
@@ -375,7 +384,7 @@ pub fn find_parent(b: &Bodies, i: usize) -> Option<usize> {
         if k == i || !is_host_kind(b.kind[k]) {
             continue;
         }
-        let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + SOFT2;
+        let d2 = (b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2) + SOFT2;
         let w = b.m[k] / d2;
         if w > best {
             best = w;
@@ -397,12 +406,12 @@ pub fn find_parent(b: &Bodies, i: usize) -> Option<usize> {
             {
                 continue;
             }
-            let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2)).sqrt();
+            let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2) + (b.z[k] - b.z[h]).powi(2)).sqrt();
             let rh = dh * (b.m[k] / (3.0 * b.m[h])).cbrt();
             if rh <= 0.0 {
                 continue;
             }
-            let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2)).sqrt();
+            let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2)).sqrt();
             let ratio = dk / rh;
             if ratio <= best_ratio {
                 best_ratio = ratio;
@@ -423,6 +432,8 @@ pub struct OrbitInfo {
     pub period: f64,
     pub peri: f64,
     pub apo: f64,
+    /// Inclination of the orbit to the xy plane, radians in [0, π].
+    pub inc: f64,
 }
 
 /// Osculating two-body elements of body `i` relative to `par`. Hyperbolic
@@ -431,16 +442,24 @@ pub struct OrbitInfo {
 pub fn orbit_info(b: &Bodies, i: usize, par: usize) -> OrbitInfo {
     let dx = b.x[i] - b.x[par];
     let dy = b.y[i] - b.y[par];
+    let dz = b.z[i] - b.z[par];
     let dvx = b.vx[i] - b.vx[par];
     let dvy = b.vy[i] - b.vy[par];
-    let r = (dx * dx + dy * dy).sqrt().max(1e-12);
-    let v2 = dvx * dvx + dvy * dvy;
+    let dvz = b.vz[i] - b.vz[par];
+    let r = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-12);
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (b.m[par] + b.m[i]);
-    let rv = dx * dvx + dy * dvy;
+    let rv = dx * dvx + dy * dvy + dz * dvz;
     // Eccentricity vector e = ((v² - μ/r)·r⃗ - (r⃗·v⃗)·v⃗) / μ.
     let ex = ((v2 - mu / r) * dx - rv * dvx) / mu;
     let ey = ((v2 - mu / r) * dy - rv * dvy) / mu;
-    let e = (ex * ex + ey * ey).sqrt();
+    let ez = ((v2 - mu / r) * dz - rv * dvz) / mu;
+    let e = (ex * ex + ey * ey + ez * ez).sqrt();
+    // Orbit normal h = r × v gives the inclination to the xy reference plane
+    // (0 for a prograde planar orbit, π for a retrograde one).
+    let (hx, hy, hz) = (dy * dvz - dz * dvy, dz * dvx - dx * dvz, dx * dvy - dy * dvx);
+    let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+    let inc = if hn > 0.0 { (hz / hn).clamp(-1.0, 1.0).acos() } else { 0.0 };
     // Vis-viva: 1/a = 2/r - v²/μ. Positive ⇒ bound ellipse.
     let inv = 2.0 / r - v2 / mu;
     let bound = inv > 1e-12;
@@ -460,6 +479,7 @@ pub fn orbit_info(b: &Bodies, i: usize, par: usize) -> OrbitInfo {
         period,
         peri: if bound { a * (1.0 - e) } else { f64::NAN },
         apo: if bound { a * (1.0 + e) } else { f64::NAN },
+        inc,
     }
 }
 
@@ -468,7 +488,7 @@ pub fn orbit_info(b: &Bodies, i: usize, par: usize) -> OrbitInfo {
 /// every body per frame. Falls back to distance-from-origin when the
 /// parent cache is stale or the body has no host (e.g. interstellar).
 pub fn host_distance(b: &Bodies, i: usize) -> f64 {
-    let fallback = b.x[i].hypot(b.y[i]);
+    let fallback = b.x[i].hypot(b.y[i]).hypot(b.z[i]);
     if !b.parent_cache_valid {
         return fallback;
     }
@@ -481,7 +501,7 @@ pub fn host_distance(b: &Bodies, i: usize) -> f64 {
     }
     match p {
         Some(h) if h < b.len() && is_host_kind(b.kind[h]) => {
-            (b.x[i] - b.x[h]).hypot(b.y[i] - b.y[h])
+            (b.x[i] - b.x[h]).hypot(b.y[i] - b.y[h]).hypot(b.z[i] - b.z[h])
         }
         _ => fallback,
     }

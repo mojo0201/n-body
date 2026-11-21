@@ -69,8 +69,10 @@ pub const DUST_COMET_FIELD_CAP: usize = 100_000;
 pub struct Grain {
     pub x: f64,
     pub y: f64,
+    pub z: f64,
     pub vx: f64,
     pub vy: f64,
+    pub vz: f64,
     /// Earth masses this tracer represents.
     pub mass: f64,
     pub size_um: f64,
@@ -99,8 +101,10 @@ pub struct DustPoint {
 struct Pert {
     x: f64,
     y: f64,
+    z: f64,
     vx: f64,
     vy: f64,
+    vz: f64,
     gm: f64,
     rc: f64,
 }
@@ -109,8 +113,10 @@ struct Pert {
 struct Star {
     x: f64,
     y: f64,
+    z: f64,
     vx: f64,
     vy: f64,
+    vz: f64,
     gm: f64,
     r: f64,
     /// (L / L_sun) / (M / M_sun), for beta.
@@ -144,12 +150,14 @@ fn collect_perturbers(b: &Bodies, pri: usize, reach: f64) -> Vec<Pert> {
                     && !b.origin[i].is_rubble()
                     && b.m[i] >= PERT_MIN_M)
         })
-        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]) < reach)
+        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]) < reach)
         .map(|i| Pert {
             x: b.x[i],
             y: b.y[i],
+            z: b.z[i],
             vx: b.vx[i],
             vy: b.vy[i],
+            vz: b.vz[i],
             gm: G * b.m[i],
             rc: b.contact_r(i),
         })
@@ -162,27 +170,30 @@ fn collect_perturbers(b: &Bodies, pri: usize, reach: f64) -> Vec<Pert> {
 /// Acceleration of a grain at time `tau` into the step. Star term follows
 /// Burns et al. (1979): a = beta GM/r^2 [(1 - rdot/c) rhat - v/c] - GM/r^2 rhat.
 #[inline]
-fn accel(g: &Grain, beta: f64, st: &Star, pert: &[Pert], tau: f64, c: f64) -> (f64, f64) {
-    let (sx, sy) = (st.x + st.vx * tau, st.y + st.vy * tau);
-    let (rx, ry) = (g.x - sx, g.y - sy);
-    let r2 = rx * rx + ry * ry + SOFT2;
+fn accel(g: &Grain, beta: f64, st: &Star, pert: &[Pert], tau: f64, c: f64) -> (f64, f64, f64) {
+    let (sx, sy, sz) = (st.x + st.vx * tau, st.y + st.vy * tau, st.z + st.vz * tau);
+    let (rx, ry, rz) = (g.x - sx, g.y - sy, g.z - sz);
+    let r2 = rx * rx + ry * ry + rz * rz + SOFT2;
     let inv_r = r2.sqrt().recip();
-    let (hx, hy) = (rx * inv_r, ry * inv_r); // one reciprocal, two muls
-    let (dvx, dvy) = (g.vx - st.vx, g.vy - st.vy);
-    let rdot = hx * dvx + hy * dvy;
+    let (hx, hy, hz) = (rx * inv_r, ry * inv_r, rz * inv_r);
+    let (dvx, dvy, dvz) = (g.vx - st.vx, g.vy - st.vy, g.vz - st.vz);
+    let rdot = hx * dvx + hy * dvy + hz * dvz;
     let f = st.gm / r2;
-    let bf = beta * f; // shared by both components below
+    let bf = beta * f; // shared by all components below
     let mut ax = -f * hx + bf * ((1.0 - rdot / c) * hx - dvx / c);
     let mut ay = -f * hy + bf * ((1.0 - rdot / c) * hy - dvy / c);
+    let mut az = -f * hz + bf * ((1.0 - rdot / c) * hz - dvz / c);
     for p in pert {
         let dx = g.x - (p.x + p.vx * tau);
         let dy = g.y - (p.y + p.vy * tau);
-        let d2 = dx * dx + dy * dy + SOFT2;
+        let dz = g.z - (p.z + p.vz * tau);
+        let d2 = dx * dx + dy * dy + dz * dz + SOFT2;
         let k = p.gm / (d2 * d2.sqrt());
         ax -= k * dx;
         ay -= k * dy;
+        az -= k * dz;
     }
-    (ax, ay)
+    (ax, ay, az)
 }
 
 /// Advance one grain by `dt` with adaptive sub-steps (kick-drift-kick).
@@ -193,10 +204,10 @@ fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f
         return false;
     }
     let beta = beta_of(st.l_over_m, g.size_um);
-    let r = (g.x - st.x).hypot(g.y - st.y).max(1e-6);
+    let r = (g.x - st.x).hypot(g.y - st.y).hypot(g.z - st.z).max(1e-6);
     let mut t_dyn = (r.powi(3) / st.gm).sqrt();
     for p in pert {
-        let d = (g.x - p.x).hypot(g.y - p.y).max(p.rc);
+        let d = (g.x - p.x).hypot(g.y - p.y).hypot(g.z - p.z).max(p.rc);
         t_dyn = t_dyn.min((d.powi(3) / p.gm).sqrt());
     }
     let n = ((dt * SUB_PER_ORBIT / (std::f64::consts::TAU * t_dyn)).ceil() as u32)
@@ -206,27 +217,39 @@ fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f
     // KDK leapfrog: the accel evaluated at the end of one sub-step is exactly
     // the accel the next sub-step would recompute at its start, so carry it
     // forward and halve the number of `accel` calls.
-    let (mut ax, mut ay) = accel(g, beta, st, pert, 0.0, c);
+    let (mut ax, mut ay, mut az) = accel(g, beta, st, pert, 0.0, c);
     for k in 0..n {
         let t1 = (k + 1) as f64 * h;
         g.vx += 0.5 * h * ax;
         g.vy += 0.5 * h * ay;
+        g.vz += 0.5 * h * az;
         g.x += h * g.vx;
         g.y += h * g.vy;
-        let (ax2, ay2) = accel(g, beta, st, pert, t1, c);
+        g.z += h * g.vz;
+        let (ax2, ay2, az2) = accel(g, beta, st, pert, t1, c);
         g.vx += 0.5 * h * ax2;
         g.vy += 0.5 * h * ay2;
+        g.vz += 0.5 * h * az2;
         ax = ax2;
         ay = ay2;
+        az = az2;
 
-        let (rx, ry) = (g.x - (st.x + st.vx * t1), g.y - (st.y + st.vy * t1));
-        let r2 = rx * rx + ry * ry;
+        let (rx, ry, rz) = (
+            g.x - (st.x + st.vx * t1),
+            g.y - (st.y + st.vy * t1),
+            g.z - (st.z + st.vz * t1),
+        );
+        let r2 = rx * rx + ry * ry + rz * rz;
         if r2 < st.r * st.r || r2 > cull2 {
             return false;
         }
         for p in pert {
-            let (dx, dy) = (g.x - (p.x + p.vx * t1), g.y - (p.y + p.vy * t1));
-            if dx * dx + dy * dy < p.rc * p.rc {
+            let (dx, dy, dz) = (
+                g.x - (p.x + p.vx * t1),
+                g.y - (p.y + p.vy * t1),
+                g.z - (p.z + p.vz * t1),
+            );
+            if dx * dx + dy * dy + dz * dz < p.rc * p.rc {
                 return false;
             }
         }
@@ -249,8 +272,10 @@ impl DustField {
         let st = Star {
             x: b.x[pri],
             y: b.y[pri],
+            z: b.z[pri],
             vx: b.vx[pri],
             vy: b.vy[pri],
+            vz: b.vz[pri],
             gm: G * b.m[pri],
             r: b.contact_r(pri),
             l_over_m: luminosity_of(b, pri) / m_sun,
@@ -277,10 +302,10 @@ impl DustField {
 
     fn emit_dir(
         &mut self,
-        p: (f64, f64, f64, f64),
+        p: (f64, f64, f64, f64, f64, f64),
         mass: f64,
         kick: f64,
-        dir: Option<(f64, f64)>,
+        dir: Option<(f64, f64, f64)>,
         rng: &mut XorShift,
     ) -> usize {
         // `n` is a const, so the scratch arrays live on the stack.
@@ -306,33 +331,50 @@ impl DustField {
         for k in 0..n {
             let size = sizes[k];
             let weight = weights[k];
-            let (dvx, dvy) = if let Some((ux, uy)) = dir {
+            let (dvx, dvy, dvz) = if let Some((ux, uy, uz)) = dir {
                 // 1. Unit vector along the comet's current velocity.
-                let speed = p.2.hypot(p.3).max(1e-9);
-                let (vx_hat, vy_hat) = (p.2 / speed, p.3 / speed);
+                let speed = p.3.hypot(p.4).hypot(p.5).max(1e-9);
+                let (vx_hat, vy_hat, vz_hat) = (p.3 / speed, p.4 / speed, p.5 / speed);
 
                 // 2. Blend the anti-sunward direction with the backward
                 // velocity. A higher sweep strongly tilts the cone backward.
                 let sweep = 1.5;
                 let base_x = ux - vx_hat * sweep;
                 let base_y = uy - vy_hat * sweep;
-                let base_len = base_x.hypot(base_y).max(1e-9);
-                let (bx, by) = (base_x / base_len, base_y / base_len);
+                let base_z = uz - vz_hat * sweep;
+                let base_len = base_x.hypot(base_y).hypot(base_z).max(1e-9);
+                let (bx, by, bz) = (base_x / base_len, base_y / base_len, base_z / base_len);
 
-                // 3. Random cone spread makes the tail fan out.
+                // 3. Random cone spread makes the tail fan out. The fan
+                // rotates about the orbit normal (+z for a planar orbit).
                 let spread = 0.8;
                 let ang = sample_normal(rng, 0.0, spread * 0.5);
                 let (sa, ca) = ang.sin_cos();
-                let tx = bx * ca - by * sa;
-                let ty = bx * sa + by * ca;
+                let (kx, ky, kz) = {
+                    let (cx, cy, cz) = (uy * vz_hat - uz * vy_hat, uz * vx_hat - ux * vz_hat, ux * vy_hat - uy * vx_hat);
+                    let cn = (cx * cx + cy * cy + cz * cz).sqrt();
+                    if uz == 0.0 && vz_hat == 0.0 || cn < 1e-9 {
+                        (0.0, 0.0, 1.0)
+                    } else {
+                        (cx / cn, cy / cn, cz / cn)
+                    }
+                };
+                // Rodrigues rotation of b about k (b is perpendicular to k
+                // for a real tail; the k·b term covers the rest).
+                let kb = kx * bx + ky * by + kz * bz;
+                let (cxb, cyb, czb) = (ky * bz - kz * by, kz * bx - kx * bz, kx * by - ky * bx);
+                let tx = bx * ca + cxb * sa + kx * kb * (1.0 - ca);
+                let ty = by * ca + cyb * sa + ky * kb * (1.0 - ca);
+                let tz = bz * ca + czb * sa + kz * kb * (1.0 - ca);
 
                 // 4. Small ejection speed: radiation pressure (beta) does
                 // most of the work, so the dust lags behind and curves.
                 let v_kick = kick * (0.01 + 0.05 * rng.next_f64());
-                (tx * v_kick, ty * v_kick)
+                (tx * v_kick, ty * v_kick, tz * v_kick)
             } else {
-                // Isotropic (collisions).
-                (sample_normal(rng, 0.0, kick), sample_normal(rng, 0.0, kick))
+                // Isotropic in the orbital plane (collisions); the vertical
+                // velocity is inherited from the source.
+                (sample_normal(rng, 0.0, kick), sample_normal(rng, 0.0, kick), 0.0)
             };
 
             // Offset the initial position along the tail direction.
@@ -340,18 +382,20 @@ impl DustField {
             // this offset the un-stepped dust forms a flat wall at the
             // source position; spreading it out along the tail makes the
             // leading edge pointy instead of squared-off.
-            let (px, py) = if let Some((ux, uy)) = dir {
+            let (px, py, pz) = if let Some((ux, uy, uz)) = dir {
                 let spread_dist = rng.next_f64() * 0.05;
-                (p.0 + ux * spread_dist, p.1 + uy * spread_dist)
+                (p.0 + ux * spread_dist, p.1 + uy * spread_dist, p.2 + uz * spread_dist)
             } else {
-                (p.0, p.1)
+                (p.0, p.1, p.2)
             };
 
             self.grains.push(Grain {
                 x: px,
                 y: py,
-                vx: p.2 + dvx,
-                vy: p.3 + dvy,
+                z: pz,
+                vx: p.3 + dvx,
+                vy: p.4 + dvy,
+                vz: p.5 + dvz,
                 mass: mass * weight / wsum,
                 size_um: size,
                 ttl: if dir.is_some() {
@@ -365,7 +409,7 @@ impl DustField {
         n
     }
 
-    fn emit(&mut self, p: (f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) -> usize {
+    fn emit(&mut self, p: (f64, f64, f64, f64, f64, f64), mass: f64, kick: f64, rng: &mut XorShift) -> usize {
         self.emit_dir(p, mass, kick, None, rng)
     }
 }
@@ -374,10 +418,12 @@ pub fn deposit(
     b: &mut Bodies,
     x: f64,
     y: f64,
+    z: f64,
     vx: f64,
     vy: f64,
+    vz: f64,
     mass: f64,
-    dir: Option<(f64, f64)>,
+    dir: Option<(f64, f64, f64)>,
     kick_scale: f64,
 ) -> usize {
     let mut fields = std::mem::take(&mut b.dust_fields);
@@ -388,11 +434,11 @@ pub fn deposit(
         if p >= b.len() {
             continue;
         }
-        let r = (x - b.x[p]).hypot(y - b.y[p]);
+        let r = (x - b.x[p]).hypot(y - b.y[p]).hypot(z - b.z[p]);
         if r < f.extent_gm {
             let vc = (G * b.m[p] / r.max(1e-6)).sqrt();
             let kick = DUST_EJECT_FRAC * vc * kick_scale;
-            added = f.emit_dir((x, y, vx, vy), mass, kick, dir, &mut rng);
+            added = f.emit_dir((x, y, z, vx, vy, vz), mass, kick, dir, &mut rng);
             break;
         }
     }
@@ -402,17 +448,36 @@ pub fn deposit(
 }
 
 /// (a, e, periapsis angle) of body `i` about `p`, or `None` if unbound.
-fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64)> {
-    let (dx, dy) = (b.x[i] - b.x[p], b.y[i] - b.y[p]);
-    let (dvx, dvy) = (b.vx[i] - b.vx[p], b.vy[i] - b.vy[p]);
-    let r = dx.hypot(dy).max(1e-12);
-    let v2 = dvx * dvx + dvy * dvy;
+/// Also returns the inclination and longitude of the ascending node (both 0
+/// for a planar orbit); then the periapsis angle is measured from the node.
+fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64, f64, f64)> {
+    let (dx, dy, dz) = (b.x[i] - b.x[p], b.y[i] - b.y[p], b.z[i] - b.z[p]);
+    let (dvx, dvy, dvz) = (b.vx[i] - b.vx[p], b.vy[i] - b.vy[p], b.vz[i] - b.vz[p]);
+    let r = dx.hypot(dy).hypot(dz).max(1e-12);
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (b.m[p] + b.m[i]);
-    let rv = dx * dvx + dy * dvy;
+    let rv = dx * dvx + dy * dvy + dz * dvz;
     let ex = ((v2 - mu / r) * dx - rv * dvx) / mu;
     let ey = ((v2 - mu / r) * dy - rv * dvy) / mu;
+    let ez = ((v2 - mu / r) * dz - rv * dvz) / mu;
     let inv = 2.0 / r - v2 / mu;
-    (inv > 1e-12).then(|| (1.0 / inv, ex.hypot(ey).min(0.95), ey.atan2(ex)))
+    if !(inv > 1e-12) {
+        return None;
+    }
+    let ecc = ex.hypot(ey).hypot(ez).min(0.95);
+    let (hx, hy, hz) = (dy * dvz - dz * dvy, dz * dvx - dx * dvz, dx * dvy - dy * dvx);
+    let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+    // Planar orbits (h along ±z) keep the original 2D periapsis angle.
+    if hx == 0.0 && hy == 0.0 || hn == 0.0 {
+        return Some((1.0 / inv, ecc, ey.atan2(ex), 0.0, 0.0));
+    }
+    let inc = (hz / hn).clamp(-1.0, 1.0).acos();
+    let node = hx.atan2(-hy); // node vector = ẑ × h = (-hy, hx, 0)
+    let (sn, cn) = node.sin_cos();
+    // Periapsis angle in the orbital plane, from the ascending node.
+    let e_par = ex * cn + ey * sn;
+    let e_perp = (-ex * sn + ey * cn) * inc.cos() + ez * inc.sin();
+    Some((1.0 / inv, ecc, e_perp.atan2(e_par), inc, node))
 }
 
 /// Just the semi-major axis (no eccentricity / periapsis needed for grinding).
@@ -420,10 +485,12 @@ fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64)> {
 fn semi_major_axis(b: &Bodies, i: usize, p: usize) -> Option<f64> {
     let dx = b.x[i] - b.x[p];
     let dy = b.y[i] - b.y[p];
+    let dz = b.z[i] - b.z[p];
     let dvx = b.vx[i] - b.vx[p];
     let dvy = b.vy[i] - b.vy[p];
-    let r = dx.hypot(dy).max(1e-12);
-    let v2 = dvx * dvx + dvy * dvy;
+    let dvz = b.vz[i] - b.vz[p];
+    let r = dx.hypot(dy).hypot(dz).max(1e-12);
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (b.m[p] + b.m[i]);
     let inv = 2.0 / r - v2 / mu;
     (inv > 1e-12).then(|| 1.0 / inv)
@@ -450,7 +517,7 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
             if i == pri {
                 continue;
             }
-            let d = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]);
+            let d = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]);
             let apo = orbit_info(b, i, pri).apo;
             extent = extent.max(if apo.is_finite() { apo.min(d * 3.0) } else { d });
         }
@@ -462,7 +529,7 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
         let per = (DUST_MAX_GRAINS / sources.len().max(1)).clamp(4, DUST_GRAINS_PER_BODY);
         let mut grains = Vec::with_capacity(sources.len() * per);
         for &i in &sources {
-            let Some((a0, e0, w0)) = elements(b, i, pri) else {
+            let Some((a0, e0, w0, inc0, node0)) = elements(b, i, pri) else {
                 continue;
             };
             let total = DUST_TO_BELT_MASS * b.m[i];
@@ -474,12 +541,15 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
                 let w = w0 + 0.05 * sample_normal(&mut rng, 0.0, 1.0);
                 let ma = rng.next_f64() * std::f64::consts::TAU;
                 let nu = true_anomaly(solve_kepler(ma, e), e);
-                let (x, y, vx, vy) = kepler_state(G * b.m[pri], a, e, nu, w);
+                let (x, y, z, vx, vy, vz) =
+                    kepler_state_incl(G * b.m[pri], a, e, nu, w, inc0, node0);
                 grains.push(Grain {
                     x: b.x[pri] + x,
                     y: b.y[pri] + y,
+                    z: b.z[pri] + z,
                     vx: b.vx[pri] + vx,
                     vy: b.vy[pri] + vy,
+                    vz: b.vz[pri] + vz,
                     mass: total * size_weight(size) / wsum,
                     size_um: size,
                     ttl: f32::INFINITY,
@@ -541,7 +611,7 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
     let mu = G * b.m[pri];
     let members: Vec<(usize, f64)> = (0..b.len())
         .filter(|&i| i != pri && !b.dead[i] && b.origin[i].is_belt())
-        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]) < f.extent_gm)
+        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]) < f.extent_gm)
         .filter_map(|i| semi_major_axis(b, i, pri).map(|a| (i, a)))
         .collect();
     let belt_mass: f64 = members.iter().map(|&(i, _)| b.m[i]).sum();
@@ -557,12 +627,12 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
             continue;
         }
         let dm = BELT_GRIND_CHUNK * m;
-        let r = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).max(1e-6);
+        let r = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]).max(1e-6);
         let vc = (mu / r).sqrt();
         mark_energy(b);
         b.set_mass(i, m - dm);
         f.emit(
-            (b.x[i], b.y[i], b.vx[i], b.vy[i]),
+            (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i]),
             dm,
             DUST_EJECT_FRAC * vc,
             rng,

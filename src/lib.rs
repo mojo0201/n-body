@@ -8,6 +8,7 @@ pub mod physics;
 pub mod render;
 pub mod theme;
 pub mod ui;
+pub mod view;
 
 /// Simulation preset. Moved here from `main.rs` so `ui.rs` (in the lib) can
 /// name it via `crate::Preset` without a circular dependency on the binary.

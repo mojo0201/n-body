@@ -959,6 +959,7 @@ pub fn physical_radius(kind: BodyKind, m: f64) -> f64 {
 pub struct Flash {
     pub x: f64,
     pub y: f64,
+    pub z: f64,
     pub r0: f64,
     pub age: f64,
     pub life: f64,
@@ -1024,8 +1025,10 @@ pub struct Stats {
 struct Spawn {
     x: f64,
     y: f64,
+    z: f64,
     vx: f64,
     vy: f64,
+    vz: f64,
     m: f64,
     kind: BodyKind,
     origin: BodyOrigin,
@@ -1462,6 +1465,8 @@ pub fn stellar_flux(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
     let au2 = au * au;
     let n = b.len();
     let mut s = 0.0;
+    // Callers pass their own index as `skip`, so its z is the sample height.
+    let z = if skip < n { b.z[skip] } else { 0.0 };
     let lo_end = skip.min(n);
     let hi_start = (skip + 1).min(n);
 
@@ -1472,7 +1477,8 @@ pub fn stellar_flux(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
         }
         let dx = b.x[k] - x;
         let dy = b.y[k] - y;
-        let d2 = (dx * dx + dy * dy) / au2;
+        let dz = b.z[k] - z;
+        let d2 = (dx * dx + dy * dy + dz * dz) / au2;
         s += l / d2.max(1e-12);
     }
     for k in hi_start..n {
@@ -1482,7 +1488,8 @@ pub fn stellar_flux(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
         }
         let dx = b.x[k] - x;
         let dy = b.y[k] - y;
-        let d2 = (dx * dx + dy * dy) / au2;
+        let dz = b.z[k] - z;
+        let d2 = (dx * dx + dy * dy + dz * dz) / au2;
         s += l / d2.max(1e-12);
     }
     s
@@ -1506,6 +1513,7 @@ pub fn equilibrium_temp(s: f64) -> f64 {
 /// (used to choose the habitable-zone limits). 5780 K if nothing shines.
 pub fn stellar_flux_teff(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
     let au2 = au_in_gm() * au_in_gm();
+    let z = if skip < b.len() { b.z[skip] } else { 0.0 };
     let (mut sw, mut st) = (0.0, 0.0);
     for k in 0..b.len() {
         if k == skip {
@@ -1517,7 +1525,8 @@ pub fn stellar_flux_teff(b: &Bodies, x: f64, y: f64, skip: usize) -> f64 {
         }
         let dx = b.x[k] - x;
         let dy = b.y[k] - y;
-        let f = l / ((dx * dx + dy * dy) / au2).max(1e-12);
+        let dz = b.z[k] - z;
+        let f = l / ((dx * dx + dy * dy + dz * dz) / au2).max(1e-12);
         sw += f;
         st += f * temperature_of(b, k);
     }
@@ -1540,7 +1549,8 @@ pub fn accretion_level(b: &Bodies, i: usize) -> f64 {
         }
         let dx = b.x[k] - b.x[i];
         let dy = b.y[k] - b.y[i];
-        let d = (dx * dx + dy * dy).sqrt();
+        let dz = b.z[k] - b.z[i];
+        let d = (dx * dx + dy * dy + dz * dz).sqrt();
         if k < b.rlof.len() && b.rlof[k] && d < 1e4 * b.r[i].max(1e-12) + 50.0 * au {
             return 1.0;
         }
@@ -1556,7 +1566,8 @@ pub fn accretion_level(b: &Bodies, i: usize) -> f64 {
 pub fn hill_radius(b: &Bodies, i: usize, h: usize) -> f64 {
     let dx = b.x[i] - b.x[h];
     let dy = b.y[i] - b.y[h];
-    (dx * dx + dy * dy).sqrt() * (b.m[i] / (3.0 * b.m[h])).cbrt()
+    let dz = b.z[i] - b.z[h];
+    (dx * dx + dy * dy + dz * dz).sqrt() * (b.m[i] / (3.0 * b.m[h])).cbrt()
 }
 
 /// Shift every body so the centre of mass sits at the origin with zero total
@@ -1568,27 +1579,35 @@ pub fn recenter_com(b: &mut Bodies) {
     if n == 0 {
         return;
     }
-    let (mut mt, mut cx, mut cy, mut px, mut py) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    let (mut mt, mut cx, mut cy, mut cz, mut px, mut py, mut pz) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     for i in 0..n {
         mt += b.m[i];
         cx += b.m[i] * b.x[i];
         cy += b.m[i] * b.y[i];
+        cz += b.m[i] * b.z[i];
         px += b.m[i] * b.vx[i];
         py += b.m[i] * b.vy[i];
+        pz += b.m[i] * b.vz[i];
     }
     if mt <= 0.0 {
         return;
     }
     cx /= mt;
     cy /= mt;
+    cz /= mt;
     px /= mt;
     py /= mt;
+    pz /= mt;
     for i in 0..n {
         b.x[i] -= cx;
         b.y[i] -= cy;
+        b.z[i] -= cz;
         b._px[i] = b.x[i];
         b._py[i] = b.y[i];
+        b._pz[i] = b.z[i];
         b.vx[i] -= px;
         b.vy[i] -= py;
+        b.vz[i] -= pz;
     }
 }

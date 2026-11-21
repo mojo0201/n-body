@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use nbody_rust::physics::{self, Bodies, BodyKind, BodyOrigin};
 use nbody_rust::render::{self, OrbitReq, OrbitVertex, Renderer};
 use nbody_rust::ui::{self, Actions, Edit, UiState, ViewInfo};
+use nbody_rust::view::{self, View3};
 use nbody_rust::Preset;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -270,18 +271,71 @@ impl Default for TrailConfig {
     }
 }
 
-/// (id, sim_time, x, y, rgba, period, parent_pos). Positions stay f64 so
+/// (id, sim_time, position, rgba, period, parent_pos). Positions stay f64 so
 /// deep zoom does not jitter; they become camera-relative f32 only in
 /// `build_vertices`.
-type TrailSample = (u64, f64, f64, f64, [u8; 4], f64, Option<(f64, f64)>);
+type TrailSample = (u64, f64, [f64; 3], [u8; 4], f64, Option<[f64; 3]>);
 
 struct Trail {
-    history: VecDeque<(f64, f64, f64)>,
+    history: VecDeque<(f64, [f64; 3])>,
     color: [u8; 4],
 }
 
 const TRAIL_MAX_POINTS: usize = 4000;
 const TRAIL_MAX_VERTS: usize = 100_000;
+
+#[inline]
+fn v3_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn v3_len(a: [f64; 3]) -> f64 {
+    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+
+/// Intermediate points between two trail samples. Around a parent, the
+/// segment is a great-circle arc (radius interpolated) so trails stay round
+/// even when the sample spacing is coarse; without a parent it is a straight
+/// line. Returns the number of steps and a function giving the point at a
+/// fraction in (0, 1).
+fn trail_arc(last: [f64; 3], now: [f64; 3], parent: Option<[f64; 3]>) -> (usize, Box<dyn Fn(f64) -> [f64; 3]>) {
+    let lerp = move |f: f64| -> [f64; 3] {
+        [
+            last[0] + (now[0] - last[0]) * f,
+            last[1] + (now[1] - last[1]) * f,
+            last[2] + (now[2] - last[2]) * f,
+        ]
+    };
+    let linear_steps = ((v3_len(v3_sub(now, last)) / 0.01).ceil() as usize).clamp(1, 256);
+    if let Some(p) = parent {
+        let (r0, r1) = (v3_sub(last, p), v3_sub(now, p));
+        let (l0, l1) = (v3_len(r0), v3_len(r1));
+        if l0 > 1e-6 && l1 > 1e-6 {
+            let cosang = ((r0[0] * r1[0] + r0[1] * r1[1] + r0[2] * r1[2]) / (l0 * l1)).clamp(-1.0, 1.0);
+            let ang = cosang.acos();
+            let sin_a = ang.sin();
+            if sin_a > 1e-6 {
+                let steps = ((ang / 0.035).ceil() as usize).clamp(1, 256);
+                return (
+                    steps,
+                    Box::new(move |f: f64| {
+                        let w0 = ((1.0 - f) * ang).sin() / sin_a;
+                        let w1 = (f * ang).sin() / sin_a;
+                        let r = l0 + (l1 - l0) * f;
+                        // Unit-vector slerp, scaled to the interpolated radius.
+                        [
+                            p[0] + r * (w0 * r0[0] / l0 + w1 * r1[0] / l1),
+                            p[1] + r * (w0 * r0[1] / l0 + w1 * r1[1] / l1),
+                            p[2] + r * (w0 * r0[2] / l0 + w1 * r1[2] / l1),
+                        ]
+                    }),
+                );
+            }
+        }
+    }
+    (linear_steps, Box::new(lerp))
+}
 
 struct TrailState {
     history: HashMap<u64, Trail>,
@@ -300,9 +354,9 @@ impl TrailState {
         self.history.clear();
     }
 
-    /// O(n) under the lock. Returns (id, sim_time, x, y, rgb, period, parent_pos).
+    /// O(n) under the lock. Returns (id, sim_time, pos, rgb, period, parent_pos).
     /// `parent_pos` is used for arc sub-sampling in `update`.
-    fn snapshot(&self, b: &Bodies, override_pos: Option<(u64, [f64; 2])>) -> Vec<TrailSample> {
+    fn snapshot(&self, b: &Bodies, override_pos: Option<(u64, [f64; 3])>) -> Vec<TrailSample> {
         if !self.cfg.enabled {
             return Vec::new();
         }
@@ -331,14 +385,14 @@ impl TrailState {
                 .filter(|&p| p != i)
                 .map(|p| {
                     let o = crate::physics::orbit_info(b, i, p);
-                    (o.period, Some((b.x[p], b.y[p])))
+                    (o.period, Some([b.x[p], b.y[p], b.z[p]]))
                 })
                 .unwrap_or((f64::INFINITY, None));
-            let (bx, by) = match override_pos {
-                Some((id, pos)) if b.id[i] == id => (pos[0], pos[1]),
-                _ => (b.x[i], b.y[i]),
+            let pos = match override_pos {
+                Some((id, pos)) if b.id[i] == id => pos,
+                _ => [b.x[i], b.y[i], b.z[i]],
             };
-            out.push((b.id[i], b.time, bx, by, color, period, parent_pos));
+            out.push((b.id[i], b.time, pos, color, period, parent_pos));
         }
         out
     }
@@ -350,7 +404,7 @@ impl TrailState {
         let now_ids: HashSet<u64> = snapshot.iter().map(|s| s.0).collect();
         self.history.retain(|id, _| now_ids.contains(id));
 
-        for &(id, t, x, y, color, period, parent_pos) in snapshot {
+        for &(id, t, pos, color, period, parent_pos) in snapshot {
             let trail = self.history.entry(id).or_insert_with(|| Trail {
                 history: VecDeque::new(),
                 color,
@@ -359,73 +413,18 @@ impl TrailState {
             let is_new = trail
                 .history
                 .back()
-                .is_none_or(|&(tl, _, _)| t > tl + 1e-12);
+                .is_none_or(|&(tl, _)| t > tl + 1e-12);
 
             if is_new {
-                if let Some(&(t_last, x_last, y_last)) = trail.history.back() {
+                if let Some(&(t_last, last)) = trail.history.back() {
                     let dt = t - t_last;
-                    let steps = if let Some((px, py)) = parent_pos {
-                        let dx0 = x_last - px;
-                        let dy0 = y_last - py;
-                        let dx1 = x - px;
-                        let dy1 = y - py;
-                        let r0 = (dx0 * dx0 + dy0 * dy0).sqrt();
-                        let r1 = (dx1 * dx1 + dy1 * dy1).sqrt();
-                        if r0 > 1e-6 && r1 > 1e-6 {
-                            let a0 = dy0.atan2(dx0);
-                            let a1 = dy1.atan2(dx1);
-                            let mut da = a1 - a0;
-                            if da > std::f64::consts::PI {
-                                da -= 2.0 * std::f64::consts::PI;
-                            } else if da < -std::f64::consts::PI {
-                                da += 2.0 * std::f64::consts::PI;
-                            }
-                            ((da.abs() / 0.035).ceil() as usize).clamp(1, 256)
-                        } else {
-                            let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
-                            ((d / 0.01).ceil() as usize).clamp(1, 256)
-                        }
-                    } else {
-                        let d = ((x - x_last).powi(2) + (y - y_last).powi(2)).sqrt();
-                        ((d / 0.01).ceil() as usize).clamp(1, 256)
-                    };
-
-                    if steps > 1 {
-                        for s in 1..steps {
-                            let frac = s as f64 / steps as f64;
-                            let (ix, iy) = if let Some((px, py)) = parent_pos {
-                                // Circular arc around the parent for round trails.
-                                let dx0 = x_last - px;
-                                let dy0 = y_last - py;
-                                let dx1 = x - px;
-                                let dy1 = y - py;
-                                let r0 = (dx0 * dx0 + dy0 * dy0).sqrt();
-                                let r1 = (dx1 * dx1 + dy1 * dy1).sqrt();
-                                if r0 < 1e-6 || r1 < 1e-6 {
-                                    (x_last + (x - x_last) * frac, y_last + (y - y_last) * frac)
-                                } else {
-                                    let a0 = dy0.atan2(dx0);
-                                    let a1 = dy1.atan2(dx1);
-                                    let mut da = a1 - a0;
-                                    // Shortest arc to avoid the trail looping backward
-                                    if da > std::f64::consts::PI {
-                                        da -= 2.0 * std::f64::consts::PI;
-                                    } else if da < -std::f64::consts::PI {
-                                        da += 2.0 * std::f64::consts::PI;
-                                    }
-                                    let r = r0 + (r1 - r0) * frac;
-                                    let a = a0 + da * frac;
-                                    (px + r * a.cos(), py + r * a.sin())
-                                }
-                            } else {
-                                // Fallback to linear interpolation (stars)
-                                (x_last + (x - x_last) * frac, y_last + (y - y_last) * frac)
-                            };
-                            trail.history.push_back((t_last + dt * frac, ix, iy));
-                        }
+                    let (steps, at) = trail_arc(last, pos, parent_pos);
+                    for s in 1..steps {
+                        let frac = s as f64 / steps as f64;
+                        trail.history.push_back((t_last + dt * frac, at(frac)));
                     }
                 }
-                trail.history.push_back((t, x, y));
+                trail.history.push_back((t, pos));
             }
 
             // Cap trail length to exactly one orbital period (plus 5% margin)
@@ -435,7 +434,7 @@ impl TrailState {
                 max_age
             };
             let t_newest = trail.history.back().map(|v| v.0).unwrap_or(t);
-            while let Some(&(t0, _, _)) = trail.history.front() {
+            while let Some(&(t0, _)) = trail.history.front() {
                 if t_newest - t0 > effective_age {
                     trail.history.pop_front();
                 } else {
@@ -455,7 +454,7 @@ impl TrailState {
     /// draws trails with the relative camera. Trails are visited in id order
     /// and, when the vertex budget is exceeded, every trail is decimated by
     /// the same stride, so the result does not depend on hash order.
-    fn build_vertices(&self, cam: [f64; 2]) -> Vec<OrbitVertex> {
+    fn build_vertices(&self, cam: [f64; 3]) -> Vec<OrbitVertex> {
         let mut ids: Vec<u64> = self.history.keys().copied().collect();
         ids.sort_unstable();
         let total_segs: usize = self
@@ -481,17 +480,20 @@ impl TrailState {
                 // 30% alpha floor at the tail so the trail doesn't vanish.
                 ((((1.0 - (t_last - t) / span) * 0.7 + 0.3).clamp(0.0, 1.0)) * 200.0) as u8
             };
+            let rel = |p: [f64; 3]| -> [f32; 3] {
+                [(p[0] - cam[0]) as f32, (p[1] - cam[1]) as f32, (p[2] - cam[2]) as f32]
+            };
             let mut k = 0;
             while k < n - 1 {
                 let k1 = (k + stride).min(n - 1);
-                let (t0, x0, y0) = trail.history[k];
-                let (t1, x1, y1) = trail.history[k1];
+                let (t0, p0) = trail.history[k];
+                let (t1, p1) = trail.history[k1];
                 out.push(OrbitVertex {
-                    pos: [(x0 - cam[0]) as f32, (y0 - cam[1]) as f32],
+                    pos: rel(p0),
                     color: [rgb[0], rgb[1], rgb[2], alpha(t0)],
                 });
                 out.push(OrbitVertex {
-                    pos: [(x1 - cam[0]) as f32, (y1 - cam[1]) as f32],
+                    pos: rel(p1),
                     color: [rgb[0], rgb[1], rgb[2], alpha(t1)],
                 });
                 if out.len() >= TRAIL_MAX_VERTS {
@@ -508,8 +510,17 @@ struct SimState {
     paused: bool,
     speed: f64,
     last_frame_time: Instant,
-    follow_smooth: Option<(u64, [f64; 2])>,
+    follow_smooth: Option<(u64, [f64; 3])>,
     cam: [f64; 2],
+    /// Focus height and view angles (radians); 0 is the old top-down view.
+    cam_z: f64,
+    yaw: f64,
+    pitch: f64,
+    /// Right mouse button held: dragging turns the view.
+    rotating: bool,
+    /// World point under the cursor when the rotation started, and where it
+    /// sat on screen: the view turns about it so it stays under the cursor.
+    rot_anchor: Option<([f64; 3], [f32; 2])>,
     zoom: f32,
     body_count: usize,
     seed: u128,
@@ -572,6 +583,11 @@ impl SimState {
             last_frame_time: Instant::now(),
             follow_smooth: None,
             cam: [0.0, 0.0],
+            cam_z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            rotating: false,
+            rot_anchor: None,
             zoom: 0.7,
             body_count: 9,
             seed: ui::random_seed(),
@@ -683,6 +699,9 @@ impl SimState {
     fn app_save(&self, body_count: usize) -> physics::AppSave {
         physics::AppSave {
             cam: self.cam,
+            cam_z: self.cam_z,
+            yaw: self.yaw,
+            pitch: self.pitch,
             zoom: self.zoom,
             speed: self.speed,
             paused: self.paused,
@@ -748,6 +767,9 @@ impl SimState {
         }
         let a = &file.app;
         self.cam = a.cam;
+        self.cam_z = a.cam_z;
+        self.yaw = a.yaw;
+        self.pitch = a.pitch.clamp(-view::PITCH_LIMIT, view::PITCH_LIMIT);
         self.zoom = a.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         self.speed = a.speed.clamp(0.01, 100.0);
         self.paused = a.paused;
@@ -790,18 +812,39 @@ impl SimState {
         ui_state.set_save_msg(format!("Loaded {} ({} bodies)", name, b.len()), true);
     }
 
-    fn screen_to_world(&self, p: [f32; 2], vp: [f32; 2]) -> [f64; 2] {
-        [
-            self.cam[0] + (p[0] as f64 - vp[0] as f64 * 0.5) / self.zoom as f64,
-            self.cam[1] + (p[1] as f64 - vp[1] as f64 * 0.5) / self.zoom as f64,
-        ]
+    /// The current camera as a `View3`.
+    fn view(&self) -> View3 {
+        View3::new(
+            [self.cam[0], self.cam[1], self.cam_z],
+            self.yaw,
+            self.pitch,
+            self.zoom as f64,
+        )
     }
 
+    fn set_view(&mut self, v: &View3) {
+        self.cam = [v.cam[0], v.cam[1]];
+        self.cam_z = v.cam[2];
+        self.yaw = v.yaw;
+        self.pitch = v.pitch;
+    }
+
+    /// Slide the focus along the screen axes by `(vx, vy)` Gm.
+    fn pan_gm(&mut self, vx: f64, vy: f64) {
+        let d = self.view().unrotate([vx, vy, 0.0]);
+        self.cam[0] += d[0];
+        self.cam[1] += d[1];
+        self.cam_z += d[2];
+    }
+
+    /// Zoom about a screen point: the world point under the cursor stays put.
     fn zoom_at(&mut self, factor: f32, p: [f32; 2], vp: [f32; 2]) {
-        let before = self.screen_to_world(p, vp);
+        let before = self.view().screen_to_world(p, vp);
         self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        self.cam[0] = before[0] - (p[0] as f64 - vp[0] as f64 * 0.5) / self.zoom as f64;
-        self.cam[1] = before[1] - (p[1] as f64 - vp[1] as f64 * 0.5) / self.zoom as f64;
+        let mut v = self.view();
+        let s = v.to_screen(before, vp);
+        v.pan_px(p[0] as f64 - s[0], p[1] as f64 - s[1]);
+        self.set_view(&v);
         self.orbit_buf_valid = false;
     }
 
@@ -811,13 +854,14 @@ impl SimState {
         if self.preset == Preset::Random && self.last_loaded_preset.is_none() && self.systems > 1 {
             let mut max_r2: f64 = 0.0;
             for i in 0..b.len() {
-                let r2 = b.x[i] * b.x[i] + b.y[i] * b.y[i];
+                let r2 = b.x[i] * b.x[i] + b.y[i] * b.y[i] + b.z[i] * b.z[i];
                 if r2 > max_r2 {
                     max_r2 = r2;
                 }
             }
             let radius = (max_r2.sqrt() * 1.15).max(50.0);
             self.cam = [0.0, 0.0];
+            self.cam_z = 0.0;
             let half = 0.5 * vp[0].min(vp[1]) as f64;
             self.zoom = ((half / radius) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
             self.orbit_buf_valid = false;
@@ -830,6 +874,7 @@ impl SimState {
             let radius = physics::solar_extent_gm(1);
             let half = 0.5 * vp[0].min(vp[1]) as f64;
             self.cam = [0.0, 0.0];
+            self.cam_z = 0.0;
             self.zoom = ((half / radius) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
             self.orbit_buf_valid = false;
             return;
@@ -842,7 +887,12 @@ impl SimState {
         };
         let mut d: Vec<f64> = (0..b.len())
             .filter(|&i| i != prim)
-            .map(|i| ((b.x[i] - b.x[prim]).powi(2) + (b.y[i] - b.y[prim]).powi(2)).sqrt())
+            .map(|i| {
+                ((b.x[i] - b.x[prim]).powi(2)
+                    + (b.y[i] - b.y[prim]).powi(2)
+                    + (b.z[i] - b.z[prim]).powi(2))
+                .sqrt()
+            })
             .collect();
         let radius = if d.is_empty() {
             50.0
@@ -852,21 +902,26 @@ impl SimState {
             (d[k] * 1.15).max(5.0)
         };
         self.cam = [b.x[prim], b.y[prim]];
+        self.cam_z = b.z[prim];
         let half = 0.5 * vp[0].min(vp[1]) as f64;
         self.zoom = ((half / radius) as f32).clamp(ZOOM_MIN, ZOOM_MAX);
         self.orbit_buf_valid = false;
     }
 
     fn pick(&self, b: &Bodies, p: [f32; 2], vp: [f32; 2]) -> Option<u64> {
-        let mut best: Option<(f64, usize)> = None;
+        let view = self.view();
+        // Nearest to the cursor wins; on a near tie the body closer to the
+        // viewer (smaller view-space depth) wins, as it is drawn on top.
+        let mut best: Option<(f64, f64, usize)> = None;
         for i in 0..b.len() {
             // Match the exact position the renderer uses (follow smooth or raw).
-            let (bx, by) = match self.follow_smooth {
-                Some((id, pos)) if b.id[i] == id => (pos[0], pos[1]),
-                _ => (b.x[i], b.y[i]),
+            let pos = match self.follow_smooth {
+                Some((id, pos)) if b.id[i] == id => pos,
+                _ => [b.x[i], b.y[i], b.z[i]],
             };
-            let sx = vp[0] as f64 * 0.5 + (bx - self.cam[0]) * self.zoom as f64;
-            let sy = vp[1] as f64 * 0.5 + (by - self.cam[1]) * self.zoom as f64;
+            let v = view.project(pos);
+            let sx = vp[0] as f64 * 0.5 + v[0] * self.zoom as f64;
+            let sy = vp[1] as f64 * 0.5 + v[1] * self.zoom as f64;
             let dx = sx - p[0] as f64;
             let dy = sy - p[1] as f64;
             let d = (dx * dx + dy * dy).sqrt();
@@ -878,11 +933,13 @@ impl SimState {
                 _ => (b.r[i] * self.zoom as f64).max(8.0),
             };
 
-            if d <= rpx && best.is_none_or(|(s, _)| d < s) {
-                best = Some((d, i));
+            if d <= rpx
+                && best.is_none_or(|(s, depth, _)| d < s - 1.0 || (d <= s + 1.0 && v[2] < depth))
+            {
+                best = Some((d, v[2], i));
             }
         }
-        best.map(|(_, i)| b.id[i])
+        best.map(|(_, _, i)| b.id[i])
     }
 
     fn cycle_selection(&mut self, b: &Bodies, dir: i32) {
@@ -894,7 +951,10 @@ impl SimState {
             })
             .map(|i| {
                 let d = match prim {
-                    Some(p) => ((b.x[i] - b.x[p]).powi(2) + (b.y[i] - b.y[p]).powi(2)).sqrt(),
+                    Some(p) => ((b.x[i] - b.x[p]).powi(2)
+                        + (b.y[i] - b.y[p]).powi(2)
+                        + (b.z[i] - b.z[p]).powi(2))
+                    .sqrt(),
                     None => 0.0,
                 };
                 (d, b.id[i])
@@ -1016,6 +1076,10 @@ impl SimState {
         if let Some(o) = act.debris_orbits {
             self.show_debris_orbits = o;
             self.orbit_buf_valid = false;
+        }
+        if let Some((yaw, pitch)) = act.view_angles {
+            self.yaw = yaw;
+            self.pitch = pitch.clamp(-view::PITCH_LIMIT, view::PITCH_LIMIT);
         }
         if let Some(f) = act.zoom_mul {
             self.zoom_at(f, [vp[0] * 0.5, vp[1] * 0.5], vp);
@@ -1423,22 +1487,22 @@ impl ApplicationHandler for App {
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Space) => self.sim.paused = !self.sim.paused,
                     Key::Named(NamedKey::ArrowUp) => {
-                        self.sim.cam[1] -= pan;
+                        self.sim.pan_gm(0.0, -pan);
                         self.sim.follow = false;
                         self.sim.follow_smooth = None;
                     }
                     Key::Named(NamedKey::ArrowDown) => {
-                        self.sim.cam[1] += pan;
+                        self.sim.pan_gm(0.0, pan);
                         self.sim.follow = false;
                         self.sim.follow_smooth = None;
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
-                        self.sim.cam[0] -= pan;
+                        self.sim.pan_gm(-pan, 0.0);
                         self.sim.follow = false;
                         self.sim.follow_smooth = None;
                     }
                     Key::Named(NamedKey::ArrowRight) => {
-                        self.sim.cam[0] += pan;
+                        self.sim.pan_gm(pan, 0.0);
                         self.sim.follow = false;
                         self.sim.follow_smooth = None;
                     }
@@ -1527,6 +1591,11 @@ impl ApplicationHandler for App {
                                     self.sim.follow = !self.sim.follow;
                                 }
                             }
+                            "t" => {
+                                // Back to the top-down view.
+                                self.sim.yaw = 0.0;
+                                self.sim.pitch = 0.0;
+                            }
                             "n" => {
                                 let b = self.shared.lock_for_render();
                                 self.sim.cycle_selection(&b, 1);
@@ -1573,15 +1642,51 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // Right button: drag to turn the camera (spin and tilt).
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if state == ElementState::Pressed {
+                    if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
+                        return;
+                    }
+                    self.sim.rotating = true;
+                    // Turn about the point under the cursor, not the screen
+                    // centre: zoomed in on one system among many, the centre
+                    // can be far from it and the system would sweep away.
+                    let p = self.sim.cursor;
+                    self.sim.rot_anchor = if self.sim.follow {
+                        None // following already pivots about the body
+                    } else {
+                        Some((self.sim.view().screen_to_world(p, vp), p))
+                    };
+                } else {
+                    self.sim.rotating = false;
+                    self.sim.rot_anchor = None;
+                }
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = [position.x as f32, position.y as f32];
+                if self.sim.rotating {
+                    let mut v = self.sim.view();
+                    v.orbit_px((pos[0] - self.sim.cursor[0]) as f64, (pos[1] - self.sim.cursor[1]) as f64);
+                    if let Some((world, screen)) = self.sim.rot_anchor {
+                        // Slide the focus so the anchor stays where it was.
+                        let s = v.to_screen(world, vp);
+                        v.pan_px(screen[0] as f64 - s[0], screen[1] as f64 - s[1]);
+                    }
+                    self.sim.set_view(&v);
+                    self.sim.orbit_buf_valid = false;
+                }
                 if self.sim.dragging {
                     let dx = pos[0] - self.sim.cursor[0];
                     let dy = pos[1] - self.sim.cursor[1];
                     self.sim.moved_px += dx.abs() + dy.abs();
                     if self.sim.moved_px >= CLICK_SLOP_PX {
-                        self.sim.cam[0] -= dx as f64 / self.sim.zoom as f64;
-                        self.sim.cam[1] -= dy as f64 / self.sim.zoom as f64;
+                        self.sim.pan_gm(-dx as f64 / self.sim.zoom as f64, -dy as f64 / self.sim.zoom as f64);
                         // ALWAYS disable follow and clear the stale smooth position
                         // when dragging the canvas.
                         self.sim.follow = false;
@@ -1615,8 +1720,7 @@ impl ApplicationHandler for App {
                     self.sim.zoom_at((dz / 30.0 * 0.15).exp(), cursor, vp);
                 } else {
                     // Two-finger scroll: pan, like a phone.
-                    self.sim.cam[0] -= dx as f64 / self.sim.zoom as f64;
-                    self.sim.cam[1] -= dy as f64 / self.sim.zoom as f64;
+                    self.sim.pan_gm(-dx as f64 / self.sim.zoom as f64, -dy as f64 / self.sim.zoom as f64);
                     self.sim.follow = false;
                     self.sim.follow_smooth = None;
                 }
@@ -1715,14 +1819,16 @@ impl ApplicationHandler for App {
                                 let alpha = 1.0 - (-frame_dt / TAU).exp();
                                 let prev = match self.sim.follow_smooth {
                                     Some((prev_id, pos)) if prev_id == id => pos,
-                                    _ => [b.x[i], b.y[i]],
+                                    _ => [b.x[i], b.y[i], b.z[i]],
                                 };
                                 let new_pos = [
                                     prev[0] + (b.x[i] - prev[0]) * alpha,
                                     prev[1] + (b.y[i] - prev[1]) * alpha,
+                                    prev[2] + (b.z[i] - prev[2]) * alpha,
                                 ];
                                 self.sim.follow_smooth = Some((id, new_pos));
-                                self.sim.cam = new_pos;
+                                self.sim.cam = [new_pos[0], new_pos[1]];
+                                self.sim.cam_z = new_pos[2];
                             }
                             None => {
                                 self.sim.follow = false;
@@ -1752,7 +1858,9 @@ impl ApplicationHandler for App {
                         fps: self.sim.fps,
                         steps_per_sec: self.sim.steps_per_sec,
                         zoom: self.sim.zoom,
-                        cam: self.sim.cam,
+                        cam: [self.sim.cam[0], self.sim.cam[1], self.sim.cam_z],
+                        yaw: self.sim.yaw,
+                        pitch: self.sim.pitch,
                         viewport_px: vp,
                         ppp: gfx.egui_ctx.pixels_per_point(),
                         seed: self.sim.seed,
@@ -1831,7 +1939,7 @@ impl ApplicationHandler for App {
                                 zoom: self.sim.zoom as f64,
                                 planets: self.sim.show_orbits,
                                 debris: self.sim.show_debris_orbits,
-                                cam: self.sim.cam,
+                                cam: [self.sim.cam[0], self.sim.cam[1], self.sim.cam_z],
                                 viewport: vp,
                             },
                         ));
@@ -1847,16 +1955,11 @@ impl ApplicationHandler for App {
                         .sim
                         .follow_smooth
                         .and_then(|(id, pos)| b.index_of_id(id).map(|idx| (idx, pos)));
-                    gfx.renderer.build_instances(
-                        &b,
-                        self.sim.zoom,
-                        self.sim.cam,
-                        vp,
-                        override_body,
-                    );
+                    let scene_view = self.sim.view();
+                    gfx.renderer.build_instances(&b, &scene_view, vp, override_body);
                     self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
                     let t_comet0 = Instant::now();
-                    comet_tail_verts = nbody_rust::render::build_comet_tails(&b, self.sim.zoom);
+                    comet_tail_verts = nbody_rust::render::build_comet_tails(&b, &scene_view);
                     self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
                     flashes_active = !b.flashes.is_empty();
                     n_bodies = b.len();
@@ -1883,14 +1986,14 @@ impl ApplicationHandler for App {
                         .set_orbit_vertices(&gfx.device, &gfx.queue, &verts);
                     self.sim.orbit_applied = id;
                 }
-                gfx.renderer
-                    .update_camera(&gfx.queue, self.sim.cam, self.sim.zoom, vp);
+                let cam_view = self.sim.view();
+                gfx.renderer.update_camera(&gfx.queue, &cam_view, vp);
                 gfx.renderer.upload_instances(&gfx.device, &gfx.queue);
                 gfx.renderer
                     .set_comet_tail_vertices(&gfx.device, &gfx.queue, &comet_tail_verts);
                 if self.sim.trail.cfg.enabled {
                     self.sim.trail.update(&trail_snapshot);
-                    let verts = self.sim.trail.build_vertices(self.sim.cam);
+                    let verts = self.sim.trail.build_vertices(cam_view.cam);
                     gfx.renderer
                         .set_trail_vertices(&gfx.device, &gfx.queue, &verts);
                 } else if gfx.renderer.trail_count() > 0 {

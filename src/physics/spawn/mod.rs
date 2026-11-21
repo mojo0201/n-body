@@ -5,6 +5,7 @@
 
 use super::*;
 use std::f64::consts::TAU;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 pub mod belts;
@@ -36,17 +37,15 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
     }
     let a = a_lo * (a_hi / a_lo).powf(rng.next_f64());
     let angle = rng.next_f64() * TAU;
-    let (sa, ca) = angle.sin_cos();
-    let v_circ = (G * b.m[i] / a).sqrt();
     let m_moon = b.m[i] * 10f64.powf(-4.0 + rng.next_f64() * 2.0);
-    let moon = b.push(
-        b.x[i] + a * ca,
-        b.y[i] + a * sa,
-        b.vx[i] - v_circ * sa,
-        b.vy[i] + v_circ * ca,
-        m_moon,
-        BodyKind::Planet,
+    // Moons orbit near their planet's own orbital plane.
+    let n = orbit_normal(
+        b,
+        i,
+        [b.x[host], b.y[host], b.z[host], b.vx[host], b.vy[host], b.vz[host]],
     );
+    let tilt = tilt_rayleigh(tilt_key(&[angle, a]), 3.0);
+    let moon = push_circular_about(b, i, n, tilt, a, angle, m_moon, BodyKind::Planet);
     // The moon inherits the parent planet's class: the Moon is Rocky,
     // Ganymede is Icy. Same rule everywhere moons are added.
     b.class[moon] = b.class[i];
@@ -66,8 +65,10 @@ pub fn spawn_moon(b: &mut Bodies, i: usize, rng: &mut XorShift) -> Option<usize>
 struct Inbound {
     x: f64,
     y: f64,
+    z: f64,
     vx: f64,
     vy: f64,
+    vz: f64,
     b_impact_au: f64,
 }
 
@@ -99,12 +100,26 @@ fn setup_inbound(b: &mut Bodies) -> Option<Inbound> {
     let v_t = dir * h / r0;
     let v_r = -(v_inf * v_inf + 2.0 * mu / r0 - v_t * v_t).max(0.0).sqrt(); // inbound
     let (st, ct) = theta.sin_cos();
+    let (vx, vy) = (v_r * ct - v_t * st, v_r * st + v_t * ct);
+
+    // Interlopers arrive from any direction: spin the whole in-plane
+    // trajectory about the x axis by a random angle (cos i uniform), which
+    // keeps the periapsis and angular momentum magnitude exactly as drawn.
+    let (beta, _) = tilt_isotropic(tilt_key(&[theta, q, v_inf]));
+    let (sb, cb) = beta.sin_cos();
+    let (sy, sz, vy, vz) = if beta == 0.0 {
+        (sy, 0.0, vy, 0.0)
+    } else {
+        (sy * cb, sy * sb, vy * cb, vy * sb)
+    };
 
     Some(Inbound {
         x: sx,
         y: sy,
-        vx: v_r * ct - v_t * st,
-        vy: v_r * st + v_t * ct,
+        z: sz,
+        vx,
+        vy,
+        vz,
         b_impact_au: q / au_in_gm(), // now the true periapsis
     })
 }
@@ -143,7 +158,7 @@ pub fn spawn_interstellar_object(b: &mut Bodies) -> Option<usize> {
         _ => BodyClass::Icy,
     };
 
-    let i = b.push(t.x, t.y, t.vx, t.vy, m, BodyKind::Planet);
+    let i = push3(b, [t.x, t.y, t.z], [t.vx, t.vy, t.vz], m, BodyKind::Planet);
     b.origin[i] = BodyOrigin::Interstellar;
     b.class[i] = class;
     b.bulk_density[i] = draw_density(&mut b.rng, class);
@@ -176,20 +191,20 @@ pub fn add_ring(b: &mut Bodies, i: usize, n: usize, rng: &mut XorShift) -> Vec<u
     // The `w = sqrt(r / r0)` weights are cheap to recompute; storing
     // them in a second `Vec` only bought an allocation.
     let wsum: f64 = radii.iter().map(|&r| (r / r0).sqrt()).sum();
+    // Rings lie in the planet's orbital plane.
+    let ring_n = match find_parent(b, i).or_else(|| primary_index(b)) {
+        Some(h) if h != i => orbit_normal(
+            b,
+            i,
+            [b.x[h], b.y[h], b.z[h], b.vx[h], b.vy[h], b.vz[h]],
+        ),
+        _ => [0.0, 0.0, 1.0],
+    };
     for &r in &radii {
         let w = (r / r0).sqrt();
         let m = m_total * w / wsum;
         let angle = rng.next_f64() * TAU;
-        let (sa, ca) = angle.sin_cos();
-        let v_circ = (G * b.m[i] / r).sqrt();
-        let k = b.push(
-            b.x[i] + r * ca,
-            b.y[i] + r * sa,
-            b.vx[i] - v_circ * sa,
-            b.vy[i] + v_circ * ca,
-            m,
-            BodyKind::Planet,
-        );
+        let k = push_circular_about(b, i, ring_n, (0.0, 0.0), r, angle, m, BodyKind::Planet);
         b.origin[k] = BodyOrigin::ImpactDebris;
         // Rings are icy — Saturn's is > 95 % water ice by mass.
         b.class[k] = BodyClass::Icy;
@@ -338,6 +353,229 @@ pub(super) fn kepler_state(mu: f64, a: f64, e: f64, nu: f64, omega: f64) -> (f64
     )
 }
 
+/// `kepler_state` for an inclined orbit: `omega` is the argument of periapsis
+/// (from the ascending node), `inc` the inclination and `node` the longitude of
+/// the ascending node. With `inc == 0 && node == 0` this is exactly the planar
+/// state, so z = 0 systems are bit-identical.
+pub(super) fn kepler_state_incl(
+    mu: f64,
+    a: f64,
+    e: f64,
+    nu: f64,
+    omega: f64,
+    inc: f64,
+    node: f64,
+) -> (f64, f64, f64, f64, f64, f64) {
+    let (x, y, vx, vy) = kepler_state(mu, a, e, nu, omega);
+    if inc == 0.0 && node == 0.0 {
+        return (x, y, 0.0, vx, vy, 0.0);
+    }
+    // Tilt about the node line (x axis), then rotate the node to `node`.
+    let (si, ci) = inc.sin_cos();
+    let (sn, cn) = node.sin_cos();
+    let (y1, z1) = (y * ci, y * si);
+    let (vy1, vz1) = (vy * ci, vy * si);
+    (
+        cn * x - sn * y1,
+        sn * x + cn * y1,
+        z1,
+        cn * vx - sn * vy1,
+        sn * vx + cn * vy1,
+        vz1,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Orbital inclination
+// ---------------------------------------------------------------------------
+//
+// The reference plane (z = 0) is the system's mid-plane. Every tilt is drawn
+// from a *private* RNG keyed on values the main stream already produced, so
+// switching inclination on or off never shifts the main spawn stream, and a
+// scale of 0 reproduces the old planar systems bit for bit.
+
+/// Global multiplier on all random inclination spreads (1.0 = realistic,
+/// 0.0 = every orbit coplanar). Stored as f64 bits.
+static INCLINATION_SCALE: AtomicU64 = AtomicU64::new(0x3FF0_0000_0000_0000);
+
+pub fn inclination_scale() -> f64 {
+    f64::from_bits(INCLINATION_SCALE.load(Ordering::Relaxed))
+}
+
+pub fn set_inclination_scale(s: f64) {
+    let s = if s.is_finite() { s.max(0.0) } else { 1.0 };
+    INCLINATION_SCALE.store(s.to_bits(), Ordering::Relaxed);
+}
+
+fn splitmix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Hash a few already-drawn values into a key for the private tilt RNG.
+pub(super) fn tilt_key(vals: &[f64]) -> u64 {
+    vals.iter()
+        .fold(0x1C1_1AB1_E5, |h, v| splitmix(h ^ v.to_bits()))
+}
+
+fn tilt_rng(key: u64) -> XorShift {
+    let mut r = XorShift::new(splitmix(key) as u128);
+    r.next_f64();
+    r
+}
+
+/// `(inclination, node)` in radians: Rayleigh-distributed inclination with
+/// scale `sigma_deg` (times the global scale) and a uniform node. Exactly
+/// `(0, 0)` when the scale is zero.
+pub(super) fn tilt_rayleigh(key: u64, sigma_deg: f64) -> (f64, f64) {
+    let scale = inclination_scale();
+    if scale <= 0.0 || sigma_deg <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut r = tilt_rng(key);
+    let inc = sample_rayleigh(&mut r, sigma_deg.to_radians() * scale).min(std::f64::consts::FRAC_PI_2);
+    (inc, r.next_f64() * TAU)
+}
+
+/// Isotropic orientation (cos i uniform in [-1, 1], so retrograde orbits are
+/// as common as prograde). `(0, 0)` when the global scale is zero.
+pub(super) fn tilt_isotropic(key: u64) -> (f64, f64) {
+    if inclination_scale() <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut r = tilt_rng(key);
+    let inc = (1.0 - 2.0 * r.next_f64()).clamp(-1.0, 1.0).acos();
+    (inc, r.next_f64() * TAU)
+}
+
+/// Push a body with a full 3D state.
+pub(super) fn push3(
+    b: &mut Bodies,
+    p: [f64; 3],
+    v: [f64; 3],
+    m: f64,
+    kind: BodyKind,
+) -> usize {
+    let i = b.push(p[0], p[1], v[0], v[1], m, kind);
+    b.z[i] = p[2];
+    b._pz[i] = p[2];
+    b.vz[i] = v[2];
+    i
+}
+
+/// Unit normal of body `i`'s orbit about a centre `c = [x, y, z, vx, vy, vz]`
+/// (+z for a planar prograde orbit).
+pub(super) fn orbit_normal(b: &Bodies, i: usize, c: [f64; 6]) -> [f64; 3] {
+    let r = [b.x[i] - c[0], b.y[i] - c[1], b.z[i] - c[2]];
+    let v = [b.vx[i] - c[3], b.vy[i] - c[4], b.vz[i] - c[5]];
+    let h = [
+        r[1] * v[2] - r[2] * v[1],
+        r[2] * v[0] - r[0] * v[2],
+        r[0] * v[1] - r[1] * v[0],
+    ];
+    let hm = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
+    if hm > 0.0 {
+        [h[0] / hm, h[1] / hm, h[2] / hm]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
+/// Two unit vectors spanning the plane with unit normal `n`; for `n = +z`
+/// they are exactly +x and +y.
+pub(super) fn plane_basis_pub(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    plane_basis(n)
+}
+
+fn plane_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let l = n[0].hypot(n[1]);
+    let e1 = if l < 1e-12 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [-n[1] / l, n[0] / l, 0.0]
+    };
+    let e2 = [
+        n[1] * e1[2] - n[2] * e1[1],
+        n[2] * e1[0] - n[0] * e1[2],
+        n[0] * e1[1] - n[1] * e1[0],
+    ];
+    (e1, e2)
+}
+
+/// `n` tilted by `inc` towards the direction at azimuth `node` about it.
+pub(super) fn tilted_normal(n: [f64; 3], tilt: (f64, f64)) -> [f64; 3] {
+    let (inc, node) = tilt;
+    if inc == 0.0 {
+        return n;
+    }
+    let (u, w) = plane_basis(n);
+    let (si, ci) = inc.sin_cos();
+    let (sn, cn) = node.sin_cos();
+    [
+        ci * n[0] + si * (cn * u[0] + sn * w[0]),
+        ci * n[1] + si * (cn * u[1] + sn * w[1]),
+        ci * n[2] + si * (cn * u[2] + sn * w[2]),
+    ]
+}
+
+/// Offset and velocity (relative to the host) of a circular orbit of radius
+/// `a` and speed `v` at phase `phi`, in the plane normal to `n` tilted by
+/// `tilt`. For `n = +z` and no tilt this is the old planar formula exactly.
+pub(super) fn circular_state(
+    n: [f64; 3],
+    tilt: (f64, f64),
+    a: f64,
+    v: f64,
+    phi: f64,
+) -> ([f64; 3], [f64; 3]) {
+    let (sp, cp) = phi.sin_cos();
+    if tilt.0 == 0.0 && n[0] == 0.0 && n[1] == 0.0 && n[2] == 1.0 {
+        return ([a * cp, a * sp, 0.0], [-v * sp, v * cp, 0.0]);
+    }
+    let (e1, e2) = plane_basis(tilted_normal(n, tilt));
+    let pos = [0, 1, 2].map(|k| a * (cp * e1[k] + sp * e2[k]));
+    let vel = [0, 1, 2].map(|k| v * (cp * e2[k] - sp * e1[k]));
+    (pos, vel)
+}
+
+/// Push a body on a circular orbit about `host` (moons, ring particles).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_circular_about(
+    b: &mut Bodies,
+    host: usize,
+    n: [f64; 3],
+    tilt: (f64, f64),
+    a: f64,
+    phi: f64,
+    m: f64,
+    kind: BodyKind,
+) -> usize {
+    let v = (G * b.m[host] / a).sqrt();
+    let (o, w) = circular_state(n, tilt, a, v, phi);
+    let p = [b.x[host] + o[0], b.y[host] + o[1], b.z[host] + o[2]];
+    let vel = [b.vx[host] + w[0], b.vy[host] + w[1], b.vz[host] + w[2]];
+    push3(b, p, vel, m, kind)
+}
+
+/// Typical inclination spread (degrees, Rayleigh scale) of a small-body
+/// population about the mid-plane. `None` means isotropic (Oort-cloud comets).
+pub(super) fn population_sigma_deg(origin: BodyOrigin, a_au: f64) -> Option<f64> {
+    Some(match origin {
+        BodyOrigin::AsteroidBelt => 7.0,
+        BodyOrigin::Hilda => 8.0,
+        BodyOrigin::Trojan => 12.0,
+        BodyOrigin::KuiperCold => 2.0,
+        BodyOrigin::KuiperHot => 12.0,
+        BodyOrigin::KuiperResonant => 10.0,
+        BodyOrigin::KuiperScattered => 15.0,
+        BodyOrigin::Comet if a_au > 200.0 => return None,
+        BodyOrigin::Comet => 12.0,
+        _ => 5.0,
+    })
+}
+
 /// Solve Kepler's equation M = E - e sin E.
 pub(super) fn solve_kepler(mean_anom: f64, e: f64) -> f64 {
     let mut ea = if e < 0.8 {
@@ -376,8 +614,11 @@ pub(super) fn push_kepler_about(
     let omega = rng.next_f64() * TAU;
     let mean_anom = rng.next_f64() * TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, e), e);
-    let (x, y, vx, vy) = kepler_state(G * (mc + m), a, e, nu, omega);
-    b.push(cx + x, cy + y, cvx + vx, cvy + vy, m, kind)
+    // Multi-planet systems are nearly coplanar (Kepler multis ~1-2 degrees,
+    // the Solar System ~3): Rayleigh with sigma 1.5 degrees about the mid-plane.
+    let (inc, node) = tilt_rayleigh(tilt_key(&[omega, mean_anom, a]), 1.5);
+    let (x, y, z, vx, vy, vz) = kepler_state_incl(G * (mc + m), a, e, nu, omega, inc, node);
+    push3(b, [cx + x, cy + y, z], [cvx + vx, cvy + vy, vz], m, kind)
 }
 
 /// Push a planet and give it a bulk density: rocky inside the snow line,
@@ -822,7 +1063,7 @@ pub fn spawn_rogue_planet(b: &mut Bodies) -> Option<usize> {
         _ => BodyClass::Rocky,
     };
 
-    let i = b.push(t.x, t.y, t.vx, t.vy, m, BodyKind::Planet);
+    let i = push3(b, [t.x, t.y, t.z], [t.vx, t.vy, t.vz], m, BodyKind::Planet);
     b.origin[i] = BodyOrigin::RoguePlanet;
     b.class[i] = class;
     b.bulk_density[i] = 0.6 + 1.1 * b.rng.next_f64();

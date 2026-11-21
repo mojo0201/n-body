@@ -189,7 +189,8 @@ pub(super) fn tidal_dissipation(b: &mut Bodies, dt: f64) {
         }
         let dx = b.x[j] - b.x[host];
         let dy = b.y[j] - b.y[host];
-        if dx * dx + dy * dy > R_EARLY_OUT2 * r_host * r_host {
+        let dz = b.z[j] - b.z[host];
+        if dx * dx + dy * dy + dz * dz > R_EARLY_OUT2 * r_host * r_host {
             continue;
         }
         // Tide raised on the parent by the child (the original model)...
@@ -209,16 +210,18 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
     let r_host = b.r[host];
     let dx = b.x[j] - b.x[host];
     let dy = b.y[j] - b.y[host];
-    let r2 = dx * dx + dy * dy;
+    let dz = b.z[j] - b.z[host];
+    let r2 = dx * dx + dy * dy + dz * dz;
     let r = r2.sqrt();
     if r <= r_host {
         return; // already inside the host; collision logic owns this
     }
     let dvx = b.vx[j] - b.vx[host];
     let dvy = b.vy[j] - b.vy[host];
+    let dvz = b.vz[j] - b.vz[host];
     let m_host = b.m[host];
     let mu = G * (m_host + b.m[j]);
-    let v2 = dvx * dvx + dvy * dvy;
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
 
     // Tides on a fly-by are meaningless, so skip hyperbolic passes.
     let energy = 0.5 * v2 - mu / r;
@@ -256,6 +259,8 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
     // `b.spin` is signed (positive = counter-clockwise), so the mean motion
     // must be signed too: the sign of the orbital angular momentum gives the
     // sense of the orbit.
+    // Spin is measured about +z, so a tilted orbit's sense is that of its
+    // angular momentum's z component.
     let n_signed = if dx * dvy - dy * dvx >= 0.0 { n_mean } else { -n_mean };
     // Decay factor 1 − Ω/n: slow spin → inward, fast spin → outward.
     let mut frac = (rate * (1.0 - omega / n_signed) * dt).clamp(-TIDAL_MAX_FRAC, TIDAL_MAX_FRAC);
@@ -266,8 +271,19 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
     let inv_r = 1.0 / r;
     let ux = dx * inv_r;
     let uy = dy * inv_r;
-    let vr = dvx * ux + dvy * uy;
-    let vt = dvy * ux - dvx * uy;
+    let uz = dz * inv_r;
+    let vr = dvx * ux + dvy * uy + dvz * uz;
+    // Planar pairs keep the original 2D expressions so z = 0 runs stay
+    // bit-identical; otherwise the tangential part is the remainder of the
+    // relative velocity, signed by the orbit's sense about +z.
+    let planar = dz == 0.0 && dvz == 0.0;
+    let (tx, ty, tz) = (dvx - vr * ux, dvy - vr * uy, dvz - vr * uz);
+    let vt = if planar {
+        dvy * ux - dvx * uy
+    } else {
+        let tm = (tx * tx + ty * ty + tz * tz).sqrt();
+        if dx * dvy - dy * dvx >= 0.0 { tm } else { -tm }
+    };
     let mu_red = m_host * b.m[j] / (m_host + b.m[j]);
 
     // Spin takes the orbit's lost angular momentum, ΔL = ½·frac·μ_red·r·v_t.
@@ -292,28 +308,35 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
     // damping v_r circularizes, damping v_t changes the semimajor axis.
     let new_vr = vr * (1.0 - frac);
     let new_vt = vt * (1.0 - 0.5 * frac);
-    let new_dvx = new_vr * ux - new_vt * uy;
-    let new_dvy = new_vr * uy + new_vt * ux;
+    let (new_dvx, new_dvy, new_dvz) = if planar {
+        (new_vr * ux - new_vt * uy, new_vr * uy + new_vt * ux, 0.0)
+    } else {
+        let s = 1.0 - 0.5 * frac;
+        (new_vr * ux + s * tx, new_vr * uy + s * ty, new_vr * uz + s * tz)
+    };
 
     // The tide changes the RELATIVE velocity by (ddvx, ddvy). Share it by
     // mass so the pair's linear momentum does not change.
     let ddvx = new_dvx - dvx;
     let ddvy = new_dvy - dvy;
+    let ddvz = new_dvz - dvz;
     let m_pair = m_host + b.m[j];
     let share_planet = m_host / m_pair;
     let share_host = b.m[j] / m_pair;
-    let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
-        + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host]);
+    let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
+        + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host] + b.vz[host] * b.vz[host]);
     b.vx[j] += share_planet * ddvx;
     b.vy[j] += share_planet * ddvy;
+    b.vz[j] += share_planet * ddvz;
     b.vx[host] -= share_host * ddvx;
     b.vy[host] -= share_host * ddvy;
+    b.vz[host] -= share_host * ddvz;
     // Positions and masses do not change, so the energy change is the
     // kinetic-energy change of both bodies. If a snapshot is pending,
     // `settle_energy` already counts it. Do not count it twice.
     if b.e_pre.is_none() {
-        let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
-            + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host]);
+        let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
+            + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host] + b.vz[host] * b.vz[host]);
         b.stats.energy_offset += ke1 - ke0;
     }
     b.spin[raised] += dl;

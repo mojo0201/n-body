@@ -10,39 +10,58 @@
 //   BlackHoleInstance <-> struct BlackHoleIn
 //   dust centres   <-> struct DustFields (256 x vec4)
 //
+// All positions are 3D; the camera rotates them into view space (see `Camera`).
 // Bind groups: group 0 is one camera uniform. Bodies, flashes, dust, glow,
 // black holes and trails use the "relative" camera (pos = 0, positions
 // pre-subtracted on the CPU in f64); orbit lines use the "world" camera. Dust also reads group 1, the
 // per-field centres (camera-relative, rewritten every frame).
  
+// `pos` is the focus (zero for the relative camera). `rot0..2` are the rows of
+// the world -> view rotation: view x is right, y is down, z is into the screen.
+// With yaw = pitch = 0 the rotation is the identity (the old top-down view).
 struct Camera {
-    pos: vec2<f32>,
+    pos: vec3<f32>,
     zoom: f32,
-    _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    rot0: vec4<f32>,
+    rot1: vec4<f32>,
+    rot2: vec4<f32>,
 };
  
 @group(0) @binding(0) var<uniform> camera: Camera;
+
+fn rot_dir(d: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(camera.rot0.xyz, d), dot(camera.rot1.xyz, d), dot(camera.rot2.xyz, d));
+}
+
+fn to_view(p: vec3<f32>) -> vec3<f32> {
+    return rot_dir(p - camera.pos);
+}
+
+fn view_clip(v: vec3<f32>) -> vec4<f32> {
+    let ndc = (v.xy * camera.zoom) / (camera.viewport * 0.5);
+    return vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+}
  
 // -------- Bodies (instanced quads) --------
  
 struct Instance {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) radius: f32,
     @location(2) color: vec3<f32>,
     // 1 = lit by a star (planets), 0 = self-luminous or unlit.
     @location(3) lit: f32,
-    // Direction to the lighting star, as an angle in world axes (radians).
-    @location(4) light_angle: f32,
+    // Unit direction from the body to the lighting star, in world axes.
+    @location(4) light: vec3<f32>,
 };
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) color: vec3<f32>,
-    // xy = unit vector toward the star (world axes), z = light strength 0..1.
-    @location(2) light: vec3<f32>,
+    // xyz = unit vector toward the star (view space), w = light strength 0..1.
+    @location(2) light: vec4<f32>,
     // Limb-darkening strength: 1 for a self-luminous disc big enough to show
     // it (stars), 0 otherwise.
     @location(3) limb: f32,
@@ -54,18 +73,17 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOut {
     let fx = f32(vi & 1u) * 2.0 - 1.0;
     let fy = f32((vi >> 1u) & 1u) * 2.0 - 1.0;
     let corner = vec2<f32>(fx, fy);
-    let world = inst.pos + corner * inst.radius;
-    let screen = (world - camera.pos) * camera.zoom;
-    let ndc = screen / (camera.viewport * 0.5);
+    var v = to_view(inst.pos);
+    v = vec3<f32>(v.xy + corner * inst.radius, v.z);
     var out: VertexOut;
-    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip_pos = view_clip(v);
     out.local = corner;
     out.color = inst.color;
     // A shaded sphere needs a few pixels to read. Below that size the body
     // stays a flat dot, so a distant planet does not lose half its light.
     let px_r = inst.radius * camera.zoom;
     let strength = inst.lit * smoothstep(2.5, 7.0, px_r);
-    out.light = vec3<f32>(cos(inst.light_angle), sin(inst.light_angle), strength);
+    out.light = vec4<f32>(rot_dir(inst.light), strength);
     out.limb = (1.0 - inst.lit) * smoothstep(3.0, 8.0, px_r);
     return out;
 }
@@ -73,10 +91,10 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOut {
 // Anti-aliased disc. Colour is multiplied by alpha and ALPHA_BLENDING
 // multiplies again (alpha^2 edge): intentional, see render.rs.
 //
-// The sim is top-down, so the star always lights a planet from the side
-// (phase angle 90 deg): exactly half of the disc is lit. The surface normal
-// of the sphere is (local.x, local.y, sqrt(1 - d^2)). The light vector lies
-// in the screen plane, so N.L reduces to dot(local, toward_star).
+// The surface normal of the sphere facing the viewer is (local.x, local.y,
+// -sqrt(1 - d^2)) in view space (z points into the screen). Top-down, the
+// light vector lies in the screen plane (phase angle 90 deg), so exactly half
+// of the disc is lit; a tilted view shows crescents and gibbous phases.
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let d = length(in.local);
@@ -84,10 +102,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     let alpha = smoothstep(1.0, 0.85, d);
-    let n_dot_l = max(dot(in.local, in.light.xy), 0.0);
+    let nz = sqrt(max(1.0 - d * d, 0.0));
+    let n_dot_l = max(dot(vec3<f32>(in.local, -nz), in.light.xyz), 0.0);
     // Lambert term plus a faint floor for scattered light on the night side.
     let lit_shade = 0.04 + 1.15 * pow(n_dot_l, 0.8);
-    let shade = mix(1.0, lit_shade, in.light.z);
+    let shade = mix(1.0, lit_shade, in.light.w);
     // Limb darkening of self-luminous discs: I = 1 - u (1 - mu), mu = cos of
     // the angle from the disc centre. Cool red stars darken more (u ~ 0.7)
     // than hot blue ones (u ~ 0.35); the blue/red ratio of the colour stands
@@ -101,7 +120,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // -------- Orbit lines (LineList) --------
  
 struct OrbitIn {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,
 };
  
@@ -112,10 +131,8 @@ struct OrbitOut {
  
 @vertex
 fn vs_orbit(v: OrbitIn) -> OrbitOut {
-    let screen = (v.pos - camera.pos) * camera.zoom;
-    let ndc = screen / (camera.viewport * 0.5);
     var out: OrbitOut;
-    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip_pos = view_clip(to_view(v.pos));
     out.color = v.color;
     return out;
 }
@@ -128,7 +145,7 @@ fn fs_orbit(in: OrbitOut) -> @location(0) vec4<f32> {
 // -------- Flash rings (instanced quads) --------
  
 struct FlashIn {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) radius: f32,
     @location(2) progress: f32,
 };
@@ -144,11 +161,10 @@ fn vs_flash(@builtin(vertex_index) vi: u32, inst: FlashIn) -> FlashOut {
     let fx = f32(vi & 1u) * 2.0 - 1.0;
     let fy = f32((vi >> 1u) & 1u) * 2.0 - 1.0;
     let corner = vec2<f32>(fx, fy);
-    let world = inst.pos + corner * inst.radius;
-    let screen = (world - camera.pos) * camera.zoom;
-    let ndc = screen / (camera.viewport * 0.5);
+    var v = to_view(inst.pos);
+    v = vec3<f32>(v.xy + corner * inst.radius, v.z);
     var out: FlashOut;
-    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip_pos = view_clip(v);
     out.local = corner;
     out.progress = inst.progress;
     return out;
@@ -185,7 +201,7 @@ struct DustFields {
 @group(1) @binding(0) var<uniform> dust_fields: DustFields;
  
 struct DustIn {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) weight: f32,
     @location(2) field: u32,
 };
@@ -202,14 +218,14 @@ fn vs_dust(@builtin(vertex_index) vi: u32, inst: DustIn) -> DustOut {
     let fy = f32((vi >> 1u) & 1u) * 2.0 - 1.0;
     let corner = vec2<f32>(fx, fy);
  
-    let centre = dust_fields.c[inst.field].xy;
+    let centre = dust_fields.c[inst.field].xyz;
     // Half-width of 0.9 px, expressed in world units.
     let r = 0.9 / camera.zoom;
-    let rel = centre + inst.pos + corner * r;
-    let ndc = (rel * camera.zoom) / (camera.viewport * 0.5);
+    var v = to_view(centre + inst.pos);
+    v = vec3<f32>(v.xy + corner * r, v.z);
  
     var out: DustOut;
-    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip_pos = view_clip(v);
     out.local = corner;
     out.intensity = clamp((log(inst.weight) / 2.302585 + 16.0) / 6.0, 0.15, 1.0);
     return out;
@@ -234,7 +250,7 @@ fn fs_dust(in: DustOut) -> @location(0) vec4<f32> {
 // across the quad, so |uv| = 1 is the halo's outer edge.
 
 struct GlowIn {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) radius: f32,
     @location(2) intensity: f32,
     @location(3) color: vec3<f32>,
@@ -256,11 +272,10 @@ fn vs_glow(@builtin(vertex_index) vi: u32, inst: GlowIn) -> GlowOut {
         vec2<f32>( 1.0,  1.0),
     );
     let c = corners[vi];
-    let world = inst.pos + c * inst.radius;
-    let screen = (world - camera.pos) * camera.zoom;
-    let ndc = screen / (camera.viewport * 0.5);
+    var v = to_view(inst.pos);
+    v = vec3<f32>(v.xy + c * inst.radius, v.z);
     var out: GlowOut;
-    out.clip = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip = view_clip(v);
     out.uv = c;
     out.color = inst.color;
     out.intensity = inst.intensity;
@@ -321,7 +336,7 @@ const BH_DPHI: f32 = 0.075;
 const PI: f32 = 3.14159265;
 
 struct BlackHoleIn {
-    @location(0) pos: vec2<f32>,
+    @location(0) pos: vec3<f32>,
     @location(1) radius: f32,   // event-horizon radius (Rs), world units
     @location(2) accretion: f32, // 0..1: how strongly the disk is fed; 0 hides it
 };
@@ -338,12 +353,11 @@ fn vs_blackhole(@builtin(vertex_index) vi: u32, inst: BlackHoleIn) -> BlackHoleO
     let fy = f32((vi >> 1u) & 1u) * 2.0 - 1.0;
     let corner = vec2<f32>(fx, fy);
 
-    let world = inst.pos + corner * inst.radius * BH_QUAD;
-    let screen = (world - camera.pos) * camera.zoom;
-    let ndc = screen / (camera.viewport * 0.5);
+    var v = to_view(inst.pos);
+    v = vec3<f32>(v.xy + corner * inst.radius * BH_QUAD, v.z);
 
     var out: BlackHoleOut;
-    out.clip_pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    out.clip_pos = view_clip(v);
     out.local = corner * BH_QUAD;
     out.accretion = inst.accretion;
     return out;

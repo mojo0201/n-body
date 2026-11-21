@@ -86,7 +86,8 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
             Some(pi) => {
                 let dx = b.x[i] - b.x[pi];
                 let dy = b.y[i] - b.y[pi];
-                d_to_parent.push((dx * dx + dy * dy).sqrt());
+                let dz = b.z[i] - b.z[pi];
+                d_to_parent.push((dx * dx + dy * dy + dz * dz).sqrt());
             }
             None => d_to_parent.push(0.0),
         }
@@ -152,7 +153,8 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
 
                     let dx = b.x[j] - b.x[i];
                     let dy = b.y[j] - b.y[i];
-                    let dist2 = dx * dx + dy * dy;
+                    let dz = b.z[j] - b.z[i];
+                    let dist2 = dx * dx + dy * dy + dz * dz;
                     let dist = dist2.sqrt();
 
                     // Mutual Hill radius of the pair around the host,
@@ -171,7 +173,8 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
                     // of the pair, otherwise the encounter is unbound.
                     let dvx = b.vx[j] - b.vx[i];
                     let dvy = b.vy[j] - b.vy[i];
-                    let vrel = (dvx * dvx + dvy * dvy).sqrt();
+                    let dvz = b.vz[j] - b.vz[i];
+                    let vrel = (dvx * dvx + dvy * dvy + dvz * dvz).sqrt();
                     let v_esc = (2.0 * G * m_ij / dist.max(1e-12)).sqrt();
                     if vrel >= DEBRIS_CAPTURE_VEL_RATIO * v_esc {
                         continue;
@@ -307,7 +310,8 @@ pub(super) fn tidal_breakup(b: &mut Bodies) {
             }
             let dx = b.x[i] - b.x[p];
             let dy = b.y[i] - b.y[p];
-            let d2 = dx * dx + dy * dy;
+            let dz = b.z[i] - b.z[p];
+            let d2 = dx * dx + dy * dy + dz * dz;
             let q = b.m[p] / mi;
 
             // Cheap early-out: d^6 vs. the Roche denominator.
@@ -324,7 +328,7 @@ pub(super) fn tidal_breakup(b: &mut Bodies) {
                 // Only dismember on the outward leg of the orbit
                 // (rdot >= 0); on the inbound leg the body is still
                 // approaching and disruption is deferred.
-                let rdot = dx * (b.vx[i] - b.vx[p]) + dy * (b.vy[i] - b.vy[p]);
+                let rdot = dx * (b.vx[i] - b.vx[p]) + dy * (b.vy[i] - b.vy[p]) + dz * (b.vz[i] - b.vz[p]);
                 if rdot >= 0.0 {
                     let _ = disrupt(b, i, p);
                 }
@@ -364,11 +368,26 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     let text = format!("{} torn apart by {}", tag(b, i), tag(b, p));
 
     // Unit vector from primary to body i, and its tangent.
-    let d = ((b.x[i] - b.x[p]).powi(2) + (b.y[i] - b.y[p]).powi(2))
+    let d = ((b.x[i] - b.x[p]).powi(2) + (b.y[i] - b.y[p]).powi(2) + (b.z[i] - b.z[p]).powi(2))
         .sqrt()
         .max(1e-12);
-    let (ux, uy) = ((b.x[i] - b.x[p]) / d, (b.y[i] - b.y[p]) / d);
-    let (tx, ty) = (-uy, ux);
+    let (ux, uy, uz) = ((b.x[i] - b.x[p]) / d, (b.y[i] - b.y[p]) / d, (b.z[i] - b.z[p]) / d);
+    // Tangent: in-plane (-uy, ux) for a planar pair, otherwise the part of the
+    // relative velocity perpendicular to the tidal axis.
+    let (rvx, rvy, rvz) = (b.vx[i] - b.vx[p], b.vy[i] - b.vy[p], b.vz[i] - b.vz[p]);
+    let (tx, ty, tz) = if uz == 0.0 && rvz == 0.0 {
+        (-uy, ux, 0.0)
+    } else {
+        let vr = rvx * ux + rvy * uy + rvz * uz;
+        let (qx, qy, qz) = (rvx - vr * ux, rvy - vr * uy, rvz - vr * uz);
+        let qn = (qx * qx + qy * qy + qz * qz).sqrt();
+        if qn > 1e-12 {
+            (qx / qn, qy / qn, qz / qn)
+        } else {
+            let pn = (ux * ux + uy * uy).sqrt().max(1e-12);
+            (-uy / pn, ux / pn, 0.0)
+        }
+    };
 
     // Draw fragment mass weights first so the geometry (fragment
     // spacing, radii) can be sized to the largest fragment.
@@ -385,55 +404,65 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     let step = DISRUPT_STEP * rmax;
     let half = (((n - 1) as f64) / 2.0 * step).max(1e-6);
     let vk = DISRUPT_KICK * (G * mi / b.r[i].max(1e-6)).sqrt();
-    let (bx, by, bvx, bvy) = (b.x[i], b.y[i], b.vx[i], b.vy[i]);
+    let (bx, by, bz, bvx, bvy, bvz) = (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i]);
     let prim_r = b.contact_r(p);
-    let (px0, py0) = (b.x[p], b.y[p]);
+    let (px0, py0, pz0) = (b.x[p], b.y[p], b.z[p]);
 
     b.dead[i] = true;
 
     // Build the fragments. Positions and kicks are symmetric about
     // the original body's centre along the tidal axis.
     let mut pieces: Vec<Spawn> = Vec::with_capacity(n);
-    let (mut pvx, mut pvy, mut mt) = (0.0, 0.0, 0.0);
+    let (mut pvx, mut pvy, mut pvz, mut mt) = (0.0, 0.0, 0.0, 0.0);
     for (k, &mk) in ms.iter().enumerate() {
         let s = (k as f64 - (n - 1) as f64 / 2.0) * step;
         let kick = vk * s / half;
 
         // Start position: offset along the tidal axis plus a small
         // perpendicular jitter.
-        let mut fx = bx + ux * s + tx * (b.rng.next_f64() - DISRUPT_JITTER) * rmax;
-        let mut fy = by + uy * s + ty * (b.rng.next_f64() - DISRUPT_JITTER) * rmax;
+        let jx = b.rng.next_f64() - DISRUPT_JITTER;
+        let jy = b.rng.next_f64() - DISRUPT_JITTER;
+        let mut fx = bx + ux * s + tx * jx * rmax;
+        let mut fy = by + uy * s + ty * jy * rmax;
+        let mut fz = bz + uz * s + tz * jy * rmax;
 
         // Push any fragment that would spawn inside the primary back
         // out to the contact radius plus a safety margin.
         let mut qx = fx - px0;
         let mut qy = fy - py0;
-        let mut qd = (qx * qx + qy * qy).sqrt();
+        let mut qz = fz - pz0;
+        let mut qd = (qx * qx + qy * qy + qz * qz).sqrt();
         let qmin = prim_r + 1.5 * planet_true_r(mk);
         if qd < qmin {
             if qd < 1e-9 {
                 qx = ux;
                 qy = uy;
+                qz = uz;
                 qd = 1.0;
             }
             fx = px0 + qx / qd * qmin;
             fy = py0 + qy / qd * qmin;
+            fz = pz0 + qz / qd * qmin;
         }
 
         let vx = bvx + ux * kick;
         let vy = bvy + uy * kick;
+        let vz = bvz + uz * kick;
 
         // Track momentum so we can later subtract the centre-of-mass
         // contribution and keep the fragment cloud recoiling.
         pvx += mk * (vx - bvx);
         pvy += mk * (vy - bvy);
+        pvz += mk * (vz - bvz);
         mt += mk;
 
         pieces.push(Spawn {
             x: fx,
             y: fy,
+            z: fz,
             vx,
             vy,
+            vz,
             m: mk,
             kind: BodyKind::Planet,
             origin: BodyOrigin::TidalDebris,
@@ -450,8 +479,11 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     let first = b.len();
     let mut l_after = 0.0;
     for s in pieces {
-        let (vx, vy) = (s.vx - pvx / mt, s.vy - pvy / mt);
+        let (vx, vy, vz) = (s.vx - pvx / mt, s.vy - pvy / mt, s.vz - pvz / mt);
         let k = b.push(s.x, s.y, vx, vy, s.m, s.kind);
+        b.z[k] = s.z;
+        b.vz[k] = vz;
+        b._pz[k] = s.z;
         b.imm[k] = t_imm;
         b.origin[k] = BodyOrigin::TidalDebris;
         b.class[k] = s.class;
@@ -465,7 +497,7 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
         b.spin[k] = dl * b.m[k] / mt;
     }
 
-    flash_at(b, bx, by, (prim_r * 0.5).max(0.05));
+    flash_at(b, bx, by, bz, (prim_r * 0.5).max(0.05));
     b.stats.tidal += 1;
     b.log(EventKind::Tidal, text, bx, by);
     true
@@ -509,7 +541,7 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     // Deferred operations, so the borrow checker stays happy across
     // the `dust::deposit` calls below.
     let mut mass_updates: Vec<(usize, f64)> = Vec::new();
-    let mut to_deposit: Vec<(usize, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut to_deposit: Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
     let mut to_kill: Vec<usize> = Vec::new();
 
     for i in 0..n {
@@ -528,7 +560,7 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
         let mut r_min = f64::INFINITY;
         let mut h_idx = 0usize;
         for (k, &hk) in hosts.iter().enumerate() {
-            let d = (b.x[i] - b.x[hk]).hypot(b.y[i] - b.y[hk]);
+            let d = (b.x[i] - b.x[hk]).hypot(b.y[i] - b.y[hk]).hypot(b.z[i] - b.z[hk]);
             if d < r_min {
                 r_min = d;
                 h_idx = k;
@@ -554,13 +586,14 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
         }
 
         // Anti-sunward unit vector for the dust's initial momentum.
-        let (x, y, vx, vy) = (b.x[i], b.y[i], b.vx[i], b.vy[i]);
+        let (x, y, z, vx, vy, vz) = (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i]);
         let dx = b.x[i] - b.x[h];
         let dy = b.y[i] - b.y[h];
-        let r = dx.hypot(dy).max(1e-9);
-        let (ux, uy) = (dx / r, dy / r);
+        let dz = b.z[i] - b.z[h];
+        let r = dx.hypot(dy).hypot(dz).max(1e-9);
+        let (ux, uy, uz) = (dx / r, dy / r, dz / r);
 
-        to_deposit.push((i, x, y, vx, vy, dm, ux, uy));
+        to_deposit.push((i, x, y, z, vx, vy, vz, dm, ux, uy, uz));
         let new_m = b.m[i] - dm;
         if new_m < COMET_DEAD_MASS {
             to_kill.push(i);
@@ -575,11 +608,11 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     for (i, m) in mass_updates {
         b.set_mass(i, m);
     }
-    for (i, x, y, vx, vy, dm, ux, uy) in to_deposit {
+    for (i, x, y, z, vx, vy, vz, dm, ux, uy, uz) in to_deposit {
         if b.comet_grains[i] as usize >= COMET_GRAIN_CAP {
             continue;
         }
-        let added = dust::deposit(b, x, y, vx, vy, dm, Some((ux, uy)), 0.005);
+        let added = dust::deposit(b, x, y, z, vx, vy, vz, dm, Some((ux, uy, uz)), 0.005);
         b.comet_grains[i] = b.comet_grains[i].saturating_add(added as u32);
     }
 
@@ -624,7 +657,7 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
         if b.dead[i] || !matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
             continue;
         }
-        let d2 = b.x[i] * b.x[i] + b.y[i] * b.y[i];
+        let d2 = b.x[i] * b.x[i] + b.y[i] * b.y[i] + b.z[i] * b.z[i];
         if d2 < cd2 {
             continue;
         }
@@ -633,12 +666,13 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
         let near_host = hosts.iter().any(|&h| {
             let dx = b.x[i] - b.x[h];
             let dy = b.y[i] - b.y[h];
-            dx * dx + dy * dy < cd2
+            let dz = b.z[i] - b.z[h];
+            dx * dx + dy * dy + dz * dz < cd2
         });
         if near_host {
             continue;
         }
-        let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i];
+        let v2 = b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i] + b.vz[i] * b.vz[i];
 
         // Hard-cull everything past the outer boundary. This applies
         // regardless of origin, motion, or mass — it's the final
@@ -652,7 +686,7 @@ pub(super) fn cull_escaped(b: &mut Bodies) {
         // outbound bodies unless they are rogues (which we track the
         // full distance), or heavy enough to *become* rogues.
         let d = d2.sqrt();
-        let unbound_out = v2 > v_esc_sq / d && b.x[i] * b.vx[i] + b.y[i] * b.vy[i] > 0.0;
+        let unbound_out = v2 > v_esc_sq / d && b.x[i] * b.vx[i] + b.y[i] * b.vy[i] + b.z[i] * b.vz[i] > 0.0;
         if !unbound_out {
             continue;
         }

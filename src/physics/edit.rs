@@ -136,12 +136,43 @@ fn circularize_raw(b: &mut Bodies, i: usize) -> bool {
     };
     let dx = b.x[i] - b.x[p];
     let dy = b.y[i] - b.y[p];
-    let r = (dx * dx + dy * dy).sqrt();
+    let dz = b.z[i] - b.z[p];
+    let r = (dx * dx + dy * dy + dz * dz).sqrt();
     if r < 1e-9 {
         return false;
     }
     let dvx = b.vx[i] - b.vx[p];
     let dvy = b.vy[i] - b.vy[p];
+    let dvz = b.vz[i] - b.vz[p];
+    if dz != 0.0 || dvz != 0.0 {
+        // Inclined orbit: keep the orbital plane and sense of rotation. The
+        // tangent is (h × r̂) / |h|, with h = r × v the orbit normal.
+        let (hx, hy, hz) = (dy * dvz - dz * dvy, dz * dvx - dx * dvz, dx * dvy - dy * dvx);
+        let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+        let (rx, ry, rz) = (dx / r, dy / r, dz / r);
+        let (mut tx, mut ty, mut tz) = if hn > 1e-30 {
+            (
+                (hy * rz - hz * ry) / hn,
+                (hz * rx - hx * rz) / hn,
+                (hx * ry - hy * rx) / hn,
+            )
+        } else {
+            // Radial plunge: any tangent will do.
+            let pn = (rx * rx + ry * ry).sqrt();
+            if pn > 1e-12 { (-ry / pn, rx / pn, 0.0) } else { (1.0, 0.0, 0.0) }
+        };
+        let tn = (tx * tx + ty * ty + tz * tz).sqrt().max(1e-30);
+        tx /= tn;
+        ty /= tn;
+        tz /= tn;
+        let vc = (G * (b.m[p] + b.m[i]) / r).sqrt();
+        b.vx[i] = b.vx[p] + tx * vc;
+        b.vy[i] = b.vy[p] + ty * vc;
+        b.vz[i] = b.vz[p] + tz * vc;
+        let text = format!("{} circularized", tag(b, i));
+        b.log(EventKind::User, text, b.x[i], b.y[i]);
+        return true;
+    }
     let sign = if dx * dvy - dy * dvx >= 0.0 {
         1.0
     } else {

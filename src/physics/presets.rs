@@ -538,6 +538,12 @@ pub struct CompanionPreset {
     /// Argument of periapsis of the companion's orbit, degrees. Default 0.
     #[serde(default)]
     pub omega_deg: f64,
+    /// Inclination to the system mid-plane (z = 0), degrees. Default 0.
+    #[serde(default)]
+    pub inc_deg: f64,
+    /// Longitude of the ascending node, degrees. Default 0.
+    #[serde(default)]
+    pub node_deg: f64,
 }
 
 /// Belt definition inside a preset. The `mass_frac` fields inside `inner`
@@ -643,36 +649,49 @@ pub(super) fn parse_body_kind(s: Option<&str>, mass: f64) -> BodyKind {
 /// their offsets relative to the primary are unchanged.
 pub(super) fn place_companion(b: &mut Bodies, c: &CompanionPreset, default_age: f64) -> usize {
     let n = b.len();
-    let (mut mt, mut cx, mut cy, mut vx, mut vy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    let (mut mt, mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0, 0.0);
+    let (mut vx, mut vy, mut vz) = (0.0, 0.0, 0.0);
     for i in 0..n {
         mt += b.m[i];
         cx += b.m[i] * b.x[i];
         cy += b.m[i] * b.y[i];
+        cz += b.m[i] * b.z[i];
         vx += b.m[i] * b.vx[i];
         vy += b.m[i] * b.vy[i];
+        vz += b.m[i] * b.vz[i];
     }
-    (cx, cy, vx, vy) = (cx / mt, cy / mt, vx / mt, vy / mt);
+    (cx, cy, cz) = (cx / mt, cy / mt, cz / mt);
+    (vx, vy, vz) = (vx / mt, vy / mt, vz / mt);
     let mt_total = mt + c.mass_earth;
     let a_gm = c.a_au * au_in_gm();
     let m_anom = c.phase * std::f64::consts::TAU;
     let nu = true_anomaly(solve_kepler(m_anom, c.e), c.e);
-    let (rx, ry, rvx, rvy) = kepler_state(G * mt_total, a_gm, c.e, nu, c.omega_deg.to_radians());
+    let (inc, node) = (c.inc_deg.to_radians(), c.node_deg.to_radians());
+    let omega = if node == 0.0 {
+        c.omega_deg.to_radians()
+    } else {
+        (c.omega_deg - c.node_deg).to_radians()
+    };
+    let (rx, ry, rz, rvx, rvy, rvz) =
+        kepler_state_incl(G * mt_total, a_gm, c.e, nu, omega, inc, node);
     let f_in = c.mass_earth / mt_total;
     let f_out = mt / mt_total;
     for i in 0..n {
         b.x[i] -= f_in * rx;
         b.y[i] -= f_in * ry;
+        b.z[i] -= f_in * rz;
         b.vx[i] -= f_in * rvx;
         b.vy[i] -= f_in * rvy;
+        b.vz[i] -= f_in * rvz;
         b._px[i] = b.x[i];
         b._py[i] = b.y[i];
+        b._pz[i] = b.z[i];
     }
     let kind = parse_body_kind(c.kind.as_deref(), c.mass_earth);
-    let idx = b.push(
-        cx + f_out * rx,
-        cy + f_out * ry,
-        vx + f_out * rvx,
-        vy + f_out * rvy,
+    let idx = push3(
+        b,
+        [cx + f_out * rx, cy + f_out * ry, cz + f_out * rz],
+        [vx + f_out * rvx, vy + f_out * rvy, vz + f_out * rvz],
         c.mass_earth,
         kind,
     );
@@ -911,8 +930,18 @@ pub struct PlanetPreset {
     #[serde(default)]
     pub host: Option<String>,
     /// Argument of periapsis in degrees, counter-clockwise from +x. Default 0.
+    /// When `node_deg` is set this is the *longitude* of periapsis
+    /// (Ω + ω), as tabulated for the Solar System; the argument of
+    /// periapsis used for the orbit is `omega_deg - node_deg`.
     #[serde(default)]
     pub omega_deg: f64,
+    /// Inclination to the system mid-plane (z = 0), degrees. Default 0.
+    /// Retrograde orbits (Halley) are above 90.
+    #[serde(default)]
+    pub inc_deg: f64,
+    /// Longitude of the ascending node, degrees. Default 0.
+    #[serde(default)]
+    pub node_deg: f64,
     pub a_au: f64,
     pub e: f64,
     pub m_earth: f64,
@@ -953,6 +982,12 @@ pub struct MoonPreset {
     pub density_gcc: Option<f64>,
     #[serde(default)]
     pub is_dwarf: bool,
+    /// Inclination to the *planet's orbital plane*, degrees. Default 0.
+    #[serde(default)]
+    pub inc_deg: f64,
+    /// Node of that tilt, degrees. Default 0.
+    #[serde(default)]
+    pub node_deg: f64,
 }
 
 /// The Solar System, embedded from `assets/presets/solar_system.json` at
@@ -1272,14 +1307,22 @@ pub(super) fn spawn_from_preset_bodies(
         let idx = if circumbinary {
             push_circumbinary(b, p.a_au, p.e, p.m_earth, angle)
         } else {
-            push_orbit_omega(
+            // `omega_deg` is a longitude of periapsis when a node is given.
+            let omega = if p.node_deg == 0.0 {
+                p.omega_deg.to_radians()
+            } else {
+                (p.omega_deg - p.node_deg).to_radians()
+            };
+            push_orbit_incl(
                 b,
                 host_idx,
                 p.a_au,
                 p.e,
                 p.m_earth,
                 angle,
-                p.omega_deg.to_radians(),
+                omega,
+                p.inc_deg.to_radians(),
+                p.node_deg.to_radians(),
             )
         };
         let planet_snow_line = if circumbinary || host_idx == star {
@@ -1316,7 +1359,17 @@ pub(super) fn spawn_from_preset_bodies(
         let mut group = vec![idx];
         for moon in &p.moons {
             let mangle = b.rng.next_f64() * std::f64::consts::TAU;
-            let mi = push_orbit_group(b, &group, moon.a_au, moon.e, moon.m_earth, mangle);
+            // Moons orbit in their planet's orbital plane (plus any preset tilt).
+            let mn = {
+                let c6 = [b.x[host_idx], b.y[host_idx], b.z[host_idx], b.vx[host_idx], b.vy[host_idx], b.vz[host_idx]];
+                if circumbinary {
+                    [0.0, 0.0, 1.0]
+                } else {
+                    orbit_normal(b, idx, c6)
+                }
+            };
+            let mtilt = (moon.inc_deg.to_radians(), moon.node_deg.to_radians());
+            let mi = push_orbit_group(b, &group, moon.a_au, moon.e, moon.m_earth, mangle, mn, mtilt);
             group.push(mi);
             b.name[mi] = Some(moon.name.clone());
             if moon.is_dwarf {
@@ -1475,20 +1528,46 @@ pub(super) fn push_orbit_omega(
     mean_anomaly: f64,
     omega: f64,
 ) -> usize {
+    push_orbit_incl(b, sun, a_au, e, m_me, mean_anomaly, omega, 0.0, 0.0)
+}
+
+/// `push_orbit_omega` with inclination and ascending node (radians), measured
+/// from the mid-plane z = 0. `omega` is the argument of periapsis from the
+/// node. With `inc == node == 0` the result is the planar orbit exactly.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_orbit_incl(
+    b: &mut Bodies,
+    sun: usize,
+    a_au: f64,
+    e: f64,
+    m_me: f64,
+    mean_anomaly: f64,
+    omega: f64,
+    inc: f64,
+    node: f64,
+) -> usize {
     let a = a_au * au_in_gm();
     // Include the orbiter's mass so a close-in moon of a comparable-mass
     // planet (Charon about Pluto) gets the right period.
     let mu = G * (b.m[sun] + m_me);
     // The angle is a mean anomaly, so the phase is uniform in time.
     let nu = true_anomaly(solve_kepler(mean_anomaly, e), e);
-    let (x, y, vx, vy) = kepler_state(mu, a, e, nu, omega);
-    let (sx, sy, svx, svy) = (b.x[sun], b.y[sun], b.vx[sun], b.vy[sun]);
-    b.push(sx + x, sy + y, svx + vx, svy + vy, m_me, BodyKind::Planet)
+    let (x, y, z, vx, vy, vz) = kepler_state_incl(mu, a, e, nu, omega, inc, node);
+    let (sx, sy, sz) = (b.x[sun], b.y[sun], b.z[sun]);
+    let (svx, svy, svz) = (b.vx[sun], b.vy[sun], b.vz[sun]);
+    push3(
+        b,
+        [sx + x, sy + y, sz + z],
+        [svx + vx, svy + vy, svz + vz],
+        m_me,
+        BodyKind::Planet,
+    )
 }
 
 /// Push a moon on an orbit about the centre of mass of `group`
 /// (a planet plus its inner moons). The orbit speed uses the total
 /// mass of the group, so outer moons see inner moons as part of the host.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn push_orbit_group(
     b: &mut Bodies,
     group: &[usize],
@@ -1496,20 +1575,43 @@ pub(super) fn push_orbit_group(
     e: f64,
     m_me: f64,
     mean_anomaly: f64,
+    normal: [f64; 3],
+    tilt: (f64, f64),
 ) -> usize {
     let mt: f64 = group.iter().map(|&k| b.m[k]).sum();
-    let (mut cx, mut cy, mut cvx, mut cvy) = (0.0, 0.0, 0.0, 0.0);
+    let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
+    let (mut cvx, mut cvy, mut cvz) = (0.0, 0.0, 0.0);
     for &k in group {
         cx += b.m[k] * b.x[k];
         cy += b.m[k] * b.y[k];
+        cz += b.m[k] * b.z[k];
         cvx += b.m[k] * b.vx[k];
         cvy += b.m[k] * b.vy[k];
+        cvz += b.m[k] * b.vz[k];
     }
-    let (cx, cy, cvx, cvy) = (cx / mt, cy / mt, cvx / mt, cvy / mt);
+    let (cx, cy, cz) = (cx / mt, cy / mt, cz / mt);
+    let (cvx, cvy, cvz) = (cvx / mt, cvy / mt, cvz / mt);
     let a = a_au * au_in_gm();
     let nu = true_anomaly(solve_kepler(mean_anomaly, e), e);
+    // Planar orbit about +z, then rotate it into the planet's plane.
     let (x, y, vx, vy) = kepler_state(G * (mt + m_me), a, e, nu, 0.0);
-    b.push(cx + x, cy + y, cvx + vx, cvy + vy, m_me, BodyKind::Planet)
+    let n2 = tilted_normal(normal, tilt);
+    let (p, v) = if n2 == [0.0, 0.0, 1.0] {
+        ([x, y, 0.0], [vx, vy, 0.0])
+    } else {
+        let (e1, e2) = plane_basis_pub(n2);
+        (
+            [0, 1, 2].map(|k| x * e1[k] + y * e2[k]),
+            [0, 1, 2].map(|k| vx * e1[k] + vy * e2[k]),
+        )
+    };
+    push3(
+        b,
+        [cx + p[0], cy + p[1], cz + p[2]],
+        [cvx + v[0], cvy + v[1], cvz + v[2]],
+        m_me,
+        BodyKind::Planet,
+    )
 }
 
 /// Most Solar Systems the UI slider can ask for.

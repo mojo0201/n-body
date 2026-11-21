@@ -102,11 +102,13 @@ pub(super) fn gas_disk_migration(b: &mut Bodies, dt: f64) {
         }
         let dx = b.x[j] - b.x[h];
         let dy = b.y[j] - b.y[h];
+        let dz = b.z[j] - b.z[h];
         let dvx = b.vx[j] - b.vx[h];
         let dvy = b.vy[j] - b.vy[h];
-        let r2 = dx * dx + dy * dy;
+        let dvz = b.vz[j] - b.vz[h];
+        let r2 = dx * dx + dy * dy + dz * dz;
         let r = r2.sqrt();
-        let v2 = dvx * dvx + dvy * dvy;
+        let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
         let mu = G * (b.m[h] + b.m[j]);
         if !(r > 0.0) || !(v2 > 0.0) {
             continue;
@@ -126,28 +128,33 @@ pub(super) fn gas_disk_migration(b: &mut Bodies, dt: f64) {
         let tau = tau_a(b.m[j], a_au.max(1e-3)) / g;
         let tau_e = tau / ECC_DAMP_RATIO;
         let v = v2.sqrt();
-        let vr_dot = dvx * dx + dvy * dy; // v·r
+        let vr_dot = dvx * dx + dvy * dy + dvz * dz; // v·r
         // Accelerations.
         let ax = -0.5 * f_mig * dvx / tau - 2.0 * vr_dot * dx / (r2 * tau_e);
         let ay = -0.5 * f_mig * dvy / tau - 2.0 * vr_dot * dy / (r2 * tau_e);
+        let az = -0.5 * f_mig * dvz / tau - 2.0 * vr_dot * dz / (r2 * tau_e);
         let mut dvx_k = ax * dt;
         let mut dvy_k = ay * dt;
-        let dv = (dvx_k * dvx_k + dvy_k * dvy_k).sqrt();
+        let mut dvz_k = az * dt;
+        let dv = (dvx_k * dvx_k + dvy_k * dvy_k + dvz_k * dvz_k).sqrt();
         if dv > MAX_FRAC * v {
             let s = MAX_FRAC * v / dv;
             dvx_k *= s;
             dvy_k *= s;
+            dvz_k *= s;
         }
-        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
-            + 0.5 * b.m[h] * (b.vx[h] * b.vx[h] + b.vy[h] * b.vy[h]);
+        let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
+            + 0.5 * b.m[h] * (b.vx[h] * b.vx[h] + b.vy[h] * b.vy[h] + b.vz[h] * b.vz[h]);
         let ratio = b.m[j] / b.m[h];
         b.vx[j] += dvx_k;
         b.vy[j] += dvy_k;
+        b.vz[j] += dvz_k;
         b.vx[h] -= dvx_k * ratio;
         b.vy[h] -= dvy_k * ratio;
+        b.vz[h] -= dvz_k * ratio;
         if b.e_pre.is_none() {
-            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j])
-                + 0.5 * b.m[h] * (b.vx[h] * b.vx[h] + b.vy[h] * b.vy[h]);
+            let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
+                + 0.5 * b.m[h] * (b.vx[h] * b.vx[h] + b.vy[h] * b.vy[h] + b.vz[h] * b.vz[h]);
             b.stats.energy_offset += ke1 - ke0;
         }
     }

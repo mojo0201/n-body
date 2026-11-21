@@ -117,6 +117,21 @@ pub(super) fn snapshot_positions(b: &mut Bodies) {
     }
 }
 
+/// Cheap fingerprint of "did a collision pass change anything": body count
+/// plus every collision counter.
+fn collision_signature(b: &Bodies) -> (usize, [u64; 5]) {
+    (
+        b.len(),
+        [
+            b.stats.merges as u64,
+            b.stats.impacts as u64,
+            b.stats.tidal as u64,
+            b.stats.coalesces as u64,
+            b.stats.bounces as u64,
+        ],
+    )
+}
+
 /// One fourth-order Yoshida step of size `dt` over the whole population.
 ///
 /// Composes three leapfrog sub-steps with weights `Y_W1, Y_W0, Y_W1` — a
@@ -132,7 +147,15 @@ pub(super) fn yoshida_step(b: &mut Bodies, dt: f64) {
     leapfrog_step(b, Y_W1 * dt);
     leapfrog_step(b, Y_W0 * dt);
     leapfrog_step(b, Y_W1 * dt);
+    let sig = collision_signature(b);
     collision_pass(b, dt, None);
+    // A collision changes the body set (merged bodies, fragments, compacted
+    // indices), so the accelerations left by the last force evaluation are
+    // stale for those bodies. The next step's opening half-kick would use
+    // them and break momentum conservation; refresh them now.
+    if collision_signature(b) != sig {
+        compute_accel(b);
+    }
     settle_energy(b);
     b.time += dt;
     age_flashes(b);
@@ -273,6 +296,9 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
     // FRAG_COUNT_MAX spawned during this block. Reallocs if a bigger
     // disruption lands, but a quiet block never grows.
     let mut active: Vec<u32> = Vec::with_capacity(b.len() + FRAG_COUNT_MAX);
+    // Set when the final sub-tick's collision pass changed the body set: the
+    // accelerations from that tick's force evaluation are then stale.
+    let mut stale_accel = false;
 
     for tick in 1..=ticks {
         // Drift everyone by the sub-tick dtf, snapshotting the old position
@@ -389,6 +415,7 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
             );
             needs_rebuild = needs_rebuild || stats_before != stats_after;
         }
+        stale_accel = needs_rebuild;
         if needs_rebuild {
             tree = if b.len() >= BH_THRESHOLD {
                 Some(Tree::build(&*b))
@@ -402,6 +429,11 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         b.time += dtf;
     }
 
+    // Refresh accelerations for the next block's opening half-kick if the last
+    // collision pass reshuffled the bodies.
+    if stale_accel {
+        compute_accel(b);
+    }
     remove_momentum_drift(b, (p0x, p0y, p0z));
 
     // Flashes are cosmetic. One O(F) retain at block end gives the same

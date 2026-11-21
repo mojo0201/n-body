@@ -272,40 +272,66 @@ pub(in crate::physics) fn place_outer_star(
     let mean_anom = rng.next_f64() * std::f64::consts::TAU;
     let nu = true_anomaly(solve_kepler(mean_anom, s.ecc), s.ecc);
     let omega = rng.next_f64() * std::f64::consts::TAU;
-    let (rx, ry, rvx, rvy) = kepler_state(G * mt, s.a_au * au, s.ecc, nu, omega);
+    // Wide companions are randomly oriented relative to the inner system
+    // (cos i uniform), which is what drives Kozai-Lidov cycles in its
+    // planets; close ones stay roughly aligned.
+    let key = tilt_key(&[mean_anom, omega, s.a_au]);
+    let (inc, node) = if s.a_au < 50.0 {
+        tilt_rayleigh(key, 15.0)
+    } else {
+        tilt_isotropic(key)
+    };
+    let (rx, ry, rz, rvx, rvy, rvz) =
+        kepler_state_incl(G * mt, s.a_au * au, s.ecc, nu, omega, inc, node);
     let (f_in, f_out) = (s.m / mt, m_in / mt);
-    let (dx, dy, dvx, dvy) = (f_in * rx, f_in * ry, f_in * rvx, f_in * rvy);
+    let (dx, dy, dz, dvx, dvy, dvz) = (
+        f_in * rx,
+        f_in * ry,
+        f_in * rz,
+        f_in * rvx,
+        f_in * rvy,
+        f_in * rvz,
+    );
 
     // Single fused pass: accumulate the pre-shift COM and translate every
     // inner body by the same barycentric offset. Reading the pre-shift
     // values first keeps the COM bit-identical to a separate loop.
-    let (mut cx, mut cy, mut cvx, mut cvy) = (0.0, 0.0, 0.0, 0.0);
+    let (mut cx, mut cy, mut cz, mut cvx, mut cvy, mut cvz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     for i in 0..n0 {
         let mi = b.m[i];
-        let xi = b.x[i];
-        let yi = b.y[i];
-        let vxi = b.vx[i];
-        let vyi = b.vy[i];
+        let (xi, yi, zi) = (b.x[i], b.y[i], b.z[i]);
+        let (vxi, vyi, vzi) = (b.vx[i], b.vy[i], b.vz[i]);
         cx += mi * xi;
         cy += mi * yi;
+        cz += mi * zi;
         cvx += mi * vxi;
         cvy += mi * vyi;
-        let nx = xi - dx;
-        let ny = yi - dy;
+        cvz += mi * vzi;
+        let (nx, ny, nz) = (xi - dx, yi - dy, zi - dz);
         b.x[i] = nx;
         b.y[i] = ny;
+        b.z[i] = nz;
         b.vx[i] = vxi - dvx;
         b.vy[i] = vyi - dvy;
+        b.vz[i] = vzi - dvz;
         b._px[i] = nx;
         b._py[i] = ny;
+        b._pz[i] = nz;
     }
     // The outer star sits at the (shifted) inner-system COM plus its own
     // barycentric offset.
-    let star = b.push(
-        cx / m_in + f_out * rx,
-        cy / m_in + f_out * ry,
-        cvx / m_in + f_out * rvx,
-        cvy / m_in + f_out * rvy,
+    let star = push3(
+        b,
+        [
+            cx / m_in + f_out * rx,
+            cy / m_in + f_out * ry,
+            cz / m_in + f_out * rz,
+        ],
+        [
+            cvx / m_in + f_out * rvx,
+            cvy / m_in + f_out * rvy,
+            cvz / m_in + f_out * rvz,
+        ],
         s.m,
         BodyKind::Star,
     );

@@ -400,16 +400,12 @@ pub(in crate::physics) fn spawn_ms_frame(
             let frac = (k as f64 + 1.0) / (n_moons as f64 + 1.0);
             let a_moon = a_lo_m * (a_hi_m / a_lo_m).powf(frac);
             let angle = rng.next_f64() * std::f64::consts::TAU;
-            let (sa, ca) = angle.sin_cos();
-            let v_circ = (G * m_p / a_moon).sqrt();
-            let moon_idx = b.push(
-                b.x[giant_idx] + a_moon * ca,
-                b.y[giant_idx] + a_moon * sa,
-                b.vx[giant_idx] - v_circ * sa,
-                b.vy[giant_idx] + v_circ * ca,
-                m_moon,
-                BodyKind::Planet,
-            );
+            let c6 = [fr.centre.0, fr.centre.1, 0.0, fr.centre.2, fr.centre.3, 0.0];
+            let n_orb = orbit_normal(b, giant_idx, c6);
+            // Regular satellites of giants sit within ~1-2 degrees of the equator.
+            let tilt = tilt_rayleigh(tilt_key(&[angle, a_moon]), 1.5);
+            let moon_idx =
+                push_circular_about(b, giant_idx, n_orb, tilt, a_moon, angle, m_moon, BodyKind::Planet);
             // Inherit the giant's composition class so moons stay Icy.
             b.class[moon_idx] = b.class[giant_idx];
             b.bulk_density[moon_idx] = draw_density(rng, b.class[moon_idx]);
@@ -445,17 +441,12 @@ pub(in crate::physics) fn spawn_ms_frame(
         }
         let a_moon = a_lo_m * (a_hi_m / a_lo_m).powf(mrng.next_f64());
         let angle = mrng.next_f64() * std::f64::consts::TAU;
-        let (sa, ca) = angle.sin_cos();
-        let v_circ = (G * pm / a_moon).sqrt();
         let m_moon = pm * 10f64.powf(-2.5 + mrng.next_f64() * 1.0);
-        let moon_idx = b.push(
-            b.x[pi] + a_moon * ca,
-            b.y[pi] + a_moon * sa,
-            b.vx[pi] - v_circ * sa,
-            b.vy[pi] + v_circ * ca,
-            m_moon,
-            BodyKind::Planet,
-        );
+        let c6 = [fr.centre.0, fr.centre.1, 0.0, fr.centre.2, fr.centre.3, 0.0];
+        let n_orb = orbit_normal(b, pi, c6);
+        // Giant-impact moons start close to the planet's orbital plane (the Moon: 5 degrees).
+        let tilt = tilt_rayleigh(tilt_key(&[angle, a_moon]), 4.0);
+        let moon_idx = push_circular_about(b, pi, n_orb, tilt, a_moon, angle, m_moon, BodyKind::Planet);
         b.class[moon_idx] = b.class[pi];
         b.bulk_density[moon_idx] = draw_density(&mut mrng, b.class[moon_idx]);
         b.r[moon_idx] = b.radius_now(moon_idx);
