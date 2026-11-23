@@ -220,37 +220,10 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
     let dvy = b.vy[j] - b.vy[host];
     let dvz = b.vz[j] - b.vz[host];
     let m_host = b.m[host];
-    let mu = G * (m_host + b.m[j]);
     let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
-
-    // Tides on a fly-by are meaningless, so skip hyperbolic passes.
-    let energy = 0.5 * v2 - mu / r;
-    if energy >= 0.0 {
-        return;
-    }
-    let a_sma = -mu / (2.0 * energy);
-    if !a_sma.is_finite() || a_sma > TIDAL_MAX_RADII * r_host || a_sma < r_host {
-        return;
-    }
-    let n_mean = (mu / (a_sma * a_sma * a_sma)).sqrt();
-    if !n_mean.is_finite() || !(n_mean > 0.0) {
-        return;
-    }
-
-    // Body carrying the bulge, and the perturbing body's mass ratio.
-    let (r_raised, q) = if raised == host {
-        (r_host, b.m[j] / m_host)
-    } else {
-        (b.r[j], m_host / b.m[j])
-    };
-    let k2q_45 = 4.5 * k2_over_q(b, raised);
-    // 1/t_f = (9/2)·(k₂/Q)·q(1+q)·(R/a)⁵·n
-    let ratio = r_raised / a_sma;
-    let ratio5 = ratio * ratio * ratio * ratio * ratio;
-    let rate = k2q_45 * q * (1.0 + q) * ratio5 * n_mean;
-    if !(rate > 0.0) || !rate.is_finite() {
-        return;
-    }
+    let Some((a_sma, n_mean)) = tidal_orbit(b, j, host, r, v2) else { return };
+    let Some(rate) = tidal_rate(b, j, host, raised, a_sma, n_mean) else { return };
+    let r_raised = if raised == host { r_host } else { b.r[j] };
 
     // Spin angular velocity of the raised body: Ω = L_spin / I.
     let inertia = inertia_factor(b.kind[raised]) * b.m[raised] * r_raised * r_raised;
@@ -315,29 +288,70 @@ fn tide_pair(b: &mut Bodies, dt: f64, j: usize, host: usize, raised: usize) {
         (new_vr * ux + s * tx, new_vr * uy + s * ty, new_vr * uz + s * tz)
     };
 
-    // The tide changes the RELATIVE velocity by (ddvx, ddvy). Share it by
-    // mass so the pair's linear momentum does not change.
-    let ddvx = new_dvx - dvx;
-    let ddvy = new_dvy - dvy;
-    let ddvz = new_dvz - dvz;
+    share_relative_kick(b, j, host, (new_dvx - dvx, new_dvy - dvy, new_dvz - dvz));
+    b.spin[raised] += dl;
+}
+
+/// Semi-major axis and mean motion of a bound orbit worth applying tides to,
+/// or `None` for fly-bys and orbits outside the tidal range.
+fn tidal_orbit(b: &Bodies, j: usize, host: usize, r: f64, v2: f64) -> Option<(f64, f64)> {
+    let r_host = b.r[host];
+    let mu = G * (b.m[host] + b.m[j]);
+    // Tides on a fly-by are meaningless, so skip hyperbolic passes.
+    let energy = 0.5 * v2 - mu / r;
+    if energy >= 0.0 {
+        return None;
+    }
+    let a_sma = -mu / (2.0 * energy);
+    if !a_sma.is_finite() || a_sma > TIDAL_MAX_RADII * r_host || a_sma < r_host {
+        return None;
+    }
+    let n_mean = (mu / (a_sma * a_sma * a_sma)).sqrt();
+    if !n_mean.is_finite() || !(n_mean > 0.0) {
+        return None;
+    }
+    Some((a_sma, n_mean))
+}
+
+/// Tidal rate 1/t_f = (9/2)·(k₂/Q)·q(1+q)·(R/a)⁵·n for the bulge on `raised`.
+fn tidal_rate(b: &Bodies, j: usize, host: usize, raised: usize, a_sma: f64, n_mean: f64) -> Option<f64> {
+    let m_host = b.m[host];
+    // Body carrying the bulge, and the perturbing body's mass ratio.
+    let (r_raised, q) = if raised == host {
+        (b.r[host], b.m[j] / m_host)
+    } else {
+        (b.r[j], m_host / b.m[j])
+    };
+    let k2q_45 = 4.5 * k2_over_q(b, raised);
+    let ratio = r_raised / a_sma;
+    let ratio5 = ratio * ratio * ratio * ratio * ratio;
+    let rate = k2q_45 * q * (1.0 + q) * ratio5 * n_mean;
+    if !(rate > 0.0) || !rate.is_finite() {
+        return None;
+    }
+    Some(rate)
+}
+
+/// Apply a change `ddv` of the relative velocity, shared by mass so the pair's
+/// linear momentum does not change, and book the kinetic-energy change.
+fn share_relative_kick(b: &mut Bodies, j: usize, host: usize, ddv: (f64, f64, f64)) {
+    let m_host = b.m[host];
     let m_pair = m_host + b.m[j];
     let share_planet = m_host / m_pair;
     let share_host = b.m[j] / m_pair;
-    let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
-        + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host] + b.vz[host] * b.vz[host]);
-    b.vx[j] += share_planet * ddvx;
-    b.vy[j] += share_planet * ddvy;
-    b.vz[j] += share_planet * ddvz;
-    b.vx[host] -= share_host * ddvx;
-    b.vy[host] -= share_host * ddvy;
-    b.vz[host] -= share_host * ddvz;
-    // Positions and masses do not change, so the energy change is the
-    // kinetic-energy change of both bodies. If a snapshot is pending,
-    // `settle_energy` already counts it. Do not count it twice.
+    let ke = |b: &Bodies| {
+        0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
+            + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host] + b.vz[host] * b.vz[host])
+    };
+    let ke0 = ke(b);
+    b.vx[j] += share_planet * ddv.0;
+    b.vy[j] += share_planet * ddv.1;
+    b.vz[j] += share_planet * ddv.2;
+    b.vx[host] -= share_host * ddv.0;
+    b.vy[host] -= share_host * ddv.1;
+    b.vz[host] -= share_host * ddv.2;
+    // If a snapshot is pending, `settle_energy` already counts the change.
     if b.e_pre.is_none() {
-        let ke1 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j])
-            + 0.5 * m_host * (b.vx[host] * b.vx[host] + b.vy[host] * b.vy[host] + b.vz[host] * b.vz[host]);
-        b.stats.energy_offset += ke1 - ke0;
+        b.stats.energy_offset += ke(b) - ke0;
     }
-    b.spin[raised] += dl;
 }

@@ -576,10 +576,19 @@ pub static DUST_STAT_GRAINS: AtomicU64 = AtomicU64::new(0);
 const DUST_LOD_GRAINS: usize = 30_000;
 const DUST_LOD_MAX_STRIDE: usize = 4;
 
-/// Advance every field. Runs every `DUST_STEP_INTERVAL` physics steps.
-pub fn evolve(b: &mut Bodies, dt: f64) {
+/// A dust update in progress. Fields are advanced one at a time so the caller
+/// can release the bodies lock between fields (see `evolve_run`).
+pub struct DustPass {
+    dt_field: f64,
+    next: usize,
+    ns: u64,
+}
+
+/// Decide whether this step updates dust, and set up the pass. Runs every
+/// `DUST_STEP_INTERVAL` physics steps (more rarely with many grains).
+pub fn evolve_begin(b: &Bodies, dt: f64) -> Option<DustPass> {
     if b.dust_fields.is_empty() {
-        return;
+        return None;
     }
     // Level of detail: dust is visual-only, so with many grains (many
     // systems) update it less often, in proportion to the grain count.
@@ -587,21 +596,42 @@ pub fn evolve(b: &mut Bodies, dt: f64) {
     let stride = (total / DUST_LOD_GRAINS).clamp(1, DUST_LOD_MAX_STRIDE) as u64;
     let interval = DUST_STEP_INTERVAL as u64 * stride;
     if !b.stats.steps.is_multiple_of(interval) {
-        return;
+        return None;
     }
-    let t0 = std::time::Instant::now();
-    let mut fields = std::mem::take(&mut b.dust_fields);
-    let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
-    let dt_field = dt * interval as f64;
-    for f in fields.iter_mut() {
-        f.step(b, dt_field);
-        grind_belts(b, f, dt_field, &mut rng);
+    Some(DustPass { dt_field: dt * interval as f64, next: 0, ns: 0 })
+}
+
+/// Advance fields until done (true) or `keep_going` says stop between fields
+/// (false; call again to resume). The result is identical to advancing all
+/// fields in one go: same order, same RNG stream.
+pub fn evolve_run(b: &mut Bodies, pass: &mut DustPass, mut keep_going: impl FnMut() -> bool) -> bool {
+    while pass.next < b.dust_fields.len() {
+        let t0 = std::time::Instant::now();
+        let i = pass.next;
+        let placeholder = DustField { primary: 0, extent_gm: 0.0, grains: Vec::new(), version: 0 };
+        let mut f = std::mem::replace(&mut b.dust_fields[i], placeholder);
+        let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
+        f.step(b, pass.dt_field);
+        grind_belts(b, &mut f, pass.dt_field, &mut rng);
+        b.rng = rng;
+        b.dust_fields[i] = f;
+        pass.next += 1;
+        pass.ns += t0.elapsed().as_nanos() as u64;
+        if pass.next < b.dust_fields.len() && !keep_going() {
+            return false;
+        }
     }
-    b.rng = rng;
-    b.dust_fields = fields;
-    DUST_STAT_NS.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    DUST_STAT_NS.fetch_add(pass.ns, AtomicOrdering::Relaxed);
     let total: u64 = b.dust_fields.iter().map(|f| f.grains.len() as u64).sum();
     DUST_STAT_GRAINS.store(total, AtomicOrdering::Relaxed);
+    true
+}
+
+/// Advance every field in one call.
+pub fn evolve(b: &mut Bodies, dt: f64) {
+    if let Some(mut p) = evolve_begin(b, dt) {
+        evolve_run(b, &mut p, || true);
+    }
 }
 
 /// Collisional evolution of the belt bodies about the field's primary.

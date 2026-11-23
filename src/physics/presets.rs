@@ -180,49 +180,12 @@ pub(super) fn belt_spec_for(
         return BeltSpec::empty();
     }
 
-    // One pass over `planets` to collect every summary the branches below
-    // need. Doing this once keeps the decision tree linear in the number of
-    // planets; earlier revisions re-scanned for each branch.
-    let mut giants: Vec<(f64, f64)> = Vec::new(); // (mass_earth, a_au)
-    let mut has_hj = false;
-    let mut a_giant_inner = f64::INFINITY;
-    let mut a_giant_outer = 0.0f64;
-    let mut n_compact = 0usize;
-    let mut a_compact = 0.0f64;
-    let mut a_ice = 0.0f64; // outermost cold Neptune-class planet
-    for p in planets {
-        let (_, m, a) = *p;
-        // Outermost cold Neptune-class planet: sets the Kuiper resonances.
-        if (10.0..=50.0).contains(&m) && a >= snow_line_au && a > a_ice {
-            a_ice = a;
-        }
-        if m > 50.0 {
-            giants.push((m, a));
-            if a < 0.1 {
-                has_hj = true;
-            }
-            if a < a_giant_inner {
-                a_giant_inner = a;
-            }
-            if a > a_giant_outer {
-                a_giant_outer = a;
-            }
-        }
-        // Only planets inside the snow line belong to the compact chain. A
-        // cold Neptune must not push the asteroid belt outward.
-        if m <= 30.0 && a < snow_line_au {
-            if a > a_compact {
-                a_compact = a;
-            }
-            if a < 1.0 {
-                n_compact += 1;
-            }
-        }
-    }
+    let arch = PlanetSummary::of(planets, snow_line_au);
+    let window = RadialWindow { lo_au: a_lo_au, hi_au: a_hi_au, snow_line_au };
 
     // Every archetype starts from a baseline "Solar-like" belt mass. The
-    // branches below scale that up or down to reflect how much the
-    // architecture depletes small bodies.
+    // branches scale that up or down to reflect how much the architecture
+    // depletes small bodies.
     let mut spec = BeltSpec {
         archetype: BeltArchetype::NoBelt,
         total_mass: belt_mass_earth(m_sun, feh, age_gyr, rng),
@@ -233,211 +196,294 @@ pub(super) fn belt_spec_for(
         gaps: Vec::new(),
     };
 
-    // Helper for the branches that model their belt as a single cold
-    // classical population. Keeps those branches short.
-    let single_outer = |a_lo: f64, a_hi: f64, e_sigma: f64, m_min: f64, m_max: f64| {
-        Some(OuterBelt {
-            populations: vec![OuterPopulation {
-                kind: BodyOrigin::KuiperCold,
-                a_lo_au: a_lo,
-                a_hi_au: a_hi,
-                mass_frac: 1.0,
-                e_sigma,
-                q_frac: None,
-                plaw: MASS_PLAW_KUIPER,
-                m_min,
-                m_max,
-            }],
-        })
-    };
-
-    if has_hj {
-        // Hot Jupiters: giant migrated inward, scattering/clearing whatever
-        // belt material was inside its present orbit. Both budgets shrink
-        // by 10x, and the surviving outer belt is a narrow annulus just
-        // beyond the giant.
-        spec.archetype = BeltArchetype::HotJupiter;
-        let start = (a_giant_inner * 3.0).max(10.0).max(a_lo_au);
-        let end = (start * 5.0).min(a_hi_au);
-        if end > start {
-            spec.outer = single_outer(start, end, 0.05, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
-        }
-        spec.total_mass *= 0.1;
-        spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
-    } else if n_compact >= 4 && giants.is_empty() {
-        // Compact chains: four or more small planets inside 1 AU, i.e. the
-        // TRAPPIST-1 / Kepler-90 regime. Same belt depletion factor as hot
-        // Jupiters; the belt sits just outside the snow line.
-        spec.archetype = BeltArchetype::CompactChain;
-        let start = (snow_line_au * 5.0).max(a_lo_au);
-        let end = (start * 3.0).min(a_hi_au);
-        if end > start {
-            spec.outer = single_outer(start, end, 0.08, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
-        }
-        spec.total_mass *= 0.1;
-        spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
-    } else if giants.is_empty() && m_sun > 1.2 && age_gyr < 0.5 {
-        // Young, massive, giant-free systems host the bright debris disks
-        // ALMA/Herschel see (Beta Pic analogues, HL Tau at a smaller
-        // scale). Two orders of magnitude above baseline, with an
-        // unusually low eccentricity — the observed dust is dynamically
-        // cold.
-        spec.archetype = BeltArchetype::YoungDebrisDisk;
-        // Disk radius follows stellar luminosity: 8 to 16 snow lines.
-        let (start, end) = (
-            a_lo_au.max(snow_line_au * 8.0),
-            a_hi_au.min(snow_line_au * 16.0),
-        );
-        if end > start {
-            spec.outer = single_outer(start, end, 0.02, 1e-3, 1e-1);
-        }
-        spec.total_mass *= 100.0;
-        spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 100.0;
-    } else if !giants.is_empty() {
-        // Solar analogue: giants present, no hot Jupiter. The canonical
-        // four-population Kuiper belt plus a main asteroid belt, Trojans
-        // at every giant beyond 0.3 AU, and Kirkwood gaps at the giants'
-        // mean-motion resonances.
-        spec.archetype = BeltArchetype::SolarType;
-        spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng);
-
-        // Only the single most massive giant gets a substantial Trojan
-        // cloud. Real Jupiter Trojans are ~8% of the main belt; Saturn's
-        // are unobservable, and Neptune's are uncertain but likely a few
-        // per cent of Jupiter's. Below ~30 M⊕ the L4/L5 resonance is not
-        // deep enough to capture a cloud at all.
-        //
-        // Computed before the inner belt so its mass fraction can take
-        // the remainder of `total_mass`.
-        let trojan_frac: f64 = if let Some((gm, ga)) = giants
-            .iter()
-            .filter(|(m, a)| *m >= 30.0 && *a > 0.3)
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-        {
-            let m_jup = gm / JUPITER_MASS;
-            let frac = (0.08 * m_jup.powf(1.5)).clamp(0.005, 0.10);
-            spec.trojans.push(Trojan {
-                giant_a_au: *ga,
-                leading_frac: 0.5,
-                mass_frac: frac,
-            });
-            // `kirkwood_gaps` assumes a Jupiter-mass giant; width ~ mu^(2/7).
-            let gap_scale = m_jup.powf(2.0 / 7.0);
-            spec.gaps
-                .extend(kirkwood_gaps(*ga).into_iter().map(|g| Gap {
-                    width_au: g.width_au * gap_scale,
-                    ..g
-                }));
-            frac
-        } else {
-            0.0
-        };
-
-        // Main belt sits between the outermost compact planet and the
-        // innermost giant, but never inside the snow line or outside the
-        // caller's requested radial window.
-        let ast_lo = (a_compact * 1.2).max(snow_line_au * 0.7).max(a_lo_au);
-        let ast_hi = (a_giant_inner * 0.6).min(a_hi_au);
-        if ast_hi > ast_lo {
-            // `total_mass` is the asteroid belt itself (see
-            // `belt_mass_earth`). Trojans and Hildas take their share
-            // first, and the inner belt takes the remainder — so a
-            // Jupiter-analogue system spawns the belt plus an 8%
-            // Trojan cloud (matching the real Solar System) without
-            // over-spending the calibrated total.
-            let inner_frac = (1.0 - trojan_frac - belts::HILDA_MASS_FRAC).max(0.0);
-            spec.inner = Some(InnerBelt {
-                a_lo_au: ast_lo,
-                a_hi_au: ast_hi,
-                mass_frac: inner_frac,
-                e_sigma: 0.10,
-                plaw: MASS_PLAW_ASTEROID,
-                m_min: MASS_ASTEROID_MIN,
-                m_max: MASS_ASTEROID_MAX,
-            });
-        }
-
-        // Kuiper belt starts just outside the outermost giant but at
-        // least 10 snow lines out. The four populations are the standard
-        // dynamical split; their mass_frac sum to 0.9, the missing 0.1
-        // is the dust tail that `spawn_belts` adds to every outer belt.
-        let kui_lo = (a_giant_outer * 1.5)
-            .max(snow_line_au * 10.0)
-            .max(a_ice * 1.3)
-            .max(a_lo_au);
-        let kui_hi = (snow_line_au * 40.0).min(a_hi_au);
-        if kui_hi > kui_lo {
-            let span = kui_hi - kui_lo;
-            // Resonant objects need a perturber: 3:2 and 2:1 resonances of
-            // the cold Neptune. Without a fit, they become hot classicals.
-            let a_32 = a_ice * 1.5f64.powf(2.0 / 3.0);
-            let a_21 = a_ice * 2.0f64.powf(2.0 / 3.0);
-            let res_ok = a_ice > 0.0 && a_32 >= kui_lo && a_21 <= kui_hi;
-            let (r_kind, lo1, hi1, lo2, hi2) = if res_ok {
-                (
-                    BodyOrigin::KuiperResonant,
-                    a_32 * 0.98,
-                    a_32 * 1.02,
-                    a_21 * 0.98,
-                    a_21 * 1.02,
-                )
-            } else {
-                (BodyOrigin::KuiperHot, kui_lo, kui_hi, kui_lo, kui_hi)
-            };
-            let pop = |kind, a_lo, a_hi, mass_frac, e_sigma, q_frac| OuterPopulation {
-                kind,
-                a_lo_au: a_lo,
-                a_hi_au: a_hi,
-                mass_frac,
-                e_sigma,
-                q_frac,
-                plaw: MASS_PLAW_KUIPER,
-                m_min: MASS_KUIPER_MIN,
-                m_max: MASS_KUIPER_MAX,
-            };
-            spec.outer = Some(OuterBelt {
-                populations: vec![
-                    // Cold classicals: tight eccentricities, inner 40% of
-                    // the belt.
-                    pop(
-                        BodyOrigin::KuiperCold,
-                        kui_lo,
-                        kui_lo + span * 0.4,
-                        0.40,
-                        0.03,
-                        None,
-                    ),
-                    // Hot classicals: wider eccentricities, full span.
-                    pop(BodyOrigin::KuiperHot, kui_lo, kui_hi, 0.30, 0.15, None),
-                    // Resonant objects (Plutinos etc.).
-                    pop(r_kind, lo1, hi1, 0.07, 0.10, None),
-                    pop(r_kind, lo2, hi2, 0.03, 0.10, None),
-                    // Scattered: pericentre tied to the outer giant.
-                    pop(
-                        BodyOrigin::KuiperScattered,
-                        kui_lo,
-                        kui_hi,
-                        0.10,
-                        0.30,
-                        Some(a_giant_outer),
-                    ),
-                ],
-            });
-        }
+    if arch.has_hot_jupiter {
+        hot_jupiter_belt(&mut spec, &arch, &window, (m_sun, feh, age_gyr), rng);
+    } else if arch.n_compact >= 4 && arch.giants.is_empty() {
+        compact_chain_belt(&mut spec, &window, (m_sun, feh, age_gyr), rng);
+    } else if arch.giants.is_empty() && m_sun > 1.2 && age_gyr < 0.5 {
+        young_debris_disk_belt(&mut spec, &window, (m_sun, feh, age_gyr), rng);
+    } else if !arch.giants.is_empty() {
+        solar_type_belt(&mut spec, &arch, &window, (m_sun, feh, age_gyr), rng);
     } else {
-        // Sparse: old, quiet, giant-poor system. Its inner belt was cleared
-        // by migration or never formed, but a modest outer belt persists.
-        // This is what ALMA sees around old K dwarfs (Matrà 2018).
-        spec.archetype = BeltArchetype::Sparse;
-        spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.3;
-        let start = (snow_line_au * 5.0).max(a_lo_au);
-        let end = (start * 5.0).min(a_hi_au);
-        if end > start {
-            spec.outer = single_outer(start, end, 0.10, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
-        }
+        sparse_belt(&mut spec, &window, (m_sun, feh, age_gyr), rng);
     }
 
     spec
+}
+
+/// The caller's radial window for belts, plus the star's snow line.
+struct RadialWindow {
+    lo_au: f64,
+    hi_au: f64,
+    snow_line_au: f64,
+}
+
+/// Summary of a planet list: everything the belt archetypes branch on.
+/// Computed in one pass so the decision tree stays linear in planet count.
+struct PlanetSummary {
+    /// `(mass_earth, a_au)` of every planet above 50 M⊕.
+    giants: Vec<(f64, f64)>,
+    has_hot_jupiter: bool,
+    a_giant_inner: f64,
+    a_giant_outer: f64,
+    /// Small planets inside 1 AU (the TRAPPIST-1 / Kepler-90 regime).
+    n_compact: usize,
+    /// Outer edge of the compact chain inside the snow line.
+    a_compact: f64,
+    /// Outermost cold Neptune-class planet: sets the Kuiper resonances.
+    a_ice: f64,
+}
+
+impl PlanetSummary {
+    /// `planets` is `(index, mass_earth, a_au)`.
+    fn of(planets: &[(usize, f64, f64)], snow_line_au: f64) -> Self {
+        let mut sum = Self {
+            giants: Vec::new(),
+            has_hot_jupiter: false,
+            a_giant_inner: f64::INFINITY,
+            a_giant_outer: 0.0,
+            n_compact: 0,
+            a_compact: 0.0,
+            a_ice: 0.0,
+        };
+        for &(_, m, a) in planets {
+            if (10.0..=50.0).contains(&m) && a >= snow_line_au && a > sum.a_ice {
+                sum.a_ice = a;
+            }
+            if m > 50.0 {
+                sum.giants.push((m, a));
+                if a < 0.1 {
+                    sum.has_hot_jupiter = true;
+                }
+                sum.a_giant_inner = sum.a_giant_inner.min(a);
+                sum.a_giant_outer = sum.a_giant_outer.max(a);
+            }
+            // Only planets inside the snow line belong to the compact chain.
+            // A cold Neptune must not push the asteroid belt outward.
+            if m <= 30.0 && a < snow_line_au {
+                sum.a_compact = sum.a_compact.max(a);
+                if a < 1.0 {
+                    sum.n_compact += 1;
+                }
+            }
+        }
+        sum
+    }
+}
+
+/// `(star mass in M☉, [Fe/H], age in Gyr)`: what the belt-mass laws take.
+type StarProps = (f64, f64, f64);
+
+/// An outer belt modelled as one cold classical population.
+fn single_cold_belt(a_lo: f64, a_hi: f64, e_sigma: f64, m_min: f64, m_max: f64) -> Option<OuterBelt> {
+    Some(OuterBelt {
+        populations: vec![OuterPopulation {
+            kind: BodyOrigin::KuiperCold,
+            a_lo_au: a_lo,
+            a_hi_au: a_hi,
+            mass_frac: 1.0,
+            e_sigma,
+            q_frac: None,
+            plaw: MASS_PLAW_KUIPER,
+            m_min,
+            m_max,
+        }],
+    })
+}
+
+/// Hot Jupiters: the giant migrated inward, scattering whatever belt was
+/// inside its present orbit. Both budgets shrink by 10x and the surviving
+/// outer belt is a narrow annulus just beyond the giant.
+fn hot_jupiter_belt(
+    spec: &mut BeltSpec,
+    arch: &PlanetSummary,
+    win: &RadialWindow,
+    (m_sun, feh, age_gyr): StarProps,
+    rng: &mut XorShift,
+) {
+    spec.archetype = BeltArchetype::HotJupiter;
+    let start = (arch.a_giant_inner * 3.0).max(10.0).max(win.lo_au);
+    let end = (start * 5.0).min(win.hi_au);
+    if end > start {
+        spec.outer = single_cold_belt(start, end, 0.05, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
+    }
+    spec.total_mass *= 0.1;
+    spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
+}
+
+/// Compact chains: four or more small planets inside 1 AU. Same depletion
+/// as hot Jupiters; the belt sits just outside the snow line.
+fn compact_chain_belt(
+    spec: &mut BeltSpec,
+    win: &RadialWindow,
+    (m_sun, feh, age_gyr): StarProps,
+    rng: &mut XorShift,
+) {
+    spec.archetype = BeltArchetype::CompactChain;
+    let start = (win.snow_line_au * 5.0).max(win.lo_au);
+    let end = (start * 3.0).min(win.hi_au);
+    if end > start {
+        spec.outer = single_cold_belt(start, end, 0.08, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
+    }
+    spec.total_mass *= 0.1;
+    spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.1;
+}
+
+/// Young, massive, giant-free systems host the bright debris disks that
+/// ALMA / Herschel see (Beta Pic analogues). Two orders of magnitude above
+/// baseline, with an unusually low eccentricity: the dust is dynamically cold.
+fn young_debris_disk_belt(
+    spec: &mut BeltSpec,
+    win: &RadialWindow,
+    (m_sun, feh, age_gyr): StarProps,
+    rng: &mut XorShift,
+) {
+    spec.archetype = BeltArchetype::YoungDebrisDisk;
+    // Disk radius follows stellar luminosity: 8 to 16 snow lines.
+    let (start, end) = (
+        win.lo_au.max(win.snow_line_au * 8.0),
+        win.hi_au.min(win.snow_line_au * 16.0),
+    );
+    if end > start {
+        spec.outer = single_cold_belt(start, end, 0.02, 1e-3, 1e-1);
+    }
+    spec.total_mass *= 100.0;
+    spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 100.0;
+}
+
+/// Sparse: old, quiet, giant-poor. The inner belt was cleared by migration
+/// or never formed, but a modest outer belt persists (ALMA, old K dwarfs;
+/// Matrà 2018).
+fn sparse_belt(
+    spec: &mut BeltSpec,
+    win: &RadialWindow,
+    (m_sun, feh, age_gyr): StarProps,
+    rng: &mut XorShift,
+) {
+    spec.archetype = BeltArchetype::Sparse;
+    spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng) * 0.3;
+    let start = (win.snow_line_au * 5.0).max(win.lo_au);
+    let end = (start * 5.0).min(win.hi_au);
+    if end > start {
+        spec.outer = single_cold_belt(start, end, 0.10, MASS_KUIPER_MIN, MASS_KUIPER_MAX);
+    }
+}
+
+/// Solar analogue: giants present, no hot Jupiter. The canonical
+/// four-population Kuiper belt plus a main asteroid belt, Trojans at the
+/// most massive giant, and Kirkwood gaps at that giant's resonances.
+fn solar_type_belt(
+    spec: &mut BeltSpec,
+    arch: &PlanetSummary,
+    win: &RadialWindow,
+    (m_sun, feh, age_gyr): StarProps,
+    rng: &mut XorShift,
+) {
+    spec.archetype = BeltArchetype::SolarType;
+    spec.outer_mass = belt_mass_earth_outer(m_sun, feh, age_gyr, rng);
+    // Computed before the inner belt so its mass fraction can take the
+    // remainder of `total_mass`.
+    let trojan_frac = add_trojans_and_gaps(spec, &arch.giants);
+    spec.inner = main_asteroid_belt(arch, win, trojan_frac);
+    spec.outer = classical_kuiper_belt(arch, win);
+}
+
+/// Only the single most massive giant gets a substantial Trojan cloud. Real
+/// Jupiter Trojans are ~8% of the main belt; Saturn's are unobservable and
+/// Neptune's likely a few per cent of Jupiter's. Below ~30 M⊕ the L4/L5
+/// resonance is not deep enough to capture a cloud at all. Also adds the
+/// Kirkwood gaps. Returns the Trojan mass fraction (0 when there is none).
+fn add_trojans_and_gaps(spec: &mut BeltSpec, giants: &[(f64, f64)]) -> f64 {
+    let Some(&(gm, ga)) = giants
+        .iter()
+        .filter(|(m, a)| *m >= 30.0 && *a > 0.3)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+    else {
+        return 0.0;
+    };
+    let m_jup = gm / JUPITER_MASS;
+    let frac = (0.08 * m_jup.powf(1.5)).clamp(0.005, 0.10);
+    spec.trojans.push(Trojan { giant_a_au: ga, leading_frac: 0.5, mass_frac: frac });
+    // `kirkwood_gaps` assumes a Jupiter-mass giant; width ~ mu^(2/7).
+    let gap_scale = m_jup.powf(2.0 / 7.0);
+    spec.gaps.extend(kirkwood_gaps(ga).into_iter().map(|g| Gap {
+        width_au: g.width_au * gap_scale,
+        ..g
+    }));
+    frac
+}
+
+/// The main belt sits between the outermost compact planet and the
+/// innermost giant, never inside the snow line or outside the caller's
+/// window. `total_mass` is the asteroid belt itself; Trojans and Hildas take
+/// their share first and the inner belt gets the remainder, so a Jupiter
+/// analogue spawns the belt plus an 8% Trojan cloud without over-spending
+/// the calibrated total.
+fn main_asteroid_belt(arch: &PlanetSummary, win: &RadialWindow, trojan_frac: f64) -> Option<InnerBelt> {
+    let lo = (arch.a_compact * 1.2).max(win.snow_line_au * 0.7).max(win.lo_au);
+    let hi = (arch.a_giant_inner * 0.6).min(win.hi_au);
+    if hi <= lo {
+        return None;
+    }
+    Some(InnerBelt {
+        a_lo_au: lo,
+        a_hi_au: hi,
+        mass_frac: (1.0 - trojan_frac - belts::HILDA_MASS_FRAC).max(0.0),
+        e_sigma: 0.10,
+        plaw: MASS_PLAW_ASTEROID,
+        m_min: MASS_ASTEROID_MIN,
+        m_max: MASS_ASTEROID_MAX,
+    })
+}
+
+/// The Kuiper belt starts just outside the outermost giant but at least 10
+/// snow lines out. The four populations are the standard dynamical split;
+/// their `mass_frac` sum to 0.9, the missing 0.1 being the dust tail that
+/// `spawn_belts` adds to every outer belt.
+fn classical_kuiper_belt(arch: &PlanetSummary, win: &RadialWindow) -> Option<OuterBelt> {
+    let lo = (arch.a_giant_outer * 1.5)
+        .max(win.snow_line_au * 10.0)
+        .max(arch.a_ice * 1.3)
+        .max(win.lo_au);
+    let hi = (win.snow_line_au * 40.0).min(win.hi_au);
+    if hi <= lo {
+        return None;
+    }
+    let span = hi - lo;
+    // Resonant objects need a perturber: 3:2 and 2:1 resonances of the cold
+    // Neptune. Without a fit, they become hot classicals.
+    let a_32 = arch.a_ice * 1.5f64.powf(2.0 / 3.0);
+    let a_21 = arch.a_ice * 2.0f64.powf(2.0 / 3.0);
+    let res_ok = arch.a_ice > 0.0 && a_32 >= lo && a_21 <= hi;
+    let (r_kind, lo1, hi1, lo2, hi2) = if res_ok {
+        (BodyOrigin::KuiperResonant, a_32 * 0.98, a_32 * 1.02, a_21 * 0.98, a_21 * 1.02)
+    } else {
+        (BodyOrigin::KuiperHot, lo, hi, lo, hi)
+    };
+    let pop = |kind, a_lo, a_hi, mass_frac, e_sigma, q_frac| OuterPopulation {
+        kind,
+        a_lo_au: a_lo,
+        a_hi_au: a_hi,
+        mass_frac,
+        e_sigma,
+        q_frac,
+        plaw: MASS_PLAW_KUIPER,
+        m_min: MASS_KUIPER_MIN,
+        m_max: MASS_KUIPER_MAX,
+    };
+    Some(OuterBelt {
+        populations: vec![
+            // Cold classicals: tight eccentricities, inner 40% of the belt.
+            pop(BodyOrigin::KuiperCold, lo, lo + span * 0.4, 0.40, 0.03, None),
+            // Hot classicals: wider eccentricities, full span.
+            pop(BodyOrigin::KuiperHot, lo, hi, 0.30, 0.15, None),
+            // Resonant objects (Plutinos etc.).
+            pop(r_kind, lo1, hi1, 0.07, 0.10, None),
+            pop(r_kind, lo2, hi2, 0.03, 0.10, None),
+            // Scattered: pericentre tied to the outer giant.
+            pop(BodyOrigin::KuiperScattered, lo, hi, 0.10, 0.30, Some(arch.a_giant_outer)),
+        ],
+    })
 }
 
 /// Belt around an evolved remnant (white dwarf, neutron star, black hole).
@@ -1017,153 +1063,68 @@ pub fn solar_system_preset() -> SystemPreset {
 /// UI keystroke.
 pub fn load_presets() -> &'static [(String, SystemPreset)] {
     static LIB: OnceLock<Vec<(String, SystemPreset)>> = OnceLock::new();
-    LIB.get_or_init(|| {
-        let sources: &[(&str, &str)] = &[
-            (
-                "2mass_j1207",
-                include_str!("../../assets/presets/2mass_j1207.json"),
-            ),
-            (
-                "hot_jupiter",
-                include_str!("../../assets/presets/51_pegasi_b.json"),
-            ),
-            (
-                "55_cancri",
-                include_str!("../../assets/presets/55_cancri.json"),
-            ),
-            ("algol", include_str!("../../assets/presets/algol.json")),
-            (
-                "alpha_centauri",
-                include_str!("../../assets/presets/alpha_centauri.json"),
-            ),
-            (
-                "au_microscopii",
-                include_str!("../../assets/presets/au_microscopii.json"),
-            ),
-            (
-                "beta_pictoris",
-                include_str!("../../assets/presets/beta_pictoris.json"),
-            ),
-            (
-                "cygnus_x1",
-                include_str!("../../assets/presets/cygnus_x1.json"),
-            ),
-            (
-                "epsilon_eridani",
-                include_str!("../../assets/presets/epsilon_eridani.json"),
-            ),
-            (
-                "fomalhaut",
-                include_str!("../../assets/presets/fomalhaut.json"),
-            ),
-            (
-                "gaia_bh1",
-                include_str!("../../assets/presets/gaia_bh1.json"),
-            ),
-            (
-                "gaia_bh3",
-                include_str!("../../assets/presets/gaia_bh3.json"),
-            ),
-            (
-                "gamma_cephei",
-                include_str!("../../assets/presets/gamma_cephei.json"),
-            ),
-            (
-                "gliese_876",
-                include_str!("../../assets/presets/gliese_876.json"),
-            ),
-            (
-                "hd_40307",
-                include_str!("../../assets/presets/hd_40307.json"),
-            ),
-            (
-                "hd_80606",
-                include_str!("../../assets/presets/hd_80606.json"),
-            ),
-            ("hl_tau", include_str!("../../assets/presets/hl_tau.json")),
-            ("hr_8799", include_str!("../../assets/presets/hr_8799.json")),
-            ("kelt_9", include_str!("../../assets/presets/kelt_9.json")),
-            (
-                "kepler_16",
-                include_str!("../../assets/presets/kepler_16.json"),
-            ),
-            (
-                "kepler_1625",
-                include_str!("../../assets/presets/kepler_1625.json"),
-            ),
-            (
-                "kepler_36",
-                include_str!("../../assets/presets/kepler_36.json"),
-            ),
-            (
-                "kepler_47",
-                include_str!("../../assets/presets/kepler_47.json"),
-            ),
-            (
-                "kepler_51",
-                include_str!("../../assets/presets/kepler_51.json"),
-            ),
-            (
-                "kepler_90",
-                include_str!("../../assets/presets/kepler_90.json"),
-            ),
-            (
-                "luhman_16",
-                include_str!("../../assets/presets/luhman_16.json"),
-            ),
-            ("pds_70", include_str!("../../assets/presets/pds_70.json")),
-            (
-                "psr_b1257_plus_12",
-                include_str!("../../assets/presets/psr_b1257_plus_12.json"),
-            ),
-            (
-                "psr_b1620_26",
-                include_str!("../../assets/presets/psr_b1620_26.json"),
-            ),
-            (
-                "sgr_a_star",
-                include_str!("../../assets/presets/sgr_a_star.json"),
-            ),
-            ("sirius", include_str!("../../assets/presets/sirius.json")),
-            (
-                "solar_system",
-                include_str!("../../assets/presets/solar_system.json"),
-            ),
-            (
-                "trappist_1",
-                include_str!("../../assets/presets/trappist_1.json"),
-            ),
-            ("vega", include_str!("../../assets/presets/vega.json")),
-            (
-                "wasp_12b",
-                include_str!("../../assets/presets/wasp_12b.json"),
-            ),
-            (
-                "wd_1145_plus_017",
-                include_str!("../../assets/presets/wd_1145_plus_017.json"),
-            ),
-            (
-                "wd_1856_534",
-                include_str!("../../assets/presets/wd_1856_534.json"),
-            ),
-        ];
-
-        // Every preset is guaranteed to parse: the JSON is embedded at
-        // build time, so a parse error here is a build regression, not a
-        // runtime condition. The panic message names the offending slug.
-        sources
-            .iter()
-            .map(|(name, json)| {
-                let preset: SystemPreset = serde_json::from_str(json)
-                    .unwrap_or_else(|e| panic!("failed to parse preset {name}: {e}"));
-                if let Some(bp) = &preset.belts {
-                    let _ = bp.to_spec(); // panics on an unknown belt kind
-                }
-                ((*name).to_string(), preset)
-            })
-            .collect()
-    })
+    LIB.get_or_init(|| PRESET_SOURCES.iter().map(|(name, json)| parse_preset(name, json)).collect())
 }
+
+/// Every preset is guaranteed to parse: the JSON is embedded at build time, so
+/// a parse error here is a build regression, not a runtime condition. The
+/// panic message names the offending slug.
+fn parse_preset(name: &str, json: &str) -> (String, SystemPreset) {
+    let preset: SystemPreset = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("failed to parse preset {name}: {e}"));
+    if let Some(bp) = &preset.belts {
+        let _ = bp.to_spec(); // panics on an unknown belt kind
+    }
+    (name.to_string(), preset)
+}
+
+/// The embedded JSON of `assets/presets/<file>.json`.
+macro_rules! embed {
+    ($file:literal) => {
+        include_str!(concat!("../../assets/presets/", $file, ".json"))
+    };
+}
+
+/// (slug, JSON) pairs in display order.
+const PRESET_SOURCES: &[(&str, &str)] = &[
+    ("2mass_j1207", embed!("2mass_j1207")),
+    ("hot_jupiter", embed!("51_pegasi_b")),
+    ("55_cancri", embed!("55_cancri")),
+    ("algol", embed!("algol")),
+    ("alpha_centauri", embed!("alpha_centauri")),
+    ("au_microscopii", embed!("au_microscopii")),
+    ("beta_pictoris", embed!("beta_pictoris")),
+    ("cygnus_x1", embed!("cygnus_x1")),
+    ("epsilon_eridani", embed!("epsilon_eridani")),
+    ("fomalhaut", embed!("fomalhaut")),
+    ("gaia_bh1", embed!("gaia_bh1")),
+    ("gaia_bh3", embed!("gaia_bh3")),
+    ("gamma_cephei", embed!("gamma_cephei")),
+    ("gliese_876", embed!("gliese_876")),
+    ("hd_40307", embed!("hd_40307")),
+    ("hd_80606", embed!("hd_80606")),
+    ("hl_tau", embed!("hl_tau")),
+    ("hr_8799", embed!("hr_8799")),
+    ("kelt_9", embed!("kelt_9")),
+    ("kepler_16", embed!("kepler_16")),
+    ("kepler_1625", embed!("kepler_1625")),
+    ("kepler_36", embed!("kepler_36")),
+    ("kepler_47", embed!("kepler_47")),
+    ("kepler_51", embed!("kepler_51")),
+    ("kepler_90", embed!("kepler_90")),
+    ("luhman_16", embed!("luhman_16")),
+    ("pds_70", embed!("pds_70")),
+    ("psr_b1257_plus_12", embed!("psr_b1257_plus_12")),
+    ("psr_b1620_26", embed!("psr_b1620_26")),
+    ("sgr_a_star", embed!("sgr_a_star")),
+    ("sirius", embed!("sirius")),
+    ("solar_system", embed!("solar_system")),
+    ("trappist_1", embed!("trappist_1")),
+    ("vega", embed!("vega")),
+    ("wasp_12b", embed!("wasp_12b")),
+    ("wd_1145_plus_017", embed!("wd_1145_plus_017")),
+    ("wd_1856_534", embed!("wd_1856_534")),
+];
 
 /// Look up a preset by slug. Returns an owned clone, so the caller can
 /// mutate `Bodies` while the returned preset is still alive (the preset
@@ -1214,6 +1175,45 @@ pub(super) fn spawn_from_preset_bodies(
     phase_seed: u128,
 ) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
+    reset_for_preset(b, preset, phase_seed);
+    let star = place_primary_star(b, preset);
+    let (hosts, star_idxs) = place_companions(b, preset, star, &mut warnings);
+
+    let ctx = PlanetContext {
+        star,
+        snow_line: snow_line_for(b, star),
+        // Planets farther than this from the primary are treated as
+        // circumbinary and orbit the host barycentre instead. `HW_MARGIN_P`
+        // is the standard P-type stability margin for a binary, so the choice
+        // of reference frame matches the physical stability boundary.
+        p_type_cutoff: preset
+            .companions
+            .first()
+            .map(|c| c.a_au * HW_MARGIN_P)
+            .unwrap_or(f64::INFINITY),
+        hosts: &hosts,
+    };
+    for p in &preset.planets {
+        place_preset_planet(b, preset, &ctx, p, &mut warnings);
+    }
+    if let Some(belt_preset) = &preset.belts {
+        spawn_preset_belts(b, preset, belt_preset, &ctx, &star_idxs, &mut warnings);
+    }
+    warnings
+}
+
+/// Where the preset's planets and belts go: the primary, its snow line, the
+/// circumbinary cutoff and the named hosts `(name, body index, slot)` (slot
+/// is `None` for the primary).
+struct PlanetContext<'a> {
+    star: usize,
+    snow_line: f64,
+    p_type_cutoff: f64,
+    hosts: &'a [(String, usize, Option<usize>)],
+}
+
+/// Start from an empty `Bodies` sized for the whole preset.
+fn reset_for_preset(b: &mut Bodies, preset: &SystemPreset, phase_seed: u128) {
     let n_stars = 1 + preset.companions.len();
     let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
     // Reserve enough capacity for the belt spawn too. Belt budgets are
@@ -1228,18 +1228,28 @@ pub(super) fn spawn_from_preset_bodies(
     *b = Bodies::with_capacity(n_stars + preset.planets.len() + n_moons + belt_capacity);
     b.rng = XorShift::new(phase_seed);
     b.metallicity = preset.star.metallicity;
+}
 
-    // Primary star sits at the origin. Companions and planets are placed
-    // relative to it, and the COM is recentred in the finalisation step.
-    let star_kind = parse_body_kind(preset.star.kind.as_deref(), preset.star.mass_earth);
-    let star = b.push(0.0, 0.0, 0.0, 0.0, preset.star.mass_earth, star_kind);
+/// The primary star sits at the origin. Companions and planets are placed
+/// relative to it, and the COM is recentred in the finalisation step.
+fn place_primary_star(b: &mut Bodies, preset: &SystemPreset) -> usize {
+    let kind = parse_body_kind(preset.star.kind.as_deref(), preset.star.mass_earth);
+    let star = b.push(0.0, 0.0, 0.0, 0.0, preset.star.mass_earth, kind);
     b.name[star] = preset.star.name.clone();
     b.age_gyr[star] = preset.star.age_gyr;
     b.set_mass(star, preset.star.mass_earth);
+    star
+}
 
-    // (name, body index, companion slot); slot is None for the primary.
-    let mut hosts: Vec<(String, usize, Option<usize>)> = Vec::with_capacity(n_stars);
-    let mut star_idxs: Vec<usize> = vec![star];
+/// Place the companion stars. Returns the named hosts and every star index.
+fn place_companions(
+    b: &mut Bodies,
+    preset: &SystemPreset,
+    star: usize,
+    warnings: &mut Vec<String>,
+) -> (Vec<(String, usize, Option<usize>)>, Vec<usize>) {
+    let mut hosts = Vec::with_capacity(1 + preset.companions.len());
+    let mut star_idxs = vec![star];
     if let Some(n) = &preset.star.name {
         hosts.push((n.clone(), star, None));
     }
@@ -1254,188 +1264,243 @@ pub(super) fn spawn_from_preset_bodies(
         hosts.push((comp.name.clone(), ci, Some(k)));
         star_idxs.push(ci);
     }
+    (hosts, star_idxs)
+}
 
-    // Planets farther than this from the primary are treated as
-    // circumbinary and orbit the host barycentre instead. `HW_MARGIN_P`
-    // is the standard P-type stability margin for a binary, so the choice
-    // of reference frame matches the physical stability boundary.
-    let p_type_cutoff = preset
-        .companions
-        .first()
-        .map(|c| c.a_au * HW_MARGIN_P)
-        .unwrap_or(f64::INFINITY);
-    let snow_line = snow_line_for(b, star);
+/// Which body a planet orbits.
+struct ResolvedHost {
+    index: usize,
+    slot: Option<usize>,
+    /// The preset forced a circumbinary orbit around the barycentre.
+    forced_p_type: bool,
+}
 
-    for p in &preset.planets {
-        // `phase: Some(..)` pins the mean anomaly without consuming an
-        // RNG draw. This matters when a preset wants e.g. a comet exactly
-        // at perihelion without shifting the phase stream for any body
-        // after it (which would perturb reproducibility of other bodies).
-        let angle = if let Some(ph) = p.phase {
-            ph * std::f64::consts::TAU
-        } else {
-            b.rng.next_f64() * std::f64::consts::TAU
-        };
-        let mut host_idx = star;
-        let mut host_slot: Option<usize> = None;
-        let mut forced_p = false;
-        match p.host.as_deref() {
-            None => {}
-            Some("barycentre") | Some("barycenter") => forced_p = true,
-            Some(name) => match hosts.iter().find(|(n, _, _)| n == name) {
-                Some(&(_, i, slot)) => {
-                    host_idx = i;
-                    host_slot = slot;
-                }
-                None => warnings.push(format!(
-                    "preset: planet {} names unknown host '{name}'; using the primary",
-                    p.name
-                )),
-            },
+/// Look up the planet's named host, warning about unknown names and about
+/// planets beyond the S-type stability limit of their host.
+fn resolve_planet_host(
+    preset: &SystemPreset,
+    ctx: &PlanetContext,
+    p: &PlanetPreset,
+    warnings: &mut Vec<String>,
+) -> ResolvedHost {
+    let mut host = ResolvedHost { index: ctx.star, slot: None, forced_p_type: false };
+    match p.host.as_deref() {
+        None => {}
+        Some("barycentre") | Some("barycenter") => host.forced_p_type = true,
+        Some(name) => match ctx.hosts.iter().find(|(n, _, _)| n == name) {
+            Some(&(_, i, slot)) => {
+                host.index = i;
+                host.slot = slot;
+            }
+            None => warnings.push(format!(
+                "preset: planet {} names unknown host '{name}'; using the primary",
+                p.name
+            )),
+        },
+    }
+    if p.host.is_some() && !host.forced_p_type {
+        if let Some(limit) = s_type_limit_au(preset, host.slot) {
+            if p.a_au > limit {
+                warnings.push(format!(
+                    "preset: {} (a = {:.3} AU) is beyond the S-type stability limit of {:.3} AU for its host",
+                    p.name, p.a_au, limit
+                ));
+            }
         }
-        if p.host.is_some() && !forced_p {
-            if let Some(limit) = s_type_limit_au(preset, host_slot) {
-                if p.a_au > limit {
+    }
+    host
+}
+
+/// Place one preset planet with its moons. The RNG draw order is part of the
+/// reproducibility contract: phase, density, then per moon phase and density.
+fn place_preset_planet(
+    b: &mut Bodies,
+    preset: &SystemPreset,
+    ctx: &PlanetContext,
+    p: &PlanetPreset,
+    warnings: &mut Vec<String>,
+) {
+    // `phase: Some(..)` pins the mean anomaly without consuming an RNG draw.
+    // This matters when a preset wants e.g. a comet exactly at perihelion
+    // without shifting the phase stream for any body after it (which would
+    // perturb reproducibility of other bodies).
+    let angle = match p.phase {
+        Some(ph) => ph * std::f64::consts::TAU,
+        None => b.rng.next_f64() * std::f64::consts::TAU,
+    };
+    let host = resolve_planet_host(preset, ctx, p, warnings);
+    let circumbinary = host.forced_p_type || (p.host.is_none() && p.a_au > ctx.p_type_cutoff);
+    let idx = if circumbinary {
+        push_circumbinary(b, p.a_au, p.e, p.m_earth, angle)
+    } else {
+        // `omega_deg` is a longitude of periapsis when a node is given.
+        let omega = if p.node_deg == 0.0 {
+            p.omega_deg.to_radians()
+        } else {
+            (p.omega_deg - p.node_deg).to_radians()
+        };
+        push_orbit_incl(
+            b,
+            host.index,
+            p.a_au,
+            p.e,
+            p.m_earth,
+            angle,
+            omega,
+            p.inc_deg.to_radians(),
+            p.node_deg.to_radians(),
+        )
+    };
+    let planet_snow_line = if circumbinary || host.index == ctx.star {
+        ctx.snow_line
+    } else {
+        snow_line_for(b, host.index)
+    };
+    b.name[idx] = Some(p.name.clone());
+    if p.is_dwarf {
+        apply_dwarf_flag(b, idx, warnings);
+    }
+    let origin = match p.origin.as_deref() {
+        Some("comet") => BodyOrigin::Comet,
+        Some("rogue") => BodyOrigin::RoguePlanet,
+        _ => BodyOrigin::Spawned,
+    };
+    b.origin[idx] = origin;
+    b.class[idx] = planet_class(p.m_earth, origin, p.a_au, planet_snow_line);
+    let cls = b.class[idx];
+    let rho = p.density_gcc.unwrap_or_else(|| draw_density(&mut b.rng, cls));
+    b.bulk_density[idx] = rho;
+    b.r[idx] = b.radius_now(idx);
+
+    place_preset_moons(b, p, idx, host.index, circumbinary, warnings);
+}
+
+/// Class comes from the body's position relative to the snow line, except
+/// comets which are always Icy regardless of where they sit, and gas giants,
+/// which are Icy wherever they sit (same rule as `spawn_planet`).
+fn planet_class(m_earth: f64, origin: BodyOrigin, a_au: f64, snow_line_au: f64) -> BodyClass {
+    if m_earth >= GIANT_DENSITY_M_MIN && matches!(origin, BodyOrigin::Spawned) {
+        BodyClass::Icy
+    } else {
+        class_for(origin, a_au, snow_line_au)
+    }
+}
+
+/// Place a planet's moons in its orbital plane (plus any preset tilt).
+fn place_preset_moons(
+    b: &mut Bodies,
+    p: &PlanetPreset,
+    planet: usize,
+    host_idx: usize,
+    circumbinary: bool,
+    warnings: &mut Vec<String>,
+) {
+    let mut group = vec![planet];
+    for moon in &p.moons {
+        let mangle = b.rng.next_f64() * std::f64::consts::TAU;
+        let normal = if circumbinary {
+            [0.0, 0.0, 1.0]
+        } else {
+            let host_state = [
+                b.x[host_idx],
+                b.y[host_idx],
+                b.z[host_idx],
+                b.vx[host_idx],
+                b.vy[host_idx],
+                b.vz[host_idx],
+            ];
+            orbit_normal(b, planet, host_state)
+        };
+        let tilt = (moon.inc_deg.to_radians(), moon.node_deg.to_radians());
+        let mi = push_orbit_group(b, &group, moon.a_au, moon.e, moon.m_earth, mangle, normal, tilt);
+        group.push(mi);
+        b.name[mi] = Some(moon.name.clone());
+        if moon.is_dwarf {
+            apply_dwarf_flag(b, mi, warnings);
+        }
+        // Moons inherit the parent planet's class, so Earth's Moon is Rocky
+        // but Ganymede is Icy. This matches the physical trend where a
+        // moon's composition is set by its formation location in the
+        // circumplanetary disk, not by heliocentric distance.
+        b.class[mi] = b.class[planet];
+        let mcls = b.class[mi];
+        b.bulk_density[mi] = moon
+            .density_gcc
+            .unwrap_or_else(|| draw_density(&mut b.rng, mcls));
+        b.r[mi] = b.radius_now(mi);
+    }
+}
+
+/// `(x, y, vx, vy, mass)` of the body a belt is centred on.
+type BeltCentre = (f64, f64, f64, f64, f64);
+
+/// Spawn the preset's belts around their host, warning when they sit inside
+/// a stability limit or name an unknown host.
+fn spawn_preset_belts(
+    b: &mut Bodies,
+    preset: &SystemPreset,
+    belt_preset: &BeltPreset,
+    ctx: &PlanetContext,
+    star_idxs: &[usize],
+    warnings: &mut Vec<String>,
+) {
+    let spec = belt_preset.to_spec();
+    let belt_budget = belt_preset.belt_budget.unwrap_or(PRESET_BELT_BUDGET);
+    let (centre, belt_snow_line) = belt_centre(b, preset, belt_preset, ctx, star_idxs, warnings);
+    // Swap the RNG out and back so belt draws do not perturb the planet-draw
+    // sequence. Reproducibility of planet phases across belt-presence
+    // changes is a hard requirement for preset tests.
+    let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
+    spawn_belts(b, centre, &spec, belt_snow_line, belt_budget, &mut rng);
+    b.rng = rng;
+}
+
+/// Where the belt is centred, and the snow line to use for it.
+fn belt_centre(
+    b: &Bodies,
+    preset: &SystemPreset,
+    belt_preset: &BeltPreset,
+    ctx: &PlanetContext,
+    star_idxs: &[usize],
+    warnings: &mut Vec<String>,
+) -> (BeltCentre, f64) {
+    let star = ctx.star;
+    let primary_centre = (b.x[star], b.y[star], b.vx[star], b.vy[star], b.m[star]);
+    let extent = belt_extent_au(belt_preset);
+    match belt_preset.host.as_deref() {
+        None => (primary_centre, ctx.snow_line),
+        Some("barycentre") | Some("barycenter") => {
+            if let (Some((lo, _)), Some(limit)) = (extent, p_type_limit_au(preset)) {
+                if lo < limit {
                     warnings.push(format!(
-                        "preset: {} (a = {:.3} AU) is beyond the S-type stability limit of {:.3} AU for its host",
-                        p.name, p.a_au, limit
+                        "preset: circumbinary belt starts at {lo:.1} AU, inside the P-type limit of {limit:.1} AU"
                     ));
                 }
             }
+            (host_barycentre(b, star_idxs), ctx.snow_line)
         }
-        let circumbinary = forced_p || (p.host.is_none() && p.a_au > p_type_cutoff);
-        let idx = if circumbinary {
-            push_circumbinary(b, p.a_au, p.e, p.m_earth, angle)
-        } else {
-            // `omega_deg` is a longitude of periapsis when a node is given.
-            let omega = if p.node_deg == 0.0 {
-                p.omega_deg.to_radians()
-            } else {
-                (p.omega_deg - p.node_deg).to_radians()
-            };
-            push_orbit_incl(
-                b,
-                host_idx,
-                p.a_au,
-                p.e,
-                p.m_earth,
-                angle,
-                omega,
-                p.inc_deg.to_radians(),
-                p.node_deg.to_radians(),
-            )
-        };
-        let planet_snow_line = if circumbinary || host_idx == star {
-            snow_line
-        } else {
-            snow_line_for(b, host_idx)
-        };
-        b.name[idx] = Some(p.name.clone());
-        if p.is_dwarf {
-            apply_dwarf_flag(b, idx, &mut warnings);
-        }
-        let origin = match p.origin.as_deref() {
-            Some("comet") => BodyOrigin::Comet,
-            Some("rogue") => BodyOrigin::RoguePlanet,
-            _ => BodyOrigin::Spawned,
-        };
-        b.origin[idx] = origin;
-        // Class comes from the body's position relative to the snow line,
-        // except comets which are always Icy regardless of where they sit.
-        b.class[idx] = if p.m_earth >= GIANT_DENSITY_M_MIN && matches!(origin, BodyOrigin::Spawned)
-        {
-            // Same rule as `spawn_planet`: gas giants are Icy wherever they sit.
-            BodyClass::Icy
-        } else {
-            class_for(origin, p.a_au, planet_snow_line)
-        };
-        let cls = b.class[idx];
-        let rho = p
-            .density_gcc
-            .unwrap_or_else(|| draw_density(&mut b.rng, cls));
-        b.bulk_density[idx] = rho;
-        b.r[idx] = b.radius_now(idx);
-
-        let mut group = vec![idx];
-        for moon in &p.moons {
-            let mangle = b.rng.next_f64() * std::f64::consts::TAU;
-            // Moons orbit in their planet's orbital plane (plus any preset tilt).
-            let mn = {
-                let c6 = [b.x[host_idx], b.y[host_idx], b.z[host_idx], b.vx[host_idx], b.vy[host_idx], b.vz[host_idx]];
-                if circumbinary {
-                    [0.0, 0.0, 1.0]
-                } else {
-                    orbit_normal(b, idx, c6)
-                }
-            };
-            let mtilt = (moon.inc_deg.to_radians(), moon.node_deg.to_radians());
-            let mi = push_orbit_group(b, &group, moon.a_au, moon.e, moon.m_earth, mangle, mn, mtilt);
-            group.push(mi);
-            b.name[mi] = Some(moon.name.clone());
-            if moon.is_dwarf {
-                apply_dwarf_flag(b, mi, &mut warnings);
-            }
-            // Moons inherit the parent planet's class, so Earth's Moon is
-            // Rocky but Ganymede is Icy. This matches the physical trend
-            // where a moon's composition is set by its formation location
-            // in the circumplanetary disk, not by heliocentric distance.
-            b.class[mi] = b.class[idx];
-            let mcls = b.class[mi];
-            b.bulk_density[mi] = moon
-                .density_gcc
-                .unwrap_or_else(|| draw_density(&mut b.rng, mcls));
-            b.r[mi] = b.radius_now(mi);
-        }
-    }
-
-    if let Some(belt_preset) = &preset.belts {
-        let spec = belt_preset.to_spec();
-        let belt_budget = belt_preset.belt_budget.unwrap_or(PRESET_BELT_BUDGET);
-        let primary_centre = (b.x[star], b.y[star], b.vx[star], b.vy[star], b.m[star]);
-        let extent = belt_extent_au(belt_preset);
-        let (centre, belt_snow_line) = match belt_preset.host.as_deref() {
-            None => (primary_centre, snow_line),
-            Some("barycentre") | Some("barycenter") => {
-                if let (Some((lo, _)), Some(limit)) = (extent, p_type_limit_au(preset)) {
-                    if lo < limit {
+        Some(name) => match ctx.hosts.iter().find(|(n, _, _)| n == name) {
+            Some(&(_, i, slot)) => {
+                if let (Some((_, hi)), Some(limit)) = (extent, s_type_limit_au(preset, slot)) {
+                    if hi > limit {
                         warnings.push(format!(
-                            "preset: circumbinary belt starts at {lo:.1} AU, inside the P-type limit of {limit:.1} AU"
+                            "preset: belt reaches {hi:.1} AU, beyond the S-type limit of {limit:.1} AU for its host"
                         ));
                     }
                 }
-                (host_barycentre(b, &star_idxs), snow_line)
+                (
+                    (b.x[i], b.y[i], b.vx[i], b.vy[i], b.m[i]),
+                    2.7 * luminosity_of(b, i).max(1e-6).sqrt(),
+                )
             }
-            Some(name) => match hosts.iter().find(|(n, _, _)| n == name) {
-                Some(&(_, i, slot)) => {
-                    if let (Some((_, hi)), Some(limit)) = (extent, s_type_limit_au(preset, slot)) {
-                        if hi > limit {
-                            warnings.push(format!(
-                                "preset: belt reaches {hi:.1} AU, beyond the S-type limit of {limit:.1} AU for its host"
-                            ));
-                        }
-                    }
-                    (
-                        (b.x[i], b.y[i], b.vx[i], b.vy[i], b.m[i]),
-                        2.7 * luminosity_of(b, i).max(1e-6).sqrt(),
-                    )
-                }
-                None => {
-                    warnings.push(format!(
-                        "preset: belt names unknown host '{name}'; using the primary"
-                    ));
-                    (primary_centre, snow_line)
-                }
-            },
-        };
-        // Swap the RNG out and back so belt draws do not perturb the
-        // planet-draw sequence. Reproducibility of planet phases across
-        // belt-presence changes is a hard requirement for preset tests.
-        let mut rng = std::mem::replace(&mut b.rng, XorShift::new(1));
-        spawn_belts(b, centre, &spec, belt_snow_line, belt_budget, &mut rng);
-        b.rng = rng;
+            None => {
+                warnings.push(format!(
+                    "preset: belt names unknown host '{name}'; using the primary"
+                ));
+                (primary_centre, ctx.snow_line)
+            }
+        },
     }
-
-    warnings
 }
 
 /// Like `spawn_from_preset`, with the seed that picks each planet's phase.

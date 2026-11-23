@@ -771,6 +771,41 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
     mark_energy(b);
     let (keep, kill) = pick_survivor(b, i, j);
     let total = b.m[keep] + b.m[kill];
+    let (cx, cy, cz) = merge_motion(b, keep, kill, total);
+
+    let verb = if b.kind[keep] != BodyKind::Planet && b.kind[kill] == BodyKind::Planet {
+        "fell into"
+    } else {
+        "merged into"
+    };
+    let text = format!("{} {} {}", tag(b, kill), verb, tag(b, keep));
+
+    let keep_was_star = b.kind[keep] == BodyKind::Star;
+    let keep_kind_before = b.kind[keep];
+    let kill_kind = b.kind[kill];
+    blend_age_and_density(b, keep, kill, total);
+    b.set_mass(keep, total);
+    b.origin[keep] = combine_origin(b.origin[keep], b.origin[kill]);
+    promote_by_mass(b, keep, cx, cy);
+    climb_stellar_ladder(b, keep, cx, cy);
+    reset_clocks_after_merge(b, keep, keep_was_star, keep_kind_before, kill_kind);
+    b.r[keep] = b.radius_now(keep);
+
+    b.dead[kill] = true;
+    b.coalesce_counter[keep] = 0;
+
+    b.stats.merges += 1;
+    if !silent {
+        let flash_r = (b.contact_r(keep) * 5.0).max(0.05);
+        flash_at(b, cx, cy, cz, flash_r);
+        b.log(EventKind::Merge, text, cx, cy);
+    }
+    keep
+}
+
+/// Move `keep` to the pair's centre of mass and momentum, and add the relative
+/// orbital angular momentum about it to the survivor's spin. Returns the centre.
+fn merge_motion(b: &mut Bodies, keep: usize, kill: usize, total: f64) -> (f64, f64, f64) {
     let cx = (b.m[keep] * b.x[keep] + b.m[kill] * b.x[kill]) / total;
     let cy = (b.m[keep] * b.y[keep] + b.m[kill] * b.y[kill]) / total;
     let cz = (b.m[keep] * b.z[keep] + b.m[kill] * b.z[kill]) / total;
@@ -785,13 +820,6 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
         - (b.y[kill] - b.y[keep]) * (b.vx[kill] - b.vx[keep]);
     b.spin[keep] += b.spin[kill] + mu * rl;
 
-    let verb = if b.kind[keep] != BodyKind::Planet && b.kind[kill] == BodyKind::Planet {
-        "fell into"
-    } else {
-        "merged into"
-    };
-    let text = format!("{} {} {}", tag(b, kill), verb, tag(b, keep));
-
     b.x[keep] = cx;
     b.y[keep] = cy;
     b.vx[keep] = cvx;
@@ -801,14 +829,17 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
     b._px[keep] = cx;
     b._py[keep] = cy;
     b._pz[keep] = cz;
-    let keep_was_star = b.kind[keep] == BodyKind::Star;
-    let keep_kind_before = b.kind[keep];
-    let kill_kind = b.kind[kill];
-    // Fractional MS age, clamped just below 1 so a nearly-departed star
-    // does not immediately leave the MS after a merge. For dwarfs the same
-    // ratio is a valid "fraction cooled" proxy; the kind-specific block
-    // below overwrites it once the survivor's final kind is known.
-    let frac_age = |k: usize| -> f64 {
+    (cx, cy, cz)
+}
+
+/// Mass-weight the main-sequence age fraction and the bulk density.
+///
+/// The age fraction is clamped just below 1 so a nearly-departed star does not
+/// immediately leave the MS after a merge. For dwarfs the same ratio is a valid
+/// "fraction cooled" proxy; `reset_clocks_after_merge` overwrites it once the
+/// survivor's final kind is known.
+fn blend_age_and_density(b: &mut Bodies, keep: usize, kill: usize, total: f64) {
+    let frac_age = |b: &Bodies, k: usize| -> f64 {
         let t = star_lifetime_gyr(BodyKind::Star, b.m_init[k]);
         if t.is_finite() && t > 0.0 {
             (b.age_gyr[k] / t).clamp(0.0, 0.99)
@@ -816,36 +847,36 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
             0.0
         }
     };
-    let f = (frac_age(keep) * b.m[keep] + frac_age(kill) * b.m[kill]) / total;
+    let f = (frac_age(b, keep) * b.m[keep] + frac_age(b, kill) * b.m[kill]) / total;
     b.m_init[keep] += b.m_init[kill];
     b.age_gyr[keep] = f * star_lifetime_gyr(BodyKind::Star, b.m_init[keep]);
     if matches!(b.kind[keep], BodyKind::Planet | BodyKind::DwarfPlanet) {
         let rho = (b.m[keep] * b.bulk_density[keep] + b.m[kill] * b.bulk_density[kill]) / total;
         b.bulk_density[keep] = rho;
     }
-    b.set_mass(keep, total);
-    b.origin[keep] = combine_origin(b.origin[keep], b.origin[kill]);
+}
 
+/// Mass-driven promotions of small bodies: rubble to planet, belt body to dwarf planet.
+fn promote_by_mass(b: &mut Bodies, keep: usize, cx: f64, cy: f64) {
     if b.origin[keep].is_rubble() && b.m[keep] >= RUBBLE_PROMOTE_MASS {
         b.origin[keep] = BodyOrigin::Spawned;
         let text = format!("{} grew to planet mass", tag(b, keep));
         b.log(EventKind::Merge, text, cx, cy);
     }
-
-    // Belt classification is driven by mass; a merged belt body that now
-    // exceeds the dwarf-planet mass range is promoted. The threshold is
-    // the same one `spawn` uses, so the two paths agree.
+    // The threshold is the same one `spawn` uses, so the two paths agree.
     if b.origin[keep].is_belt()
         && b.kind[keep] == BodyKind::Planet
         && classify_small_body(b.m[keep]) == BodyKind::DwarfPlanet
     {
         b.kind[keep] = BodyKind::DwarfPlanet;
     }
+}
 
-    // Stellar-evolution ladder. Each transition is followed by a `set_mass`
-    // so the radius, density, and radius caching are recomputed against the
-    // new kind; leaving a body just above a threshold on the wrong side of
-    // the boundary would break later classification.
+/// Stellar-evolution ladder. Each transition is followed by a `set_mass`
+/// so the radius, density, and radius caching are recomputed against the
+/// new kind; leaving a body just above a threshold on the wrong side of
+/// the boundary would break later classification.
+fn climb_stellar_ladder(b: &mut Bodies, keep: usize, cx: f64, cy: f64) {
     if b.kind[keep] == BodyKind::WhiteDwarf && b.m[keep] > WD_M_MAX {
         b.kind[keep] = BodyKind::NeutronStar;
         b.set_mass(keep, NS_M_MIN * 1.07);
@@ -865,7 +896,16 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
         let text = format!("{} ignited as a star", tag(b, keep));
         b.log(EventKind::Merge, text, cx, cy);
     }
+}
 
+/// Set the survivor's initial mass and age once its final kind is known.
+fn reset_clocks_after_merge(
+    b: &mut Bodies,
+    keep: usize,
+    keep_was_star: bool,
+    keep_kind_before: BodyKind,
+    kill_kind: BodyKind,
+) {
     let kind_after = b.kind[keep];
     if kind_after == BodyKind::Star {
         if !keep_was_star {
@@ -873,34 +913,18 @@ pub(super) fn merge_impl(b: &mut Bodies, i: usize, j: usize, silent: bool) -> us
             b.m_init[keep] = b.m[keep];
             b.age_gyr[keep] = 0.0;
         }
-    } else {
-        b.m_init[keep] = b.m[keep];
-        let same_kind = keep_kind_before == kind_after;
-        // A dwarf that swallows a planet or a star keeps its cooling clock.
-        // Two dwarfs merging, or a kind transition, restarts it.
-        let swallowed_other = same_kind
-            && kill_kind != kind_after
-            && matches!(kind_after, BodyKind::WhiteDwarf | BodyKind::BrownDwarf);
-        if !swallowed_other {
-            b.age_gyr[keep] = if same_kind {
-                0.0
-            } else {
-                default_age_gyr(kind_after)
-            };
-        }
+        return;
     }
-    b.r[keep] = b.radius_now(keep);
-
-    b.dead[kill] = true;
-    b.coalesce_counter[keep] = 0;
-
-    b.stats.merges += 1;
-    if !silent {
-        let flash_r = (b.contact_r(keep) * 5.0).max(0.05);
-        flash_at(b, cx, cy, cz, flash_r);
-        b.log(EventKind::Merge, text, cx, cy);
+    b.m_init[keep] = b.m[keep];
+    let same_kind = keep_kind_before == kind_after;
+    // A dwarf that swallows a planet or a star keeps its cooling clock.
+    // Two dwarfs merging, or a kind transition, restarts it.
+    let swallowed_other = same_kind
+        && kill_kind != kind_after
+        && matches!(kind_after, BodyKind::WhiteDwarf | BodyKind::BrownDwarf);
+    if !swallowed_other {
+        b.age_gyr[keep] = if same_kind { 0.0 } else { default_age_gyr(kind_after) };
     }
-    keep
 }
 
 /// Logged merge: emits a flash and an event. See `merge_impl`.
@@ -952,10 +976,82 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
         return;
     }
 
-    // Disruption regime. `alpha` and `m_int` define the *interacting* part
-    // of the small body; `mu_a` is the reduced mass of that sub-collision.
-    // `x` is the impact energy in units of `Q*_RD`; `lr` is the surviving
-    // (largest-remnant) mass fraction after the impact.
+    // Disruption regime.
+    let Some(d) = disruption_budget(b, big, small, bb, vrel, mtot, spawns.len()) else {
+        merge(b, i, j);
+        return;
+    };
+
+    // Snapshot the pair's total L before the merge so the post-impact
+    // configuration can be rebalanced to match.
+    let l_before = pair_l(b, i, j);
+    let rel_pos = (b.x[j] - b.x[i], b.y[j] - b.y[i], b.z[j] - b.z[i]);
+    let plane = impact_plane(rel_pos, (rvx, rvy, rvz));
+    let idg = (b.id[i], b.id[j]);
+    // Perform the merge to get a single survivor, then immediately strip
+    // it back to the residual mass. The spurious merge event and its
+    // statistic are popped; this impact will log its own line.
+    let rem = merge(b, i, j);
+    b.events.pop_back();
+    b.stats.merges -= 1;
+    let m_rem = mtot - d.m_ejected;
+    b.set_mass(rem, m_rem);
+    b.imm[rem] = b.time + IMMUNITY_TIME;
+    b.origin[rem] = BodyOrigin::Spawned;
+
+    let (rx, ry) = (b.x[rem], b.y[rem]); // event position: before the recoil
+    let s0 = spawns.len();
+    let recoil = eject_debris(b, rem, &d, m_rem, &plane, spawns);
+    apply_recoil(b, rem, m_rem, &recoil);
+
+    // Spin absorbs whatever L the fragment population could not carry.
+    let mut l_after = l_orb(b, rem);
+    for s in &spawns[s0..] {
+        l_after += s.m * (s.x * s.vy - s.y * s.vx);
+    }
+    b.spin[rem] = l_before - l_after;
+
+    b.stats.impacts += 1;
+    let text = format!(
+        "impact #{} × #{} at {:.1}× escape speed, b = {:.2}: {} fragments, {} ejected{}",
+        idg.0,
+        idg.1,
+        ratio,
+        bb,
+        d.n_fragments,
+        mass_str(d.m_ejected),
+        if d.m_disk > d.m_erode { " (disk)" } else { "" }
+    );
+    b.log(EventKind::Impact, text, rx, ry);
+}
+
+/// How much mass an impact throws off and into how many fragments.
+struct Disruption {
+    /// Mass stripped from the colliders, erosion plus disk material, capped.
+    m_ejected: f64,
+    /// Part of `m_ejected` due to erosion alone (before the cap).
+    m_erode: f64,
+    /// Mass put into a circumplanetary disk.
+    m_disk: f64,
+    n_fragments: usize,
+}
+
+/// Size the disruption of an impact, or `None` when too little would be
+/// ejected for fragments to be worth spawning (the pair then simply merges).
+///
+/// `alpha` and `m_int` define the *interacting* part of the small body;
+/// `mu_a` is the reduced mass of that sub-collision. `x` is the impact
+/// energy in units of `Q*_RD`; `lr` is the surviving (largest-remnant) mass
+/// fraction after the impact.
+fn disruption_budget(
+    b: &Bodies,
+    big: usize,
+    small: usize,
+    bb: f64,
+    vrel: f64,
+    mtot: f64,
+    pending_spawns: usize,
+) -> Option<Disruption> {
     let alpha = interact_frac(b.contact_r(big), b.contact_r(small), bb).max(1e-3);
     let m_int = alpha * b.m[small];
     let mu_a = b.m[big] * m_int / (b.m[big] + m_int);
@@ -972,52 +1068,77 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
         0.0
     };
     let cap = (DEBRIS_MAX_FRAC_HEADON + (DEBRIS_MAX_FRAC - DEBRIS_MAX_FRAC_HEADON) * bb) * mtot;
-    let md = (m_erode + m_disk).min(cap);
+    let m_ejected = (m_erode + m_disk).min(cap);
     let n_raw = FRAG_COUNT_BASE
         + FRAG_COUNT_SCALE * x.powf(FRAG_COUNT_EXP)
         + FRAG_COUNT_DISK_GAIN * (m_disk / DEBRIS_MIN_MASS).ln_1p();
     // Clamp fragment count to: model, per-event maximum, what the ejected
     // mass can actually pay for, and remaining body-slot budget (+1 for
     // the survivor).
-    let n = (n_raw.round() as usize)
+    let n_fragments = (n_raw.round() as usize)
         .min(FRAG_COUNT_MAX)
-        .min((md / DEBRIS_MIN_MASS) as usize)
-        .min(room(b, spawns.len()) + 1);
-    if md < DEBRIS_MIN_MASS || n < 2 {
-        merge(b, i, j);
-        return;
+        .min((m_ejected / DEBRIS_MIN_MASS) as usize)
+        .min(room(b, pending_spawns) + 1);
+    if m_ejected < DEBRIS_MIN_MASS || n_fragments < 2 {
+        return None;
     }
+    Some(Disruption { m_ejected, m_erode, m_disk, n_fragments })
+}
 
-    // Snapshot the pair's total L before the merge so the post-impact
-    // configuration can be rebalanced to match.
-    let l_before = pair_l(b, i, j);
-    let (px0, py0, pz0) = (b.x[j] - b.x[i], b.y[j] - b.y[i], b.z[j] - b.z[i]);
-    // Impact plane: spanned by the relative position and velocity. Planar
-    // pairs use the xy axes and a ±1 sense (as before); otherwise the frame is
-    // right-handed about the orbit normal, so the sense is always +1.
+/// Orthonormal frame of the impact plane plus the sense of rotation.
+struct ImpactPlane {
+    e1: (f64, f64, f64),
+    e2: (f64, f64, f64),
+    sense: f64,
+}
+
+/// The impact plane is spanned by the relative position and velocity. Planar
+/// pairs use the xy axes and a ±1 sense (as before); otherwise the frame is
+/// right-handed about the orbit normal, so the sense is always +1.
+fn impact_plane(rel_pos: (f64, f64, f64), rel_vel: (f64, f64, f64)) -> ImpactPlane {
+    let (px0, py0, pz0) = rel_pos;
+    let (rvx, rvy, rvz) = rel_vel;
     let (hxv, hyv, hzv) = (py0 * rvz - pz0 * rvy, pz0 * rvx - px0 * rvz, px0 * rvy - py0 * rvx);
-    let (e1, e2, sense) = if hxv == 0.0 && hyv == 0.0 {
-        ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), if hzv >= 0.0 { 1.0 } else { -1.0 })
-    } else {
-        let hn = (hxv * hxv + hyv * hyv + hzv * hzv).sqrt();
-        let (nhx, nhy, nhz) = (hxv / hn, hyv / hn, hzv / hn);
-        let ln = (nhx * nhx + nhy * nhy).sqrt();
-        let e1 = (-nhy / ln, nhx / ln, 0.0);
-        let e2 = (nhy * e1.2 - nhz * e1.1, nhz * e1.0 - nhx * e1.2, nhx * e1.1 - nhy * e1.0);
-        (e1, e2, 1.0)
-    };
-    let idg = (b.id[i], b.id[j]);
-    // Perform the merge to get a single survivor, then immediately strip
-    // it back to the residual mass. The spurious merge event and its
-    // statistic are popped; this impact will log its own line.
-    let rem = merge(b, i, j);
-    b.events.pop_back();
-    b.stats.merges -= 1;
-    let m_rem = mtot - md;
-    b.set_mass(rem, m_rem);
-    b.imm[rem] = b.time + IMMUNITY_TIME;
-    b.origin[rem] = BodyOrigin::Spawned;
+    if hxv == 0.0 && hyv == 0.0 {
+        return ImpactPlane {
+            e1: (1.0, 0.0, 0.0),
+            e2: (0.0, 1.0, 0.0),
+            sense: if hzv >= 0.0 { 1.0 } else { -1.0 },
+        };
+    }
+    let hn = (hxv * hxv + hyv * hyv + hzv * hzv).sqrt();
+    let (nhx, nhy, nhz) = (hxv / hn, hyv / hn, hzv / hn);
+    let ln = (nhx * nhx + nhy * nhy).sqrt();
+    let e1 = (-nhy / ln, nhx / ln, 0.0);
+    let e2 = (nhy * e1.2 - nhz * e1.1, nhz * e1.0 - nhx * e1.2, nhx * e1.1 - nhy * e1.0);
+    ImpactPlane { e1, e2, sense: 1.0 }
+}
 
+/// Total fragment momentum and mass-weighted offset, so the survivor can be
+/// pushed the opposite way afterwards.
+struct Recoil {
+    px: f64,
+    py: f64,
+    pz: f64,
+    sx: f64,
+    sy: f64,
+    sz: f64,
+}
+
+/// Throw the ejected mass off the survivor `rem` as fragments (pushed onto
+/// `spawns`) plus a dust deposit. Draw order from `b.rng` is part of the
+/// model's determinism: masses, then the base angle, then per fragment the
+/// disk flag, angle jitter and its kick.
+fn eject_debris(
+    b: &mut Bodies,
+    rem: usize,
+    d: &Disruption,
+    m_rem: f64,
+    plane: &ImpactPlane,
+    spawns: &mut Vec<Spawn>,
+) -> Recoil {
+    let (e1, e2, sense) = (plane.e1, plane.e2, plane.sense);
+    let (n, md, m_disk) = (d.n_fragments, d.m_ejected, d.m_disk);
     let ms = frag_masses(&mut b.rng, n, md);
     // Dust source term: a bonus population, see `DUST_YIELD_FRAC`.
     let (dust_x, dust_y, dust_z) = (b.x[rem], b.y[rem], b.z[rem]);
@@ -1040,11 +1161,7 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     let base = b.rng.next_f64() * std::f64::consts::TAU;
     let (rx, ry, rz) = (b.x[rem], b.y[rem], b.z[rem]);
     let (rvx0, rvy0, rvz0) = (b.vx[rem], b.vy[rem], b.vz[rem]);
-    let s0 = spawns.len();
-    // Accumulate fragment momentum and mass-weighted offset so the survivor
-    // can be pushed in the opposite direction afterward, conserving total
-    // momentum and centre of mass exactly.
-    let (mut px, mut py, mut pz, mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let mut recoil = Recoil { px: 0.0, py: 0.0, pz: 0.0, sx: 0.0, sy: 0.0, sz: 0.0 };
     for (k, &mk) in ms.iter().enumerate() {
         // Disk fragments inherit the survivor's orbital frame; ejecta get
         // a radial kick scaled by `v_esc`. `disk_share` sets the fraction
@@ -1074,12 +1191,12 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
             wy = uy * kick;
             wz = uz * kick;
         }
-        px += mk * wx;
-        py += mk * wy;
-        pz += mk * wz;
-        sx += mk * ux * dist;
-        sy += mk * uy * dist;
-        sz += mk * uz * dist;
+        recoil.px += mk * wx;
+        recoil.py += mk * wy;
+        recoil.pz += mk * wz;
+        recoil.sx += mk * ux * dist;
+        recoil.sy += mk * uy * dist;
+        recoil.sz += mk * uz * dist;
         spawns.push(Spawn {
             x: rx + ux * dist,
             y: ry + uy * dist,
@@ -1097,34 +1214,18 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
             class: b.class[rem],
         });
     }
-    // Momentum- and centre-of-mass-conserving recoil of the survivor.
-    b.x[rem] -= sx / m_rem;
-    b.y[rem] -= sy / m_rem;
-    b.z[rem] -= sz / m_rem;
+    recoil
+}
+
+/// Momentum- and centre-of-mass-conserving recoil of the survivor.
+fn apply_recoil(b: &mut Bodies, rem: usize, m_rem: f64, r: &Recoil) {
+    b.x[rem] -= r.sx / m_rem;
+    b.y[rem] -= r.sy / m_rem;
+    b.z[rem] -= r.sz / m_rem;
     b._px[rem] = b.x[rem];
     b._py[rem] = b.y[rem];
     b._pz[rem] = b.z[rem];
-    b.vx[rem] -= px / m_rem;
-    b.vy[rem] -= py / m_rem;
-    b.vz[rem] -= pz / m_rem;
-
-    // Spin absorbs whatever L the fragment population could not carry.
-    let mut l_after = l_orb(b, rem);
-    for s in &spawns[s0..] {
-        l_after += s.m * (s.x * s.vy - s.y * s.vx);
-    }
-    b.spin[rem] = l_before - l_after;
-
-    b.stats.impacts += 1;
-    let text = format!(
-        "impact #{} × #{} at {:.1}× escape speed, b = {:.2}: {} fragments, {} ejected{}",
-        idg.0,
-        idg.1,
-        ratio,
-        bb,
-        n,
-        mass_str(md),
-        if m_disk > m_erode { " (disk)" } else { "" }
-    );
-    b.log(EventKind::Impact, text, rx, ry);
+    b.vx[rem] -= r.px / m_rem;
+    b.vy[rem] -= r.py / m_rem;
+    b.vz[rem] -= r.pz / m_rem;
 }

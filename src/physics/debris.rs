@@ -15,97 +15,127 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
     if n < 2 {
         return;
     }
-    let t_now = b.time;
-
     // Quick pass to decide whether the expensive path is worth taking.
     // Simulations with no rubble, or exactly one fragment, exit here.
-    let mut n_eligible = 0usize;
-    for i in 0..n {
-        if !b.dead[i]
-            && b.origin[i].is_rubble()
-            && b.m[i] < DEBRIS_COALESCE_MAX_MASS
-            && t_now >= b.imm[i]
-        {
-            n_eligible += 1;
-        }
-    }
+    let n_eligible = (0..n).filter(|&i| can_coalesce(b, i)).count();
     if n_eligible < 2 {
         // No pair can form, so no counters can advance — but stale
         // counters from a previous step must still be cleared so a
         // fragment that leaves the neighbourhood resets its streak.
-        for i in 0..n {
-            if !b.dead[i] && b.origin[i].is_rubble() {
-                b.coalesce_counter[i] = 0;
-            }
-        }
+        reset_rubble_counters(b, |_| true);
         return;
     }
 
     let hosts = host_list(b);
-
-    // Collect the eligible fragments once; every later pass iterates
-    // over this compact list rather than scanning all bodies.
-    let mut eligible: Vec<usize> = Vec::with_capacity(n_eligible);
-    for i in 0..n {
-        if !b.dead[i]
-            && b.origin[i].is_rubble()
-            && b.m[i] < DEBRIS_COALESCE_MAX_MASS
-            && t_now >= b.imm[i]
-        {
-            eligible.push(i);
-        }
-    }
-
-    // Reverse map: body index → position in `eligible`, or NOT_ELIGIBLE.
-    debug_assert!(n <= u32::MAX as usize);
-    const NOT_ELIGIBLE: u32 = u32::MAX;
-    let mut body_to_eligible: Vec<u32> = vec![NOT_ELIGIBLE; n];
-    for (pos, &i) in eligible.iter().enumerate() {
-        body_to_eligible[i] = pos as u32;
-    }
+    let cands = Candidates::collect(b);
 
     // Rubble bodies that were not selected still need their counter
     // cleared, so a fragment that temporarily leaves the size window
     // doesn't resume a stale capture streak when it re-enters.
-    for i in 0..n {
-        if !b.dead[i] && b.origin[i].is_rubble() && body_to_eligible[i] == NOT_ELIGIBLE {
+    reset_rubble_counters(b, |i| cands.position(i).is_none());
+
+    let (pairs, in_capture) = find_capture_pairs(b, &hosts, &cands);
+    advance_capture_streaks(b, &cands.eligible, &in_capture);
+    if pairs.is_empty() {
+        return;
+    }
+    if merge_captured_pairs(b, pairs) {
+        b.compact();
+    }
+}
+
+/// A live rubble fragment small enough and old enough to coalesce.
+fn can_coalesce(b: &Bodies, i: usize) -> bool {
+    !b.dead[i]
+        && b.origin[i].is_rubble()
+        && b.m[i] < DEBRIS_COALESCE_MAX_MASS
+        && b.time >= b.imm[i]
+}
+
+/// Zero the capture streak of every live rubble body for which `select`
+/// returns true.
+fn reset_rubble_counters(b: &mut Bodies, select: impl Fn(usize) -> bool) {
+    for i in 0..b.len() {
+        if !b.dead[i] && b.origin[i].is_rubble() && select(i) {
             b.coalesce_counter[i] = 0;
         }
     }
+}
 
-    let parents: Vec<Option<usize>> = eligible
-        .iter()
-        .map(|&i| b.parent_cache.get(i).copied().flatten())
-        .collect();
+const NOT_ELIGIBLE: u32 = u32::MAX;
 
-    // Distance from each fragment to its parent, computed once here
-    // and reused by every pair evaluation the fragment participates in.
-    let mut d_to_parent: Vec<f64> = Vec::with_capacity(eligible.len());
-    for (pos, &i) in eligible.iter().enumerate() {
-        match parents[pos] {
-            Some(pi) => {
-                let dx = b.x[i] - b.x[pi];
-                let dy = b.y[i] - b.y[pi];
-                let dz = b.z[i] - b.z[pi];
-                d_to_parent.push((dx * dx + dy * dy + dz * dz).sqrt());
-            }
-            None => d_to_parent.push(0.0),
+/// The fragments that may coalesce this step, collected once so every later
+/// pass iterates a compact list instead of scanning all bodies.
+struct Candidates {
+    /// Body indices of the eligible fragments.
+    eligible: Vec<usize>,
+    /// Reverse map: body index → position in `eligible`, or `NOT_ELIGIBLE`.
+    body_to_eligible: Vec<u32>,
+    /// Cached parent host of each eligible fragment.
+    parents: Vec<Option<usize>>,
+    /// Distance from each eligible fragment to its parent, computed once
+    /// and reused by every pair evaluation the fragment takes part in.
+    d_to_parent: Vec<f64>,
+}
+
+impl Candidates {
+    fn collect(b: &Bodies) -> Self {
+        let n = b.len();
+        debug_assert!(n <= u32::MAX as usize);
+        let eligible: Vec<usize> = (0..n).filter(|&i| can_coalesce(b, i)).collect();
+        let mut body_to_eligible: Vec<u32> = vec![NOT_ELIGIBLE; n];
+        for (pos, &i) in eligible.iter().enumerate() {
+            body_to_eligible[i] = pos as u32;
         }
+        let parents: Vec<Option<usize>> = eligible
+            .iter()
+            .map(|&i| b.parent_cache.get(i).copied().flatten())
+            .collect();
+        let d_to_parent: Vec<f64> = eligible
+            .iter()
+            .zip(&parents)
+            .map(|(&i, parent)| match parent {
+                Some(pi) => {
+                    let pi = *pi;
+                    let dx = b.x[i] - b.x[pi];
+                    let dy = b.y[i] - b.y[pi];
+                    let dz = b.z[i] - b.z[pi];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                }
+                None => 0.0,
+            })
+            .collect();
+        Self { eligible, body_to_eligible, parents, d_to_parent }
     }
 
-    // Grid-cell size is sized to the largest fragment's interaction
-    // radius so a 3×3 neighbourhood always covers the capture range.
-    let max_cr = eligible
-        .iter()
-        .map(|&i| b.contact_r(i))
-        .fold(0.0f64, f64::max);
+    /// Position of body `i` in `eligible`, if it is a candidate.
+    fn position(&self, i: usize) -> Option<usize> {
+        match self.body_to_eligible[i] {
+            NOT_ELIGIBLE => None,
+            pos => Some(pos as usize),
+        }
+    }
+}
+
+/// Find fragment pairs that are bound to each other right now. Returns the
+/// pairs and, per body, whether it is in at least one.
+///
+/// Fragments are binned in a grid whose cell is sized to the largest
+/// fragment's interaction radius, so the 3×3 neighbourhood of a cell always
+/// covers the capture range. Fragments without a parent cannot be captured
+/// and are left out.
+fn find_capture_pairs(
+    b: &Bodies,
+    hosts: &[usize],
+    cands: &Candidates,
+) -> (Vec<(usize, usize)>, Vec<bool>) {
+    let eligible = &cands.eligible;
+    let max_cr = eligible.iter().map(|&i| b.contact_r(i)).fold(0.0f64, f64::max);
     let cell = (DEBRIS_SEARCH_RADII * max_cr).max(1e-4);
 
-    // Bucket every parented fragment into its grid cell. Fragments
-    // without a parent can't be captured, so they're omitted.
     let mut keys: Vec<(u64, u32)> = Vec::with_capacity(eligible.len());
     for (pos, &i) in eligible.iter().enumerate() {
-        if parents[pos].is_none() {
+        if cands.parents[pos].is_none() {
             continue;
         }
         let cx = (b.x[i] / cell).floor() as i64;
@@ -114,15 +144,15 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
     }
     keys.par_sort_unstable();
 
-    let mut in_capture = vec![false; n];
+    let mut in_capture = vec![false; b.len()];
     let mut pairs: Vec<(usize, usize)> = Vec::new();
 
     for (pos_i, &i) in eligible.iter().enumerate() {
-        let Some(pi) = parents[pos_i] else { continue };
+        let Some(pi) = cands.parents[pos_i] else { continue };
 
         // Quantities shared by every candidate partner j for this i.
-        let m_p = effective_host_mass(b, &hosts, i, pi);
-        let d_i = d_to_parent[pos_i];
+        let m_p = effective_host_mass(b, hosts, i, pi);
+        let d_i = cands.d_to_parent[pos_i];
         let cx = (b.x[i] / cell).floor() as i64;
         let cy = (b.y[i] / cell).floor() as i64;
 
@@ -130,106 +160,89 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
             for ddy in -1..=1i64 {
                 let key = cell_key(cx + ddx, cy + ddy);
                 let start = keys.partition_point(|e| e.0 < key);
-                for e in &keys[start..] {
-                    if e.0 != key {
-                        break;
-                    }
+                for e in keys[start..].iter().take_while(|e| e.0 == key) {
                     let j = e.1 as usize;
                     // Each unordered pair is visited once.
                     if j <= i {
                         continue;
                     }
-                    let pos_j = body_to_eligible[j];
-                    if pos_j == NOT_ELIGIBLE {
-                        continue;
-                    }
-                    let pos_j = pos_j as usize;
-                    let Some(pj) = parents[pos_j] else { continue };
-                    // Coalescence only occurs between siblings —
-                    // fragments must share a parent host.
+                    let Some(pos_j) = cands.position(j) else { continue };
+                    let Some(pj) = cands.parents[pos_j] else { continue };
+                    // Coalescence only occurs between siblings: fragments
+                    // must share a parent host.
                     if pi != pj {
                         continue;
                     }
-
-                    let dx = b.x[j] - b.x[i];
-                    let dy = b.y[j] - b.y[i];
-                    let dz = b.z[j] - b.z[i];
-                    let dist2 = dx * dx + dy * dy + dz * dz;
-                    let dist = dist2.sqrt();
-
-                    // Mutual Hill radius of the pair around the host,
-                    // evaluated at the mean orbital distance.
-                    let d_j = d_to_parent[pos_j];
-                    let m_ij = b.m[i] + b.m[j];
-                    let r_hill = (m_ij / (3.0 * m_p)).cbrt() * ((d_i + d_j) * 0.5);
-
-                    // Separation must lie well inside the Hill sphere
-                    // for the pair to remain bound long enough to merge.
-                    if dist >= DEBRIS_CAPTURE_HILL_FRAC * r_hill {
-                        continue;
+                    let d_j = cands.d_to_parent[pos_j];
+                    if is_bound_pair(b, i, j, m_p, (d_i + d_j) * 0.5) {
+                        in_capture[i] = true;
+                        in_capture[j] = true;
+                        pairs.push((i, j));
                     }
-
-                    // Relative speed must fall below the escape speed
-                    // of the pair, otherwise the encounter is unbound.
-                    let dvx = b.vx[j] - b.vx[i];
-                    let dvy = b.vy[j] - b.vy[i];
-                    let dvz = b.vz[j] - b.vz[i];
-                    let vrel = (dvx * dvx + dvy * dvy + dvz * dvz).sqrt();
-                    let v_esc = (2.0 * G * m_ij / dist.max(1e-12)).sqrt();
-                    if vrel >= DEBRIS_CAPTURE_VEL_RATIO * v_esc {
-                        continue;
-                    }
-
-                    in_capture[i] = true;
-                    in_capture[j] = true;
-                    pairs.push((i, j));
                 }
             }
         }
     }
+    (pairs, in_capture)
+}
 
-    // Advance the capture streak for fragments currently in capture;
-    // reset any that fell out of it. Saturating add guards against
-    // overflow during very long runs.
-    for &i in &eligible {
-        if in_capture[i] {
-            b.coalesce_counter[i] = b.coalesce_counter[i].saturating_add(1);
+/// Whether fragments `i` and `j` are close and slow enough to stay bound
+/// around a host of mass `m_p` at mean orbital distance `d_mean`.
+fn is_bound_pair(b: &Bodies, i: usize, j: usize, m_p: f64, d_mean: f64) -> bool {
+    let dx = b.x[j] - b.x[i];
+    let dy = b.y[j] - b.y[i];
+    let dz = b.z[j] - b.z[i];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    // Mutual Hill radius of the pair around the host, evaluated at the mean
+    // orbital distance. The separation must lie well inside it for the pair
+    // to remain bound long enough to merge.
+    let m_ij = b.m[i] + b.m[j];
+    let r_hill = (m_ij / (3.0 * m_p)).cbrt() * d_mean;
+    if dist >= DEBRIS_CAPTURE_HILL_FRAC * r_hill {
+        return false;
+    }
+
+    // Relative speed must fall below the escape speed of the pair,
+    // otherwise the encounter is unbound.
+    let dvx = b.vx[j] - b.vx[i];
+    let dvy = b.vy[j] - b.vy[i];
+    let dvz = b.vz[j] - b.vz[i];
+    let vrel = (dvx * dvx + dvy * dvy + dvz * dvz).sqrt();
+    let v_esc = (2.0 * G * m_ij / dist.max(1e-12)).sqrt();
+    vrel < DEBRIS_CAPTURE_VEL_RATIO * v_esc
+}
+
+/// Advance the capture streak for fragments currently in capture and reset
+/// the rest. Saturating add guards against overflow in very long runs.
+fn advance_capture_streaks(b: &mut Bodies, eligible: &[usize], in_capture: &[bool]) {
+    for &i in eligible {
+        b.coalesce_counter[i] = if in_capture[i] {
+            b.coalesce_counter[i].saturating_add(1)
         } else {
-            b.coalesce_counter[i] = 0;
-        }
+            0
+        };
     }
+}
 
-    if pairs.is_empty() {
-        return;
-    }
-
-    // Keep only pairs where both members have persisted long enough.
-    pairs.retain(|&(i, j)| {
-        b.coalesce_counter[i] >= DEBRIS_CAPTURE_STEPS
-            && b.coalesce_counter[j] >= DEBRIS_CAPTURE_STEPS
-    });
+/// Merge the pairs whose members have both been bound for long enough.
+/// Returns whether anything merged (the caller then compacts the arrays).
+fn merge_captured_pairs(b: &mut Bodies, mut pairs: Vec<(usize, usize)>) -> bool {
+    let persisted = |b: &Bodies, i: usize| b.coalesce_counter[i] >= DEBRIS_CAPTURE_STEPS;
+    pairs.retain(|&(i, j)| persisted(b, i) && persisted(b, j));
 
     let mut merged_any = false;
     for (i, j) in pairs {
-        // A body may appear in several pairs; earlier merges in this
-        // pass can invalidate later ones. Re-check both membership and
-        // streak before merging.
-        if b.dead[i] || b.dead[j] {
-            continue;
-        }
-        if b.coalesce_counter[i] < DEBRIS_CAPTURE_STEPS
-            || b.coalesce_counter[j] < DEBRIS_CAPTURE_STEPS
-        {
+        // A body may appear in several pairs; earlier merges in this pass
+        // can invalidate later ones, so re-check membership and streak.
+        if b.dead[i] || b.dead[j] || !persisted(b, i) || !persisted(b, j) {
             continue;
         }
         merge_impl(b, i, j, /*silent=*/ true);
         b.stats.coalesces += 1;
         merged_any = true;
     }
-
-    if merged_any {
-        b.compact();
-    }
+    merged_any
 }
 
 pub fn density_gcc(b: &Bodies, i: usize) -> f64 {
@@ -367,15 +380,39 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     let l_before = l_orb(b, i) + b.spin[i];
     let text = format!("{} torn apart by {}", tag(b, i), tag(b, p));
 
-    // Unit vector from primary to body i, and its tangent.
+    let axes = tidal_axes(b, i, p);
+    // Draw fragment mass weights first so the geometry (fragment
+    // spacing, radii) can be sized to the largest fragment.
+    let (ms, rmax) = fragment_masses(b, mi, n);
+    let origin = (b.x[i], b.y[i], b.z[i]);
+    let bvel = (b.vx[i], b.vy[i], b.vz[i]);
+    let prim_r = b.contact_r(p);
+
+    let pieces = build_fragments(b, i, p, &axes, &ms, rmax);
+    b.dead[i] = true;
+    spawn_fragments(b, pieces, bvel, l_before);
+
+    flash_at(b, origin.0, origin.1, origin.2, (prim_r * 0.5).max(0.05));
+    b.stats.tidal += 1;
+    b.log(EventKind::Tidal, text, origin.0, origin.1);
+    true
+}
+
+/// Unit vector from primary to body, and a unit tangent to it.
+struct TidalAxes {
+    u: (f64, f64, f64),
+    t: (f64, f64, f64),
+}
+
+/// Tangent: in-plane (-uy, ux) for a planar pair, otherwise the part of the
+/// relative velocity perpendicular to the tidal axis.
+fn tidal_axes(b: &Bodies, i: usize, p: usize) -> TidalAxes {
     let d = ((b.x[i] - b.x[p]).powi(2) + (b.y[i] - b.y[p]).powi(2) + (b.z[i] - b.z[p]).powi(2))
         .sqrt()
         .max(1e-12);
     let (ux, uy, uz) = ((b.x[i] - b.x[p]) / d, (b.y[i] - b.y[p]) / d, (b.z[i] - b.z[p]) / d);
-    // Tangent: in-plane (-uy, ux) for a planar pair, otherwise the part of the
-    // relative velocity perpendicular to the tidal axis.
     let (rvx, rvy, rvz) = (b.vx[i] - b.vx[p], b.vy[i] - b.vy[p], b.vz[i] - b.vz[p]);
-    let (tx, ty, tz) = if uz == 0.0 && rvz == 0.0 {
+    let t = if uz == 0.0 && rvz == 0.0 {
         (-uy, ux, 0.0)
     } else {
         let vr = rvx * ux + rvy * uy + rvz * uz;
@@ -388,93 +425,100 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
             (-uy / pn, ux / pn, 0.0)
         }
     };
+    TidalAxes { u: (ux, uy, uz), t }
+}
 
-    // Draw fragment mass weights first so the geometry (fragment
-    // spacing, radii) can be sized to the largest fragment.
-    let mut ms: Vec<f64> = (0..n)
-        .map(|_| DEBRIS_WEIGHT_MIN + b.rng.next_f64())
-        .collect();
+/// Random fragment masses summing to `mi`, and the largest fragment radius.
+fn fragment_masses(b: &mut Bodies, mi: f64, n: usize) -> (Vec<f64>, f64) {
+    let mut ms: Vec<f64> = (0..n).map(|_| DEBRIS_WEIGHT_MIN + b.rng.next_f64()).collect();
     let wsum: f64 = ms.iter().sum();
     let mut rmax: f64 = 0.0;
     for m in ms.iter_mut() {
         *m = mi * *m / wsum;
         rmax = rmax.max(planet_true_r(*m));
     }
+    (ms, rmax)
+}
 
+/// Fragments strung along the tidal axis. Positions and kicks are symmetric
+/// about the original body's centre. Draws two jitter numbers per fragment.
+fn build_fragments(
+    b: &mut Bodies,
+    i: usize,
+    p: usize,
+    axes: &TidalAxes,
+    ms: &[f64],
+    rmax: f64,
+) -> Vec<Spawn> {
+    let n = ms.len();
+    let (ux, uy, uz) = axes.u;
+    let (tx, ty, tz) = axes.t;
     let step = DISRUPT_STEP * rmax;
     let half = (((n - 1) as f64) / 2.0 * step).max(1e-6);
-    let vk = DISRUPT_KICK * (G * mi / b.r[i].max(1e-6)).sqrt();
+    let vk = DISRUPT_KICK * (G * b.m[i] / b.r[i].max(1e-6)).sqrt();
     let (bx, by, bz, bvx, bvy, bvz) = (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i]);
     let prim_r = b.contact_r(p);
-    let (px0, py0, pz0) = (b.x[p], b.y[p], b.z[p]);
+    let prim = (b.x[p], b.y[p], b.z[p]);
 
-    b.dead[i] = true;
-
-    // Build the fragments. Positions and kicks are symmetric about
-    // the original body's centre along the tidal axis.
     let mut pieces: Vec<Spawn> = Vec::with_capacity(n);
-    let (mut pvx, mut pvy, mut pvz, mut mt) = (0.0, 0.0, 0.0, 0.0);
     for (k, &mk) in ms.iter().enumerate() {
         let s = (k as f64 - (n - 1) as f64 / 2.0) * step;
         let kick = vk * s / half;
 
-        // Start position: offset along the tidal axis plus a small
-        // perpendicular jitter.
+        // Start position: offset along the tidal axis plus a small perpendicular jitter.
         let jx = b.rng.next_f64() - DISRUPT_JITTER;
         let jy = b.rng.next_f64() - DISRUPT_JITTER;
-        let mut fx = bx + ux * s + tx * jx * rmax;
-        let mut fy = by + uy * s + ty * jy * rmax;
-        let mut fz = bz + uz * s + tz * jy * rmax;
-
-        // Push any fragment that would spawn inside the primary back
-        // out to the contact radius plus a safety margin.
-        let mut qx = fx - px0;
-        let mut qy = fy - py0;
-        let mut qz = fz - pz0;
-        let mut qd = (qx * qx + qy * qy + qz * qz).sqrt();
-        let qmin = prim_r + 1.5 * planet_true_r(mk);
-        if qd < qmin {
-            if qd < 1e-9 {
-                qx = ux;
-                qy = uy;
-                qz = uz;
-                qd = 1.0;
-            }
-            fx = px0 + qx / qd * qmin;
-            fy = py0 + qy / qd * qmin;
-            fz = pz0 + qz / qd * qmin;
-        }
-
-        let vx = bvx + ux * kick;
-        let vy = bvy + uy * kick;
-        let vz = bvz + uz * kick;
-
-        // Track momentum so we can later subtract the centre-of-mass
-        // contribution and keep the fragment cloud recoiling.
-        pvx += mk * (vx - bvx);
-        pvy += mk * (vy - bvy);
-        pvz += mk * (vz - bvz);
-        mt += mk;
+        let pos = (bx + ux * s + tx * jx * rmax, by + uy * s + ty * jy * rmax, bz + uz * s + tz * jy * rmax);
+        let (fx, fy, fz) = keep_outside_primary(pos, prim, prim_r + 1.5 * planet_true_r(mk), axes.u);
 
         pieces.push(Spawn {
             x: fx,
             y: fy,
             z: fz,
-            vx,
-            vy,
-            vz,
+            vx: bvx + ux * kick,
+            vy: bvy + uy * kick,
+            vz: bvz + uz * kick,
             m: mk,
             kind: BodyKind::Planet,
             origin: BodyOrigin::TidalDebris,
-            // Fragments inherit the composition of the body they
-            // came from. `i` is still valid here — `b.dead[i]` is
-            // set above, but `class[i]` is untouched.
+            // Fragments inherit the composition of the body they came from.
             class: b.class[i],
         });
     }
+    pieces
+}
 
-    // Spawn fragments and correct each one's velocity so the cloud's
-    // centre of mass moves with the original body.
+/// Push a fragment that would spawn inside the primary back out to `qmin`.
+fn keep_outside_primary(
+    pos: (f64, f64, f64),
+    prim: (f64, f64, f64),
+    qmin: f64,
+    axis: (f64, f64, f64),
+) -> (f64, f64, f64) {
+    let (mut qx, mut qy, mut qz) = (pos.0 - prim.0, pos.1 - prim.1, pos.2 - prim.2);
+    let mut qd = (qx * qx + qy * qy + qz * qz).sqrt();
+    if qd >= qmin {
+        return pos;
+    }
+    if qd < 1e-9 {
+        (qx, qy, qz) = axis;
+        qd = 1.0;
+    }
+    (prim.0 + qx / qd * qmin, prim.1 + qy / qd * qmin, prim.2 + qz / qd * qmin)
+}
+
+/// Add the fragments, correcting each velocity so the cloud's centre of mass
+/// moves with the original body (`bvel`). The orbital angular momentum the
+/// fragments lost goes into their spin.
+fn spawn_fragments(b: &mut Bodies, pieces: Vec<Spawn>, bvel: (f64, f64, f64), l_before: f64) {
+    // Momentum kick of the cloud relative to the original body.
+    let (mut pvx, mut pvy, mut pvz, mut mt) = (0.0, 0.0, 0.0, 0.0);
+    for s in &pieces {
+        pvx += s.m * (s.vx - bvel.0);
+        pvy += s.m * (s.vy - bvel.1);
+        pvz += s.m * (s.vz - bvel.2);
+        mt += s.m;
+    }
     let t_imm = b.time + IMMUNITY_TIME;
     let first = b.len();
     let mut l_after = 0.0;
@@ -489,18 +533,10 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
         b.class[k] = s.class;
         l_after += s.m * (s.x * vy - s.y * vx);
     }
-
-    // Redistribute the orbital angular momentum the fragments lost
-    // back into their spin, so total L is conserved.
     let dl = l_before - l_after;
     for k in first..b.len() {
         b.spin[k] = dl * b.m[k] / mt;
     }
-
-    flash_at(b, bx, by, bz, (prim_r * 0.5).max(0.05));
-    b.stats.tidal += 1;
-    b.log(EventKind::Tidal, text, bx, by);
-    true
 }
 
 /// Sublimate ice from comet bodies near their host star.

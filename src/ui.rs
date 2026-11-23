@@ -296,6 +296,25 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
         n: b.len(),
         ..Default::default()
     };
+    count_classes(b, &mut s);
+    if b.len() <= 1000 {
+        count_moons(b, &mut s);
+    }
+    add_mass_and_motion(b, &mut s);
+    if let Some(p) = ph::primary_index(b) {
+        add_primary_stats(b, &mut s, p);
+    }
+    if b.len() <= 3000 {
+        s.hz_planets = Some(count_habitable(b));
+    }
+    s.drift = ph::energy_drift_pct(b);
+    s.dissipated = ph::energy_dissipated_pct(b);
+    s.ang_mom = ph::total_angular_momentum(b);
+    s
+}
+
+/// Bodies per class, and the total mass.
+fn count_classes(b: &Bodies, s: &mut StatsSnapshot) {
     for i in 0..b.len() {
         s.total_mass += b.m[i];
         match b.kind[i] {
@@ -312,60 +331,59 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
             BodyKind::WhiteDwarf => s.white_dwarfs += 1,
             BodyKind::NeutronStar => s.neutron_stars += 1,
             BodyKind::BlackHole => s.black_holes += 1,
-            BodyKind::Planet | BodyKind::DwarfPlanet => {
-                let o = b.origin[i];
-                if o == BodyOrigin::Comet {
-                    s.comets += 1;
-                } else if o == BodyOrigin::Interstellar {
-                    s.interstellar += 1;
-                } else if o == BodyOrigin::RoguePlanet {
-                    s.rogues += 1;
-                } else if o.is_belt() || o.is_rubble() {
-                    s.rubble += 1;
-                    if o.is_belt() {
-                        s.belt_bodies += 1;
-                    }
-                } else if b.kind[i] == BodyKind::Planet {
-                    s.planets += 1;
-                } else {
-                    s.dwarf_planets += 1;
-                }
-            }
+            BodyKind::Planet | BodyKind::DwarfPlanet => count_small_body(b, i, s),
         }
     }
-    if b.len() <= 1000 {
-        let mut moons_planet = 0;
-        let mut moons_dwarf = 0;
-        for i in 0..b.len() {
-            if matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet)
-                && b.origin[i] == BodyOrigin::Spawned
-            {
-                if let Some(p) = parent_of(b, i) {
-                    if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet)
-                        && b.origin[p] == BodyOrigin::Spawned
-                    {
-                        match b.kind[i] {
-                            BodyKind::Planet => moons_planet += 1,
-                            _ => moons_dwarf += 1,
-                        }
-                    }
-                }
-            }
+}
+
+/// Count a planet-kind body in the bucket its origin says.
+fn count_small_body(b: &Bodies, i: usize, s: &mut StatsSnapshot) {
+    let o = b.origin[i];
+    if o == BodyOrigin::Comet {
+        s.comets += 1;
+    } else if o == BodyOrigin::Interstellar {
+        s.interstellar += 1;
+    } else if o == BodyOrigin::RoguePlanet {
+        s.rogues += 1;
+    } else if o.is_belt() || o.is_rubble() {
+        s.rubble += 1;
+        if o.is_belt() {
+            s.belt_bodies += 1;
         }
-        s.moons = Some(moons_planet + moons_dwarf);
-        // Subtract from the bucket each moon was counted in.
-        s.planets -= moons_planet.min(s.planets);
-        s.dwarf_planets -= moons_dwarf.min(s.dwarf_planets);
+    } else if b.kind[i] == BodyKind::Planet {
+        s.planets += 1;
+    } else {
+        s.dwarf_planets += 1;
     }
-    // ---- extra statistics, one O(n) pass ---------------------------------
-    let n = b.len();
-    let label = |i: usize| -> String {
-        b.name[i]
-            .clone()
-            .unwrap_or_else(|| format!("#{} {}", b.id[i], ph::class_name(b, i)))
+}
+
+/// Moons: spawned planets whose parent is a spawned planet. Each moon is
+/// taken out of the bucket it was counted in.
+fn count_moons(b: &Bodies, s: &mut StatsSnapshot) {
+    let is_spawned_planet = |i: usize| {
+        matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet)
+            && b.origin[i] == BodyOrigin::Spawned
     };
+    let (mut moons_planet, mut moons_dwarf) = (0, 0);
+    for i in (0..b.len()).filter(|&i| is_spawned_planet(i)) {
+        if let Some(p) = parent_of(b, i) {
+            if is_spawned_planet(p) {
+                match b.kind[i] {
+                    BodyKind::Planet => moons_planet += 1,
+                    _ => moons_dwarf += 1,
+                }
+            }
+        }
+    }
+    s.moons = Some(moons_planet + moons_dwarf);
+    s.planets -= moons_planet.min(s.planets);
+    s.dwarf_planets -= moons_dwarf.min(s.dwarf_planets);
+}
+
+/// Mass by group, kinetic energy, barycentre motion and the oldest star.
+fn add_mass_and_motion(b: &Bodies, s: &mut StatsSnapshot) {
     let (mut mx, mut my, mut mvx, mut mvy) = (0.0, 0.0, 0.0, 0.0);
-    for i in 0..n {
+    for i in 0..b.len() {
         let m = b.m[i];
         mx += m * b.x[i];
         my += m * b.y[i];
@@ -398,52 +416,52 @@ pub fn compute_stats(b: &Bodies) -> StatsSnapshot {
         s.com_dist = (cx * cx + cy * cy).sqrt();
         s.com_speed = (mvx * mvx + mvy * mvy).sqrt() / s.total_mass;
     }
-    if let Some(p) = ph::primary_index(b) {
-        s.primary = Some((label(p), b.m[p]));
-        let mut heaviest: Option<usize> = None;
-        let mut far: Option<(usize, f64)> = None;
-        for i in 0..n {
-            if i == p {
-                continue;
-            }
-            let dx = b.x[i] - b.x[p];
-            let dy = b.y[i] - b.y[p];
-            let r = (dx * dx + dy * dy).sqrt().max(1e-12);
-            let dvx = b.vx[i] - b.vx[p];
-            let dvy = b.vy[i] - b.vy[p];
-            let mu = ph::G * (b.m[p] + b.m[i]);
-            if 0.5 * (dvx * dvx + dvy * dvy) - mu / r >= 0.0 {
-                s.unbound += 1;
-            } else if far.is_none_or(|(_, d)| r > d) {
-                far = Some((i, r));
-            }
-            if b.kind[i] == BodyKind::Planet
-                && b.origin[i] == BodyOrigin::Spawned
-                && heaviest.is_none_or(|h| b.m[i] > b.m[h])
-            {
-                heaviest = Some(i);
-            }
+}
+
+/// Statistics relative to the primary: the unbound count, the heaviest
+/// spawned planet and the farthest bound body.
+fn add_primary_stats(b: &Bodies, s: &mut StatsSnapshot, p: usize) {
+    let label = |i: usize| -> String {
+        b.name[i]
+            .clone()
+            .unwrap_or_else(|| format!("#{} {}", b.id[i], ph::class_name(b, i)))
+    };
+    s.primary = Some((label(p), b.m[p]));
+    let mut heaviest: Option<usize> = None;
+    let mut far: Option<(usize, f64)> = None;
+    for i in (0..b.len()).filter(|&i| i != p) {
+        let dx = b.x[i] - b.x[p];
+        let dy = b.y[i] - b.y[p];
+        let r = (dx * dx + dy * dy).sqrt().max(1e-12);
+        let dvx = b.vx[i] - b.vx[p];
+        let dvy = b.vy[i] - b.vy[p];
+        let mu = ph::G * (b.m[p] + b.m[i]);
+        if 0.5 * (dvx * dvx + dvy * dvy) - mu / r >= 0.0 {
+            s.unbound += 1;
+        } else if far.is_none_or(|(_, d)| r > d) {
+            far = Some((i, r));
         }
-        s.heaviest_planet = heaviest.map(|h| (label(h), b.m[h]));
-        s.farthest = far.map(|(i, d)| (label(i), d));
-    }
-    if n <= 3000 {
-        let mut hz = 0;
-        for i in 0..n {
-            if b.kind[i] == BodyKind::Planet && b.origin[i] == BodyOrigin::Spawned {
-                let f = ph::stellar_flux(b, b.x[i], b.y[i], i);
-                let (hi, ho) = ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
-                if (ho..=hi).contains(&f) {
-                    hz += 1;
-                }
-            }
+        if b.kind[i] == BodyKind::Planet
+            && b.origin[i] == BodyOrigin::Spawned
+            && heaviest.is_none_or(|h| b.m[i] > b.m[h])
+        {
+            heaviest = Some(i);
         }
-        s.hz_planets = Some(hz);
     }
-    s.drift = ph::energy_drift_pct(b);
-    s.dissipated = ph::energy_dissipated_pct(b);
-    s.ang_mom = ph::total_angular_momentum(b);
-    s
+    s.heaviest_planet = heaviest.map(|h| (label(h), b.m[h]));
+    s.farthest = far.map(|(i, d)| (label(i), d));
+}
+
+/// Spawned planets whose stellar flux lies in the habitable-zone limits.
+fn count_habitable(b: &Bodies) -> usize {
+    (0..b.len())
+        .filter(|&i| b.kind[i] == BodyKind::Planet && b.origin[i] == BodyOrigin::Spawned)
+        .filter(|&i| {
+            let f = ph::stellar_flux(b, b.x[i], b.y[i], i);
+            let (hi, ho) = ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
+            (ho..=hi).contains(&f)
+        })
+        .count()
 }
 
 /// One point in the diagnostics history. Sampled once per wall-clock second.
@@ -1822,26 +1840,10 @@ fn section_simulation(
 fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
     let si = st.units_si;
     ui.vertical(|ui| {
+        stats_section_tabs(ui, st);
+        let sec = st.stats_sections;
         // `st.stats` is the cached snapshot from `draw` (recomputed every
         // 250 ms), not a live query.
-        // Pick which sections to show.
-        ui.horizontal_wrapped(|ui| {
-            for (k, name) in ["System", "Population", "Events", "Conservation", "Solver"]
-                .iter()
-                .enumerate()
-            {
-                let on = st.stats_sections[k];
-                let txt = RichText::new(*name).small().color(if on {
-                    theme().colors.accent()
-                } else {
-                    theme().colors.dim()
-                });
-                if ui.selectable_label(on, txt).clicked() {
-                    st.stats_sections[k] = !on;
-                }
-            }
-        });
-        let sec = st.stats_sections;
         let s = &st.stats;
 
         let col_w = (ui.available_width() - 10.0) / 2.0;
@@ -1853,167 +1855,215 @@ fn section_stats(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, b: &Bodie
             .striped(true)
             .show(ui, |ui| {
                 if sec[0] {
-                    heading_row(ui, "System");
-                    kv(ui, "elapsed", fmt_time(b.time, si));
-                    kv(ui, "seed", ph::seed_to_base62(view.seed));
-                    kv(
-                        ui,
-                        "systems",
-                        format!("{} × {} bodies", view.systems, view.body_count),
-                    );
-                    if let Some(slug) = &st.loaded_preset_slug {
-                        kv(ui, "loaded", slug.clone());
-                    }
-                    kv(ui, "bodies", format!("{}", s.n));
-                    sub_kv(ui, "stars", format!("{}", s.stars));
-                    if s.brown_dwarfs > 0 {
-                        sub_kv(ui, "brown dwarfs", format!("{}", s.brown_dwarfs));
-                    }
-                    if s.white_dwarfs > 0 {
-                        sub_kv(ui, "white dwarfs", format!("{}", s.white_dwarfs));
-                    }
-                    if s.neutron_stars > 0 {
-                        sub_kv(ui, "neutron stars", format!("{}", s.neutron_stars));
-                    }
-                    if s.black_holes > 0 {
-                        sub_kv(ui, "black holes", format!("{}", s.black_holes));
-                    }
-                    sub_kv(ui, "planets", format!("{}", s.planets));
-                    if s.dwarf_planets > 0 {
-                        sub_kv(ui, "dwarf planets", format!("{}", s.dwarf_planets));
-                    }
-                    if let Some(m) = s.moons {
-                        sub_kv(ui, "moons", format!("{}", m));
-                    }
-                    if s.comets > 0 {
-                        sub_kv(ui, "comets", format!("{}", s.comets));
-                    }
-                    if s.interstellar > 0 {
-                        sub_kv(ui, "interstellar", format!("{}", s.interstellar));
-                    }
-                    if s.rogues > 0 {
-                        sub_kv(ui, "rogues", format!("{}", s.rogues));
-                    }
-                    let debris_val = if s.belt_bodies > 0 && s.belt_bodies == s.rubble {
-                        format!("{} (all belt)", s.rubble)
-                    } else if s.belt_bodies > 0 {
-                        format!("{} ({} belt)", s.rubble, s.belt_bodies)
-                    } else {
-                        format!("{}", s.rubble)
-                    };
-                    sub_kv(ui, "debris", debris_val);
-                    kv(ui, "total mass", fmt_mass(s.total_mass, si));
-                    heading_row(ui, "phase mix");
-                    sub_kv(
-                        ui,
-                        "main sequence",
-                        format!("{}", s.stars.saturating_sub(s.giants)),
-                    );
-                    sub_kv(ui, "giants", format!("{}", s.giants));
-                    sub_kv(ui, "white dwarfs", format!("{}", s.white_dwarfs));
-                    sub_kv(ui, "neutron stars", format!("{}", s.neutron_stars));
-                    sub_kv(ui, "black holes", format!("{}", s.black_holes));
-
-                    if s.total_mass > 0.0 {
-                        let pc = |x: f64| 100.0 * x / s.total_mass;
-                        heading_row(ui, "mass split");
-                        sub_kv(ui, "by stars", format!("{:.2} %", pc(s.mass_stellar)));
-                        sub_kv(ui, "by planets", format!("{:.3} %", pc(s.mass_planets)));
-                        sub_kv(ui, "by debris", format!("{:.4} %", pc(s.mass_debris)));
-                    }
+                    stats_system_rows(ui, st, s, view, b, si);
                 }
                 if sec[1] {
-                    heading_row(ui, "Population");
-                    if let Some((name, m)) = &s.primary {
-                        kv(ui, "primary", format!("{} ({})", name, fmt_mass(*m, si)));
-                    }
-                    if let Some((name, m)) = &s.heaviest_planet {
-                        kv(
-                            ui,
-                            "heaviest planet",
-                            format!("{} ({})", name, fmt_mass(*m, si)),
-                        );
-                    }
-                    if let Some((name, d)) = &s.farthest {
-                        heading_row(ui, "farthest bound");
-                        sub_kv(ui, "body", name.clone());
-                        sub_kv(ui, "from primary", fmt_len(*d, si));
-                    }
-                    kv(ui, "on escape orbits", format!("{}", s.unbound));
-                    if let Some(hz) = s.hz_planets {
-                        kv(ui, "in habitable zone", format!("{}", hz));
-                    }
-                    if let Some(age) = s.oldest_star_gyr {
-                        kv(ui, "oldest star", format!("{:.3} Gyr", age));
-                    }
-                    let eccs = &st.diag.eccs;
-                    if !eccs.is_empty() {
-                        let mean = eccs.iter().sum::<f64>() / eccs.len() as f64;
-                        let max = eccs.iter().copied().fold(0.0_f64, f64::max);
-                        heading_row(ui, "planet eccentricity");
-                        sub_kv(ui, "mean", format!("{:.3}", mean));
-                        sub_kv(ui, "max", format!("{:.3}", max));
-                        sub_kv(ui, "sampled", format!("{}", eccs.len()));
-                    }
+                    stats_population_rows(ui, st, s, si);
                 }
                 if sec[2] {
-                    heading_row(ui, "Events");
-                    kv(ui, "merges", fmt_count(b.stats.merges));
-                    kv(ui, "impacts", fmt_count(b.stats.impacts));
-                    kv(ui, "torn apart", fmt_count(b.stats.tidal));
-                    kv(ui, "escaped", fmt_count(b.stats.escaped));
+                    stats_event_rows(ui, b);
                 }
                 if sec[3] {
-                    heading_row(ui, "Conservation");
-                    // Green if drift < 1 %, orange if > 1 %, gray if no data.
-                    // 1 % is a rough "this is fine for a toy" threshold; at
-                    // 4th-order accuracy and rung-0 integration, well-behaved
-                    // sims stay under 0.1 %, so 1 % is the point where
-                    // something is likely wrong.
-                    let drift_col = match s.drift {
-                        Some(d) if d.abs() > 1.0 => theme().colors.warn(),
-                        Some(_) => theme().colors.good(),
-                        None => theme().colors.dim(),
-                    };
-                    kv_color(ui, "integrator drift", fmt_pct(s.drift), drift_col);
-                    kv(ui, "heat / escapes", fmt_pct(s.dissipated));
-                    kv(ui, "ang. momentum", format!("{:.4e}", s.ang_mom));
-                    kv(ui, "kinetic energy", format!("{:.4e}", s.kinetic));
-                    kv(ui, "barycentre offset", fmt_len(s.com_dist, si));
-                    kv(ui, "barycentre speed", fmt_speed(s.com_speed, si));
+                    stats_conservation_rows(ui, s, si);
                 }
                 if sec[4] {
-                    heading_row(ui, "Solver");
-                    // The solver names are hardcoded to match `physics.rs`'s
-                    // thresholds (PAR_DIRECT_MIN, BH_THRESHOLD). If those
-                    // constants change, this display lies. It's cheap enough
-                    // not to bother with a single source of truth.
-                    let solver = if b.len() < ph::PAR_DIRECT_MIN {
-                        "direct pairs".to_string()
-                    } else if b.len() < ph::BH_THRESHOLD {
-                        "direct, parallel".to_string()
-                    } else {
-                        format!("Barnes-Hut θ={:.2}", ph::BH_THETA)
-                    };
-                    kv(ui, "gravity", solver);
-                    let dt_s = ph::DT * ph::time_unit_s();
-                    kv(ui, "base step", format!("{:.1} h", dt_s / 3600.0));
-                    let integ = if b.stats.max_rung == 0 && b.len() < ph::YOSHIDA_MAX_N {
-                        "Yoshida 4th order"
-                    } else {
-                        "block leapfrog"
-                    };
-                    kv(ui, "integrator", integ);
-                    kv(
-                        ui,
-                        "fine ticks / step",
-                        format!("{} (rung {})", b.stats.last_nsub, b.stats.max_rung),
-                    );
-                    kv(ui, "steps/s", format!("{:.0}", view.steps_per_sec));
-                    kv(ui, "zoom", format!("{:.4} px/Gm", view.zoom));
+                    stats_solver_rows(ui, b, view);
                 }
             });
     });
+}
+
+/// Toggle chips choosing which statistics sections are shown.
+fn stats_section_tabs(ui: &mut egui::Ui, st: &mut UiState) {
+    ui.horizontal_wrapped(|ui| {
+        for (k, name) in ["System", "Population", "Events", "Conservation", "Solver"]
+            .iter()
+            .enumerate()
+        {
+            let on = st.stats_sections[k];
+            let colour = if on { theme().colors.accent() } else { theme().colors.dim() };
+            if ui.selectable_label(on, RichText::new(*name).small().color(colour)).clicked() {
+                st.stats_sections[k] = !on;
+            }
+        }
+    });
+}
+
+/// "System": elapsed time, seed, body counts by kind, mass totals and splits.
+fn stats_system_rows(
+    ui: &mut egui::Ui,
+    st: &UiState,
+    s: &StatsSnapshot,
+    view: &ViewInfo,
+    b: &Bodies,
+    si: bool,
+) {
+                heading_row(ui, "System");
+                kv(ui, "elapsed", fmt_time(b.time, si));
+                kv(ui, "seed", ph::seed_to_base62(view.seed));
+                kv(
+                    ui,
+                    "systems",
+                    format!("{} × {} bodies", view.systems, view.body_count),
+                );
+                if let Some(slug) = &st.loaded_preset_slug {
+                    kv(ui, "loaded", slug.clone());
+                }
+                kv(ui, "bodies", format!("{}", s.n));
+                sub_kv(ui, "stars", format!("{}", s.stars));
+                if s.brown_dwarfs > 0 {
+                    sub_kv(ui, "brown dwarfs", format!("{}", s.brown_dwarfs));
+                }
+                if s.white_dwarfs > 0 {
+                    sub_kv(ui, "white dwarfs", format!("{}", s.white_dwarfs));
+                }
+                if s.neutron_stars > 0 {
+                    sub_kv(ui, "neutron stars", format!("{}", s.neutron_stars));
+                }
+                if s.black_holes > 0 {
+                    sub_kv(ui, "black holes", format!("{}", s.black_holes));
+                }
+                sub_kv(ui, "planets", format!("{}", s.planets));
+                if s.dwarf_planets > 0 {
+                    sub_kv(ui, "dwarf planets", format!("{}", s.dwarf_planets));
+                }
+                if let Some(m) = s.moons {
+                    sub_kv(ui, "moons", format!("{}", m));
+                }
+                if s.comets > 0 {
+                    sub_kv(ui, "comets", format!("{}", s.comets));
+                }
+                if s.interstellar > 0 {
+                    sub_kv(ui, "interstellar", format!("{}", s.interstellar));
+                }
+                if s.rogues > 0 {
+                    sub_kv(ui, "rogues", format!("{}", s.rogues));
+                }
+                let debris_val = if s.belt_bodies > 0 && s.belt_bodies == s.rubble {
+                    format!("{} (all belt)", s.rubble)
+                } else if s.belt_bodies > 0 {
+                    format!("{} ({} belt)", s.rubble, s.belt_bodies)
+                } else {
+                    format!("{}", s.rubble)
+                };
+                sub_kv(ui, "debris", debris_val);
+                kv(ui, "total mass", fmt_mass(s.total_mass, si));
+                heading_row(ui, "phase mix");
+                sub_kv(
+                    ui,
+                    "main sequence",
+                    format!("{}", s.stars.saturating_sub(s.giants)),
+                );
+                sub_kv(ui, "giants", format!("{}", s.giants));
+                sub_kv(ui, "white dwarfs", format!("{}", s.white_dwarfs));
+                sub_kv(ui, "neutron stars", format!("{}", s.neutron_stars));
+                sub_kv(ui, "black holes", format!("{}", s.black_holes));
+
+                if s.total_mass > 0.0 {
+                    let pc = |x: f64| 100.0 * x / s.total_mass;
+                    heading_row(ui, "mass split");
+                    sub_kv(ui, "by stars", format!("{:.2} %", pc(s.mass_stellar)));
+                    sub_kv(ui, "by planets", format!("{:.3} %", pc(s.mass_planets)));
+                    sub_kv(ui, "by debris", format!("{:.4} %", pc(s.mass_debris)));
+                }
+}
+
+/// "Population": primary, heaviest planet, farthest bound body, eccentricities.
+fn stats_population_rows(ui: &mut egui::Ui, st: &UiState, s: &StatsSnapshot, si: bool) {
+                heading_row(ui, "Population");
+                if let Some((name, m)) = &s.primary {
+                    kv(ui, "primary", format!("{} ({})", name, fmt_mass(*m, si)));
+                }
+                if let Some((name, m)) = &s.heaviest_planet {
+                    kv(
+                        ui,
+                        "heaviest planet",
+                        format!("{} ({})", name, fmt_mass(*m, si)),
+                    );
+                }
+                if let Some((name, d)) = &s.farthest {
+                    heading_row(ui, "farthest bound");
+                    sub_kv(ui, "body", name.clone());
+                    sub_kv(ui, "from primary", fmt_len(*d, si));
+                }
+                kv(ui, "on escape orbits", format!("{}", s.unbound));
+                if let Some(hz) = s.hz_planets {
+                    kv(ui, "in habitable zone", format!("{}", hz));
+                }
+                if let Some(age) = s.oldest_star_gyr {
+                    kv(ui, "oldest star", format!("{:.3} Gyr", age));
+                }
+                let eccs = &st.diag.eccs;
+                if !eccs.is_empty() {
+                    let mean = eccs.iter().sum::<f64>() / eccs.len() as f64;
+                    let max = eccs.iter().copied().fold(0.0_f64, f64::max);
+                    heading_row(ui, "planet eccentricity");
+                    sub_kv(ui, "mean", format!("{:.3}", mean));
+                    sub_kv(ui, "max", format!("{:.3}", max));
+                    sub_kv(ui, "sampled", format!("{}", eccs.len()));
+                }
+}
+
+/// "Events": cumulative collision and escape counters.
+fn stats_event_rows(ui: &mut egui::Ui, b: &Bodies) {
+                heading_row(ui, "Events");
+                kv(ui, "merges", fmt_count(b.stats.merges));
+                kv(ui, "impacts", fmt_count(b.stats.impacts));
+                kv(ui, "torn apart", fmt_count(b.stats.tidal));
+                kv(ui, "escaped", fmt_count(b.stats.escaped));
+}
+
+/// "Conservation": integrator drift, ang. momentum, barycentre motion.
+fn stats_conservation_rows(ui: &mut egui::Ui, s: &StatsSnapshot, si: bool) {
+                heading_row(ui, "Conservation");
+                // Green if drift < 1 %, orange if > 1 %, gray if no data.
+                // 1 % is a rough "this is fine for a toy" threshold; at
+                // 4th-order accuracy and rung-0 integration, well-behaved
+                // sims stay under 0.1 %, so 1 % is the point where
+                // something is likely wrong.
+                let drift_col = match s.drift {
+                    Some(d) if d.abs() > 1.0 => theme().colors.warn(),
+                    Some(_) => theme().colors.good(),
+                    None => theme().colors.dim(),
+                };
+                kv_color(ui, "integrator drift", fmt_pct(s.drift), drift_col);
+                kv(ui, "heat / escapes", fmt_pct(s.dissipated));
+                kv(ui, "ang. momentum", format!("{:.4e}", s.ang_mom));
+                kv(ui, "kinetic energy", format!("{:.4e}", s.kinetic));
+                kv(ui, "barycentre offset", fmt_len(s.com_dist, si));
+                kv(ui, "barycentre speed", fmt_speed(s.com_speed, si));
+}
+
+/// "Solver": which gravity and integration scheme is in use right now.
+fn stats_solver_rows(ui: &mut egui::Ui, b: &Bodies, view: &ViewInfo) {
+                heading_row(ui, "Solver");
+                // The solver names are hardcoded to match `physics.rs`'s
+                // thresholds (PAR_DIRECT_MIN, BH_THRESHOLD). If those
+                // constants change, this display lies. It's cheap enough
+                // not to bother with a single source of truth.
+                let solver = if b.len() < ph::PAR_DIRECT_MIN {
+                    "direct pairs".to_string()
+                } else if b.len() < ph::BH_THRESHOLD {
+                    "direct, parallel".to_string()
+                } else {
+                    format!("Barnes-Hut θ={:.2}", ph::BH_THETA)
+                };
+                kv(ui, "gravity", solver);
+                let dt_s = ph::DT * ph::time_unit_s();
+                kv(ui, "base step", format!("{:.1} h", dt_s / 3600.0));
+                let integ = if b.stats.max_rung == 0 && b.len() < ph::YOSHIDA_MAX_N {
+                    "Yoshida 4th order"
+                } else {
+                    "block leapfrog"
+                };
+                kv(ui, "integrator", integ);
+                kv(
+                    ui,
+                    "fine ticks / step",
+                    format!("{} (rung {})", b.stats.last_nsub, b.stats.max_rung),
+                );
+                kv(ui, "steps/s", format!("{:.0}", view.steps_per_sec));
+                kv(ui, "zoom", format!("{:.4} px/Gm", view.zoom));
 }
 
 fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
@@ -2197,159 +2247,9 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
         // still `Random` under the hood.
         let random_selected =
             view.preset == crate::Preset::Random && st.loaded_preset_slug.is_none();
-
-        let names: Vec<(String, String)> = st.preset_names().to_vec();
-        let current_name = if let Some(slug) = &st.loaded_preset_slug {
-            names
-                .iter()
-                .find(|(s, _)| s == slug)
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| slug.clone())
-        } else {
-            match view.preset {
-                crate::Preset::SolarSystem => "Solar System".to_string(),
-                crate::Preset::Random => "Random".to_string(),
-            }
-        };
-
-        enum Choice {
-            Random,
-            SolarSystem,
-            Library(String),
-        }
-        let mut choice: Option<Choice> = None;
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("preset").color(theme().colors.dim()));
-            egui::ComboBox::from_id_salt("preset_picker")
-                .selected_text(current_name)
-                .width(200.0)
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(random_selected, "Random").clicked() {
-                        choice = Some(Choice::Random);
-                    }
-                    for (slug, name) in &names {
-                        let slug: &String = slug;
-                        let selected = if slug == "solar_system" {
-                            view.preset == crate::Preset::SolarSystem
-                                && st.loaded_preset_slug.is_none()
-                        } else {
-                            st.loaded_preset_slug.as_deref() == Some(slug.as_str())
-                        };
-                        if ui.selectable_label(selected, name).clicked() {
-                            choice = Some(if slug == "solar_system" {
-                                Choice::SolarSystem
-                            } else {
-                                Choice::Library(slug.clone())
-                            });
-                        }
-                    }
-                });
-        });
-        match choice {
-            Some(Choice::Random) => act.preset = Some(crate::Preset::Random),
-            Some(Choice::SolarSystem) => act.preset = Some(crate::Preset::SolarSystem),
-            Some(Choice::Library(slug)) => act.load_preset = Some(slug),
-            None => {}
-        }
-
+        preset_picker(ui, st, view, random_selected, act);
         if random_selected {
-            // Body count — the per-system target. With realistic
-            // belts, this is a *ceiling*, not the actual spawn count:
-            // a typical system has ~15 planets + a handful of belt
-            // tracers, far below the slider value.
-            ui.add(
-                egui::Slider::new(&mut st.pending_count, 10..=50_000)
-                    .logarithmic(true)
-                    .text("bodies"),
-            );
-            // Systems — Random only. Committed on drag-release so
-            // dragging doesn't rebuild the sim every frame.
-            let r = ui.add(
-                egui::Slider::new(&mut st.pending_systems, 1..=ph::MAX_SOLAR_SYSTEMS)
-                    .logarithmic(true)
-                    .text("systems"),
-            );
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                act.systems = Some(st.pending_systems);
-            }
-            // Warn if the requested combination exceeds MAX_BODIES.
-            // `spawn_random_systems_impl` clamps `body_count`
-            // per-system to fit, but the user should see that
-            // happening rather than discovering it from the live
-            // count.
-            let n_sys = st.pending_systems;
-            let n_bodies = st.pending_count;
-            let requested = n_bodies.saturating_mul(n_sys);
-            if requested > ph::MAX_BODIES {
-                let effective_per_system = ph::MAX_BODIES / n_sys.max(1);
-                ui.label(
-                    RichText::new(format!(
-                        "⚠ {n_sys} × {n_bodies} > {}: each system capped at {effective_per_system}",
-                        ph::MAX_BODIES
-                    ))
-                    .small()
-                    .color(theme().colors.warn()),
-                );
-            }
-            // Seed.
-            ui.horizontal(|ui| {
-                ui.label("seed");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut st.pending_seed_text)
-                        .char_limit(ph::SEED_LEN)
-                        .desired_width(150.0),
-                );
-                if r.changed() && ph::seed_from_base62(&st.pending_seed_text).is_none() {
-                    // Hold the old value: `commit_seed_text` uses
-                    // the fallback.
-                    st.seed_text_invalid = true;
-                } else if r.changed() {
-                    st.seed_text_invalid = false;
-                }
-                if st.seed_text_invalid {
-                    r.on_hover_text(
-                        RichText::new("invalid base62 seed").color(Color32::from_rgb(220, 60, 60)),
-                    );
-                }
-                if ui
-                    .button("Random")
-                    .on_hover_text("roll a new random seed")
-                    .clicked()
-                {
-                    st.pending_seed_text = ph::seed_to_base62(random_seed());
-                    st.seed_text_invalid = false;
-                }
-                if ui
-                    .button("Copy")
-                    .on_hover_text("copy the seed of the current system")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(ph::seed_to_base62(view.seed));
-                }
-            });
-            // Status line. `body_count` is the per-system *target*;
-            // the live count shows what actually spawned. They differ
-            // because realistic belts are sparse — a typical 4.6-Gyr
-            // G dwarf has ~15 planets and ~5 debris tracers, not the
-            // thousands a full belt would hold.
-            let live_per_system = view.total_bodies.checked_div(view.systems).unwrap_or(0);
-            ui.label(
-                RichText::new(format!(
-                    "{} system{} × {} target • {} live ({} per system)",
-                    view.systems,
-                    if view.systems == 1 { "" } else { "s" },
-                    view.body_count,
-                    view.total_bodies,
-                    live_per_system,
-                ))
-                .small()
-                .color(theme().colors.dim()),
-            );
-            if ui.button("Generate").clicked() {
-                act.body_count = Some(st.pending_count);
-                act.seed = Some(commit_seed_text(&st.pending_seed_text, view.seed));
-            }
+            random_system_controls(ui, st, view, act);
         } else {
             // Named preset: no sliders, just info + reload.
             ui.label(
@@ -2359,6 +2259,167 @@ fn section_generate(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
             );
         }
     });
+}
+
+/// What the preset drop-down selected.
+enum PresetChoice {
+    Random,
+    SolarSystem,
+    Library(String),
+}
+
+/// The preset drop-down: Random, the built-in Solar System, and the library.
+fn preset_picker(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    view: &ViewInfo,
+    random_selected: bool,
+    act: &mut Actions,
+) {
+    let names: Vec<(String, String)> = st.preset_names().to_vec();
+    let current_name = match &st.loaded_preset_slug {
+        Some(slug) => names
+            .iter()
+            .find(|(s, _)| s == slug)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| slug.clone()),
+        None => match view.preset {
+            crate::Preset::SolarSystem => "Solar System".to_string(),
+            crate::Preset::Random => "Random".to_string(),
+        },
+    };
+    let mut choice: Option<PresetChoice> = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("preset").color(theme().colors.dim()));
+        egui::ComboBox::from_id_salt("preset_picker")
+            .selected_text(current_name)
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(random_selected, "Random").clicked() {
+                    choice = Some(PresetChoice::Random);
+                }
+                for (slug, name) in &names {
+                    let is_solar = slug == "solar_system";
+                    let selected = if is_solar {
+                        view.preset == crate::Preset::SolarSystem && st.loaded_preset_slug.is_none()
+                    } else {
+                        st.loaded_preset_slug.as_deref() == Some(slug.as_str())
+                    };
+                    if ui.selectable_label(selected, name).clicked() {
+                        choice = Some(if is_solar {
+                            PresetChoice::SolarSystem
+                        } else {
+                            PresetChoice::Library(slug.clone())
+                        });
+                    }
+                }
+            });
+    });
+    match choice {
+        Some(PresetChoice::Random) => act.preset = Some(crate::Preset::Random),
+        Some(PresetChoice::SolarSystem) => act.preset = Some(crate::Preset::SolarSystem),
+        Some(PresetChoice::Library(slug)) => act.load_preset = Some(slug),
+        None => {}
+    }
+}
+
+/// Sliders, seed box, status line and the Generate button for random systems.
+fn random_system_controls(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut Actions) {
+    // Body count: the per-system target. With realistic belts this is a
+    // *ceiling*, not the actual spawn count: a typical system has ~15 planets
+    // and a handful of belt tracers, far below the slider value.
+    ui.add(
+        egui::Slider::new(&mut st.pending_count, 10..=50_000)
+            .logarithmic(true)
+            .text("bodies"),
+    );
+    // Systems: committed on drag-release so dragging doesn't rebuild the sim
+    // every frame.
+    let r = ui.add(
+        egui::Slider::new(&mut st.pending_systems, 1..=ph::MAX_SOLAR_SYSTEMS)
+            .logarithmic(true)
+            .text("systems"),
+    );
+    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+        act.systems = Some(st.pending_systems);
+    }
+    body_cap_warning(ui, st.pending_systems, st.pending_count);
+    seed_row(ui, st, view);
+    population_status_line(ui, view);
+    if ui.button("Generate").clicked() {
+        act.body_count = Some(st.pending_count);
+        act.seed = Some(commit_seed_text(&st.pending_seed_text, view.seed));
+    }
+}
+
+/// Warn when the requested systems × bodies exceeds `MAX_BODIES`.
+/// `spawn_random_systems_impl` clamps the per-system count to fit, but the
+/// user should see that happening rather than discover it from the live count.
+fn body_cap_warning(ui: &mut egui::Ui, n_systems: usize, n_bodies: usize) {
+    if n_bodies.saturating_mul(n_systems) <= ph::MAX_BODIES {
+        return;
+    }
+    let effective_per_system = ph::MAX_BODIES / n_systems.max(1);
+    ui.label(
+        RichText::new(format!(
+            "⚠ {n_systems} × {n_bodies} > {}: each system capped at {effective_per_system}",
+            ph::MAX_BODIES
+        ))
+        .small()
+        .color(theme().colors.warn()),
+    );
+}
+
+/// Seed text box (base62), with Random and Copy buttons.
+fn seed_row(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo) {
+    ui.horizontal(|ui| {
+        ui.label("seed");
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut st.pending_seed_text)
+                .char_limit(ph::SEED_LEN)
+                .desired_width(150.0),
+        );
+        if r.changed() {
+            // An invalid value holds the old seed: `commit_seed_text` falls back.
+            st.seed_text_invalid = ph::seed_from_base62(&st.pending_seed_text).is_none();
+        }
+        if st.seed_text_invalid {
+            r.on_hover_text(
+                RichText::new("invalid base62 seed").color(Color32::from_rgb(220, 60, 60)),
+            );
+        }
+        if ui.button("Random").on_hover_text("roll a new random seed").clicked() {
+            st.pending_seed_text = ph::seed_to_base62(random_seed());
+            st.seed_text_invalid = false;
+        }
+        if ui
+            .button("Copy")
+            .on_hover_text("copy the seed of the current system")
+            .clicked()
+        {
+            ui.ctx().copy_text(ph::seed_to_base62(view.seed));
+        }
+    });
+}
+
+/// `body_count` is the per-system *target*; the live count shows what
+/// actually spawned. They differ because realistic belts are sparse: a typical
+/// 4.6-Gyr G dwarf has ~15 planets and ~5 debris tracers, not the thousands a
+/// full belt would hold.
+fn population_status_line(ui: &mut egui::Ui, view: &ViewInfo) {
+    let live_per_system = view.total_bodies.checked_div(view.systems).unwrap_or(0);
+    ui.label(
+        RichText::new(format!(
+            "{} system{} × {} target • {} live ({} per system)",
+            view.systems,
+            if view.systems == 1 { "" } else { "s" },
+            view.body_count,
+            view.total_bodies,
+            live_per_system,
+        ))
+        .small()
+        .color(theme().colors.dim()),
+    );
 }
 
 /// Map an event kind to a text color: merges are white-ish blue, impacts
@@ -2409,7 +2470,6 @@ const EVENT_KINDS: [(EventKind, &str); 9] = [
 /// body list.
 fn systems_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
     let mut open = st.show_systems;
-    let si = st.units_si;
     let mut pick: Option<Option<usize>> = None;
     egui::Window::new("Systems")
         .open(&mut open)
@@ -2429,102 +2489,11 @@ fn systems_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
             let cur = st
                 .system_filter
                 .and_then(|id| st.systems.iter().position(|s| s.root_id == id));
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{} systems", st.systems.len()))
-                        .color(theme().colors.dim()),
-                );
-                if ui
-                    .add_enabled(cur.is_some(), egui::Button::new("show all"))
-                    .on_hover_text("remove the system filter and fit everything")
-                    .clicked()
-                {
-                    pick = Some(None);
-                }
-            });
-            // Sorted view of the list. `k` below is always the index into
-            // `st.systems`, so picking works whatever the order.
-            let mut order: Vec<usize> = (0..st.systems.len()).collect();
-            {
-                let sys = &st.systems;
-                let key = st.sys_sort;
-                order.sort_by(|&x, &y| {
-                    let (p, q) = (&sys[x], &sys[y]);
-                    match key {
-                        SysSort::Index => x.cmp(&y),
-                        SysSort::Name => p.label.cmp(&q.label),
-                        SysSort::Bodies => p.n.cmp(&q.n),
-                        SysSort::Mass => p.mass.partial_cmp(&q.mass).unwrap_or(std::cmp::Ordering::Equal),
-                        SysSort::Radius => p.radius.partial_cmp(&q.radius).unwrap_or(std::cmp::Ordering::Equal),
-                    }
-                });
-                if st.sys_sort_desc {
-                    order.reverse();
-                }
-            }
+            systems_summary_row(ui, st, cur, &mut pick);
+            let order = systems_order(st);
             egui::ScrollArea::vertical()
                 .max_height((ctx.content_rect().height() - 220.0).max(160.0))
-                .show(ui, |ui| {
-                    egui::Grid::new("systems_grid")
-                        .num_columns(5)
-                        .spacing([12.0, 3.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (name, key) in [
-                                ("#", SysSort::Index),
-                                ("main star", SysSort::Name),
-                                ("bodies", SysSort::Bodies),
-                                ("mass", SysSort::Mass),
-                                ("radius", SysSort::Radius),
-                            ] {
-                                let active = st.sys_sort == key;
-                                let arrow = if active {
-                                    if st.sys_sort_desc {
-                                        " ▼"
-                                    } else {
-                                        " ▲"
-                                    }
-                                } else {
-                                    ""
-                                };
-                                let txt = RichText::new(format!("{}{}", name, arrow))
-                                    .strong()
-                                    .color(if active {
-                                        theme().colors.accent()
-                                    } else {
-                                        Color32::WHITE
-                                    });
-                                if ui
-                                    .add(egui::Label::new(txt).sense(egui::Sense::click()))
-                                    .on_hover_text("click to sort")
-                                    .clicked()
-                                {
-                                    if active {
-                                        st.sys_sort_desc = !st.sys_sort_desc;
-                                    } else {
-                                        st.sys_sort = key;
-                                        st.sys_sort_desc = key != SysSort::Index && key != SysSort::Name;
-                                    }
-                                }
-                            }
-                            ui.end_row();
-                            for &k in &order {
-                                let s = &st.systems[k];
-                                ui.label(
-                                    RichText::new(format!("{}", k + 1))
-                                        .monospace()
-                                        .color(theme().colors.dim()),
-                                );
-                                if ui.selectable_label(cur == Some(k), &s.label).clicked() {
-                                    pick = Some(Some(k));
-                                }
-                                ui.label(RichText::new(format!("{}", s.n)).monospace());
-                                ui.label(RichText::new(fmt_mass(s.mass, si)).monospace());
-                                ui.label(RichText::new(fmt_len(s.radius, si)).monospace());
-                                ui.end_row();
-                            }
-                        });
-                });
+                .show(ui, |ui| systems_grid(ui, st, &order, cur, &mut pick));
             ui.label(
                 RichText::new("Click a system to focus it and filter the body list.")
                     .small()
@@ -2533,22 +2502,123 @@ fn systems_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
         });
     st.show_systems = open;
     if let Some(p) = pick {
-        match p {
-            None => {
-                st.system_filter = None;
-                act.fit = true;
-            }
-            Some(k) => {
-                let (id, x, y, r) = {
-                    let s = &st.systems[k];
-                    (s.root_id, s.x, s.y, s.radius)
-                };
-                st.system_filter = Some(id);
-                act.focus = Some([x, y, r]);
-            }
-        }
-        st.list_time = Instant::now() - Duration::from_secs(5);
+        apply_system_pick(st, act, p);
     }
+}
+
+/// The system count and the "show all" button.
+fn systems_summary_row(ui: &mut egui::Ui, st: &UiState, cur: Option<usize>, pick: &mut Option<Option<usize>>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} systems", st.systems.len())).color(theme().colors.dim()));
+        if ui
+            .add_enabled(cur.is_some(), egui::Button::new("show all"))
+            .on_hover_text("remove the system filter and fit everything")
+            .clicked()
+        {
+            *pick = Some(None);
+        }
+    });
+}
+
+/// Indices into `st.systems` in the chosen sort order, so that picking works
+/// whatever the order.
+fn systems_order(st: &UiState) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..st.systems.len()).collect();
+    let sys = &st.systems;
+    order.sort_by(|&x, &y| {
+        let (p, q) = (&sys[x], &sys[y]);
+        match st.sys_sort {
+            SysSort::Index => x.cmp(&y),
+            SysSort::Name => p.label.cmp(&q.label),
+            SysSort::Bodies => p.n.cmp(&q.n),
+            SysSort::Mass => p.mass.partial_cmp(&q.mass).unwrap_or(std::cmp::Ordering::Equal),
+            SysSort::Radius => p.radius.partial_cmp(&q.radius).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    if st.sys_sort_desc {
+        order.reverse();
+    }
+    order
+}
+
+fn systems_grid(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    order: &[usize],
+    cur: Option<usize>,
+    pick: &mut Option<Option<usize>>,
+) {
+    let si = st.units_si;
+    egui::Grid::new("systems_grid")
+        .num_columns(5)
+        .spacing([12.0, 3.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for (name, key) in [
+                ("#", SysSort::Index),
+                ("main star", SysSort::Name),
+                ("bodies", SysSort::Bodies),
+                ("mass", SysSort::Mass),
+                ("radius", SysSort::Radius),
+            ] {
+                systems_header_cell(ui, st, name, key);
+            }
+            ui.end_row();
+            for &k in order {
+                let s = &st.systems[k];
+                ui.label(RichText::new(format!("{}", k + 1)).monospace().color(theme().colors.dim()));
+                if ui.selectable_label(cur == Some(k), &s.label).clicked() {
+                    *pick = Some(Some(k));
+                }
+                ui.label(RichText::new(format!("{}", s.n)).monospace());
+                ui.label(RichText::new(fmt_mass(s.mass, si)).monospace());
+                ui.label(RichText::new(fmt_len(s.radius, si)).monospace());
+                ui.end_row();
+            }
+        });
+}
+
+/// A sortable column header: click to sort, click again to reverse.
+fn systems_header_cell(ui: &mut egui::Ui, st: &mut UiState, name: &str, key: SysSort) {
+    let active = st.sys_sort == key;
+    let arrow = match (active, st.sys_sort_desc) {
+        (true, true) => " ▼",
+        (true, false) => " ▲",
+        (false, _) => "",
+    };
+    let color = if active { theme().colors.accent() } else { Color32::WHITE };
+    let txt = RichText::new(format!("{}{}", name, arrow)).strong().color(color);
+    if ui
+        .add(egui::Label::new(txt).sense(egui::Sense::click()))
+        .on_hover_text("click to sort")
+        .clicked()
+    {
+        if active {
+            st.sys_sort_desc = !st.sys_sort_desc;
+        } else {
+            st.sys_sort = key;
+            st.sys_sort_desc = key != SysSort::Index && key != SysSort::Name;
+        }
+    }
+}
+
+/// Filter to a system and focus the camera on it, or clear the filter.
+fn apply_system_pick(st: &mut UiState, act: &mut Actions, pick: Option<usize>) {
+    match pick {
+        None => {
+            st.system_filter = None;
+            act.fit = true;
+        }
+        Some(k) => {
+            let (id, x, y, r) = {
+                let s = &st.systems[k];
+                (s.root_id, s.x, s.y, s.radius)
+            };
+            st.system_filter = Some(id);
+            act.focus = Some([x, y, r]);
+        }
+    }
+    st.list_time = Instant::now() - Duration::from_secs(5);
 }
 
 /// Event log window: a stacked timeline chart, a per-kind filter with counts,
@@ -2567,198 +2637,209 @@ fn events_window(ctx: &egui::Context, st: &mut UiState, b: &Bodies, act: &mut Ac
                 ui.label(RichText::new("nothing has happened yet").color(theme().colors.dim()));
                 return;
             }
-            // Counts per kind.
-            let mut counts = [0usize; 9];
-            for e in b.events.iter() {
-                if let Some(k) = EVENT_KINDS
-                    .iter()
-                    .position(|(kk, _)| event_bit(*kk) == event_bit(e.kind))
-                {
-                    counts[k] += 1;
-                }
-            }
-            // Filter chips with counts.
-            ui.horizontal_wrapped(|ui| {
-                for (k, (kind, name)) in EVENT_KINDS.iter().enumerate() {
-                    let bit = event_bit(*kind);
-                    let on = st.event_mask & bit != 0;
-                    let txt = RichText::new(format!("{} {}", name, counts[k]))
-                        .small()
-                        .color(if on {
-                            event_color(*kind)
-                        } else {
-                            theme().colors.dim()
-                        });
-                    if ui.selectable_label(on, txt).clicked() {
-                        st.event_mask ^= bit;
-                    }
-                }
-            });
+            event_filter_chips(ui, st, &count_events_per_kind(b));
             let mask = st.event_mask;
-
-            // Stacked timeline: events per time bin, coloured by kind.
-            const BINS: usize = 48;
-            let t0 = b
-                .events
-                .iter()
-                .map(|e| e.time)
-                .fold(f64::INFINITY, f64::min);
-            let t1 = b.time.max(t0 + 1e-9);
-            let span = (t1 - t0).max(1e-9);
-            let mut bins = [[0u32; 9]; BINS];
-            for e in b.events.iter().filter(|e| mask & event_bit(e.kind) != 0) {
-                if let Some(k) = EVENT_KINDS
-                    .iter()
-                    .position(|(kk, _)| event_bit(*kk) == event_bit(e.kind))
-                {
-                    let f = ((e.time - t0) / span).clamp(0.0, 1.0);
-                    let bi = ((f * BINS as f64) as usize).min(BINS - 1);
-                    bins[bi][k] += 1;
-                }
-            }
-            let peak = bins
-                .iter()
-                .map(|c| c.iter().sum::<u32>())
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            let (rect, painter, resp) = plot_rect(ui, 90.0);
-            draw_axes(rect, &painter);
-            let bw = rect.width() / BINS as f32;
-            for (bi, c) in bins.iter().enumerate() {
-                let mut y = rect.bottom();
-                for (k, &n) in c.iter().enumerate() {
-                    if n == 0 {
-                        continue;
-                    }
-                    let h = n as f32 / peak as f32 * (rect.height() - 14.0);
-                    let x0 = rect.left() + bi as f32 * bw;
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x0 + 0.5, y - h),
-                            egui::pos2(x0 + bw - 0.5, y),
-                        ),
-                        egui::CornerRadius::ZERO,
-                        event_color(EVENT_KINDS[k].0),
-                    );
-                    y -= h;
-                }
-            }
-            painter.text(
-                rect.left_top() + egui::vec2(4.0, 2.0),
-                Align2::LEFT_TOP,
-                format!("events over time (peak {} per bin)", peak),
-                FontId::monospace(10.0),
-                theme().colors.dim(),
-            );
-            painter.text(
-                rect.left_bottom() + egui::vec2(2.0, -2.0),
-                Align2::LEFT_BOTTOM,
-                fmt_time(t0, si),
-                FontId::monospace(9.0),
-                theme().colors.dim(),
-            );
-            painter.text(
-                rect.right_bottom() + egui::vec2(-2.0, -2.0),
-                Align2::RIGHT_BOTTOM,
-                fmt_time(t1, si),
-                FontId::monospace(9.0),
-                theme().colors.dim(),
-            );
-            if let Some(pos) = resp.hover_pos() {
-                let bi = (((pos.x - rect.left()) / bw) as usize).min(BINS - 1);
-                let lo = t0 + span * bi as f64 / BINS as f64;
-                let hi = t0 + span * (bi + 1) as f64 / BINS as f64;
-                let total: u32 = bins[bi].iter().sum();
-                painter.text(
-                    rect.right_top() + egui::vec2(-4.0, 2.0),
-                    Align2::RIGHT_TOP,
-                    format!("{} – {}: {}", fmt_time(lo, si), fmt_time(hi, si), total),
-                    FontId::monospace(10.0),
-                    Color32::WHITE,
-                );
-            }
+            draw_event_timeline(ui, b, mask, si);
             ui.add_space(4.0);
-
-            // Table. Distance is measured from the primary's current position.
-            let prim = ph::primary_index(b);
-            let shown = b
-                .events
-                .iter()
-                .rev()
-                .filter(|e| mask & event_bit(e.kind) != 0)
-                .count();
-            ui.label(
-                RichText::new(format!("{} shown, newest first (last 300)", shown))
-                    .small()
-                    .color(theme().colors.dim()),
-            );
-            egui::ScrollArea::both()
-                .max_height((ctx.content_rect().height() - 330.0).max(160.0))
-                .auto_shrink([false, false])
-                .id_salt("events_scroll")
-                .show(ui, |ui| {
-                    egui::Grid::new("events_grid")
-                        .num_columns(5)
-                        .spacing([12.0, 3.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for h in ["time", "ago", "type", "what", "from primary"] {
-                                ui.label(RichText::new(h).strong());
-                            }
-                            ui.end_row();
-                            for e in b
-                                .events
-                                .iter()
-                                .rev()
-                                .filter(|e| mask & event_bit(e.kind) != 0)
-                                .take(300)
-                            {
-                                let col = event_color(e.kind);
-                                let name = EVENT_KINDS
-                                    .iter()
-                                    .find(|(k, _)| event_bit(*k) == event_bit(e.kind))
-                                    .map(|(_, n)| *n)
-                                    .unwrap_or("?");
-                                ui.label(
-                                    RichText::new(fmt_time(e.time, si))
-                                        .monospace()
-                                        .small()
-                                        .color(theme().colors.dim()),
-                                );
-                                ui.label(
-                                    RichText::new(fmt_time((b.time - e.time).max(0.0), si))
-                                        .monospace()
-                                        .small()
-                                        .color(theme().colors.dim()),
-                                );
-                                ui.label(RichText::new(name).small().color(col));
-                                let resp = ui
-                                    .add(
-                                        egui::Label::new(RichText::new(&e.text).small().color(col))
-                                            .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text("click to centre the view here");
-                                if resp.clicked() {
-                                    act.center_on = Some([e.x, e.y]);
-                                }
-                                let d = prim
-                                    .map(|p| {
-                                        ((e.x - b.x[p]).powi(2) + (e.y - b.y[p]).powi(2)).sqrt()
-                                    })
-                                    .unwrap_or(f64::NAN);
-                                ui.label(RichText::new(fmt_len(d, si)).monospace().small());
-                                ui.end_row();
-                            }
-                        });
-                });
+            let table_height = (ctx.content_rect().height() - 330.0).max(160.0);
+            events_table(ui, b, mask, si, table_height, act);
         });
     st.show_events = open;
+}
+
+/// Number of timeline bins in the event chart.
+const EVENT_TIMELINE_BINS: usize = 48;
+
+/// Index of `kind` in `EVENT_KINDS` (kinds that share a filter bit share a slot).
+fn event_kind_index(kind: EventKind) -> Option<usize> {
+    EVENT_KINDS
+        .iter()
+        .position(|(k, _)| event_bit(*k) == event_bit(kind))
+}
+
+fn count_events_per_kind(b: &Bodies) -> [usize; 9] {
+    let mut counts = [0usize; 9];
+    for e in b.events.iter() {
+        if let Some(k) = event_kind_index(e.kind) {
+            counts[k] += 1;
+        }
+    }
+    counts
+}
+
+/// One toggle chip per event kind, labelled with its count.
+fn event_filter_chips(ui: &mut egui::Ui, st: &mut UiState, counts: &[usize; 9]) {
+    ui.horizontal_wrapped(|ui| {
+        for (k, (kind, name)) in EVENT_KINDS.iter().enumerate() {
+            let bit = event_bit(*kind);
+            let on = st.event_mask & bit != 0;
+            let colour = if on { event_color(*kind) } else { theme().colors.dim() };
+            let label = RichText::new(format!("{} {}", name, counts[k])).small().color(colour);
+            if ui.selectable_label(on, label).clicked() {
+                st.event_mask ^= bit;
+            }
+        }
+    });
+}
+
+/// Stacked timeline: events per time bin, coloured by kind, with the time
+/// range and a hover read-out.
+fn draw_event_timeline(ui: &mut egui::Ui, b: &Bodies, mask: u16, si: bool) {
+    const BINS: usize = EVENT_TIMELINE_BINS;
+    let t0 = b.events.iter().map(|e| e.time).fold(f64::INFINITY, f64::min);
+    let t1 = b.time.max(t0 + 1e-9);
+    let span = (t1 - t0).max(1e-9);
+    let mut bins = [[0u32; 9]; BINS];
+    for e in b.events.iter().filter(|e| mask & event_bit(e.kind) != 0) {
+        if let Some(k) = event_kind_index(e.kind) {
+            let f = ((e.time - t0) / span).clamp(0.0, 1.0);
+            let bi = ((f * BINS as f64) as usize).min(BINS - 1);
+            bins[bi][k] += 1;
+        }
+    }
+    let peak = bins.iter().map(|c| c.iter().sum::<u32>()).max().unwrap_or(1).max(1);
+    let (rect, painter, resp) = plot_rect(ui, 90.0);
+    draw_axes(rect, &painter);
+    let bw = rect.width() / BINS as f32;
+    for (bi, c) in bins.iter().enumerate() {
+        let mut y = rect.bottom();
+        for (k, &n) in c.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let h = n as f32 / peak as f32 * (rect.height() - 14.0);
+            let x0 = rect.left() + bi as f32 * bw;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0 + 0.5, y - h), egui::pos2(x0 + bw - 0.5, y)),
+                egui::CornerRadius::ZERO,
+                event_color(EVENT_KINDS[k].0),
+            );
+            y -= h;
+        }
+    }
+    let dim = theme().colors.dim();
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 2.0),
+        Align2::LEFT_TOP,
+        format!("events over time (peak {} per bin)", peak),
+        FontId::monospace(10.0),
+        dim,
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(2.0, -2.0),
+        Align2::LEFT_BOTTOM,
+        fmt_time(t0, si),
+        FontId::monospace(9.0),
+        dim,
+    );
+    painter.text(
+        rect.right_bottom() + egui::vec2(-2.0, -2.0),
+        Align2::RIGHT_BOTTOM,
+        fmt_time(t1, si),
+        FontId::monospace(9.0),
+        dim,
+    );
+    if let Some(pos) = resp.hover_pos() {
+        let bi = (((pos.x - rect.left()) / bw) as usize).min(BINS - 1);
+        let lo = t0 + span * bi as f64 / BINS as f64;
+        let hi = t0 + span * (bi + 1) as f64 / BINS as f64;
+        let total: u32 = bins[bi].iter().sum();
+        painter.text(
+            rect.right_top() + egui::vec2(-4.0, 2.0),
+            Align2::RIGHT_TOP,
+            format!("{} – {}: {}", fmt_time(lo, si), fmt_time(hi, si), total),
+            FontId::monospace(10.0),
+            Color32::WHITE,
+        );
+    }
+}
+
+/// Number of newest events listed in the table.
+const EVENT_TABLE_ROWS: usize = 300;
+
+/// The event table, newest first. Distance is measured from the primary's
+/// current position; clicking a row asks the view to centre on the event.
+fn events_table(
+    ui: &mut egui::Ui,
+    b: &Bodies,
+    mask: u16,
+    si: bool,
+    max_height: f32,
+    act: &mut Actions,
+) {
+    let prim = ph::primary_index(b);
+    let shown = b.events.iter().filter(|e| mask & event_bit(e.kind) != 0).count();
+    ui.label(
+        RichText::new(format!("{} shown, newest first (last {})", shown, EVENT_TABLE_ROWS))
+            .small()
+            .color(theme().colors.dim()),
+    );
+    egui::ScrollArea::both()
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .id_salt("events_scroll")
+        .show(ui, |ui| {
+            egui::Grid::new("events_grid")
+                .num_columns(5)
+                .spacing([12.0, 3.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["time", "ago", "type", "what", "from primary"] {
+                        ui.label(RichText::new(h).strong());
+                    }
+                    ui.end_row();
+                    let rows = b
+                        .events
+                        .iter()
+                        .rev()
+                        .filter(|e| mask & event_bit(e.kind) != 0)
+                        .take(EVENT_TABLE_ROWS);
+                    for e in rows {
+                        event_row(ui, b, e, prim, si, act);
+                    }
+                });
+        });
+}
+
+/// One row of the event table.
+fn event_row(
+    ui: &mut egui::Ui,
+    b: &Bodies,
+    e: &ph::Event,
+    primary: Option<usize>,
+    si: bool,
+    act: &mut Actions,
+) {
+    let col = event_color(e.kind);
+    let name = event_kind_index(e.kind).map(|k| EVENT_KINDS[k].1).unwrap_or("?");
+    let dim = theme().colors.dim();
+    ui.label(RichText::new(fmt_time(e.time, si)).monospace().small().color(dim));
+    ui.label(
+        RichText::new(fmt_time((b.time - e.time).max(0.0), si))
+            .monospace()
+            .small()
+            .color(dim),
+    );
+    ui.label(RichText::new(name).small().color(col));
+    let resp = ui
+        .add(egui::Label::new(RichText::new(&e.text).small().color(col)).sense(egui::Sense::click()))
+        .on_hover_text("click to centre the view here");
+    if resp.clicked() {
+        act.center_on = Some([e.x, e.y]);
+    }
+    let dist = primary
+        .map(|p| ((e.x - b.x[p]).powi(2) + (e.y - b.y[p]).powi(2)).sqrt())
+        .unwrap_or(f64::NAN);
+    ui.label(RichText::new(fmt_len(dist, si)).monospace().small());
+    ui.end_row();
 }
 
 // ---------------------------------------------------------------------------
 // Selected body
 // ---------------------------------------------------------------------------
+
+/// Most "orbiting it" rows listed in the selection window.
+const KIDS_LISTED: usize = 60;
 
 /// The floating window shown when a body is selected. Everything here is
 /// read-only except the buttons at the bottom, which emit `Edit` actions.
@@ -2775,21 +2856,8 @@ fn selection_window(
     // One O(n) `find_parent` per frame, reused for the title (moon vs
     // planet) and the Orbit section below.
     let parent = parent_of(b, i);
-    let stale = match &st.kids {
-        Some((id, t, _)) => *id != b.id[i] || t.elapsed() > Duration::from_millis(500),
-        None => true,
-    };
-    if stale {
-        st.kids = Some((b.id[i], Instant::now(), compute_kids(b, i)));
-    }
-    // The rename box follows the selection.
-    if st.edit_name_for != Some(b.id[i]) {
-        st.edit_name_for = Some(b.id[i]);
-        st.edit_name = b.name[i].clone().unwrap_or_default();
-        st.edit_mass = 1.0;
-        st.edit_vel = 1.0;
-        st.edit_confirm_delete = None;
-    }
+    refresh_kids_cache(st, b, i);
+    sync_edit_fields_to_selection(st, b, i);
     let kind = b.kind[i];
     let stellar = matches!(
         kind,
@@ -2808,57 +2876,8 @@ fn selection_window(
         .collapsible(true)
         .default_width(260.0)
         .show(ctx, |ui| {
-            // Follow and parent shortcut at the top.
-            ui.horizontal_wrapped(|ui| {
-                let mut follow = view.follow;
-                if ui.checkbox(&mut follow, "follow").changed() {
-                    act.follow = Some(follow);
-                }
-                if let Some(p) = parent {
-                    if ui
-                        .small_button("select parent")
-                        .on_hover_text(ph::tag(b, p))
-                        .clicked()
-                    {
-                        act.select = Some(Some(b.id[p]));
-                    }
-                }
-            });
-            // Section toggles. Only the sections that exist for this body
-            // are offered.
-            const NAMES: [&str; 6] = [
-                "Physical",
-                "Stellar",
-                "Climate",
-                "Orbit",
-                "State",
-                "Orbiting it",
-            ];
-            let applicable = [true, stellar, planetish, parent.is_some(), true, true];
-            ui.horizontal_wrapped(|ui| {
-                for k in 0..6 {
-                    if !applicable[k] {
-                        continue;
-                    }
-                    let on = st.sel_sections[k];
-                    let txt = RichText::new(NAMES[k]).small().color(if on {
-                        theme().colors.accent()
-                    } else {
-                        theme().colors.dim()
-                    });
-                    if ui.selectable_label(on, txt).clicked() {
-                        st.sel_sections[k] = !on;
-                    }
-                }
-            });
-            let sec = [
-                st.sel_sections[0],
-                stellar && st.sel_sections[1],
-                planetish && st.sel_sections[2],
-                parent.is_some() && st.sel_sections[3],
-                st.sel_sections[4],
-                st.sel_sections[5],
-            ];
+            selection_follow_row(ui, view, b, parent, act);
+            let sec = section_toggles(ui, st, stellar, planetish, parent.is_some());
             // Height is capped to "screen height minus 300 points", so the
             // window never overflows on small screens.
             egui::ScrollArea::vertical()
@@ -2866,9 +2885,8 @@ fn selection_window(
                 .max_height((ctx.content_rect().height() - 300.0).max(120.0))
                 .show(ui, |ui| {
                     if sec[0] || sec[1] || sec[2] || sec[3] || sec[4] {
-                        // Calculate half the available width, minus half the spacing (10.0 / 2)
+                        // Half the available width, minus half the spacing (10.0 / 2).
                         let col_w = (ui.available_width() - 10.0) / 2.0;
-
                         egui::Grid::new("sel_grid")
                             .num_columns(2)
                             .spacing([10.0, 2.0])
@@ -2881,73 +2899,7 @@ fn selection_window(
                     }
                     if sec[5] {
                         if let Some((_, _, kids)) = &st.kids {
-                            match kids {
-                                None => {
-                                    ui.label(
-                                        RichText::new(
-                                            "Too many bodies to list what orbits this one.",
-                                        )
-                                        .small()
-                                        .color(theme().colors.dim()),
-                                    );
-                                }
-                                Some(rows) if rows.is_empty() => {
-                                    ui.label(
-                                        RichText::new("Nothing orbits this body.")
-                                            .small()
-                                            .color(theme().colors.dim()),
-                                    );
-                                }
-                                Some(rows) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "Orbiting this body ({})",
-                                            rows.len()
-                                        ))
-                                        .strong()
-                                        .color(theme().colors.accent()),
-                                    );
-                                    egui::ScrollArea::vertical()
-                                        .max_height(170.0)
-                                        .id_salt("kids_scroll")
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("kids_grid")
-                                                .num_columns(4)
-                                                .spacing([10.0, 2.0])
-                                                .striped(true)
-                                                .show(ui, |ui| {
-                                                    for r in rows.iter().take(60) {
-                                                        if ui
-                                                            .selectable_label(false, &r.label)
-                                                            .clicked()
-                                                        {
-                                                            act.select = Some(Some(r.id));
-                                                        }
-                                                        ui.label(&r.class);
-                                                        ui.label(
-                                                            RichText::new(fmt_len(r.dist, si))
-                                                                .monospace(),
-                                                        );
-                                                        ui.label(
-                                                            RichText::new(fmt_time(r.period, si))
-                                                                .monospace(),
-                                                        );
-                                                        ui.end_row();
-                                                    }
-                                                });
-                                            if rows.len() > 60 {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "+{} more",
-                                                        rows.len() - 60
-                                                    ))
-                                                    .small()
-                                                    .color(theme().colors.dim()),
-                                                );
-                                            }
-                                        });
-                                }
-                            }
+                            kids_section(ui, kids, si, act);
                         }
                     }
                 });
@@ -2958,6 +2910,138 @@ fn selection_window(
     // If the user closed the window (the little X), clear the selection.
     if !open {
         act.select = Some(None);
+    }
+}
+
+/// Recompute the "what orbits this body" list when the selection changed or
+/// the cached list is older than half a second.
+fn refresh_kids_cache(st: &mut UiState, b: &Bodies, i: usize) {
+    let stale = match &st.kids {
+        Some((id, t, _)) => *id != b.id[i] || t.elapsed() > Duration::from_millis(500),
+        None => true,
+    };
+    if stale {
+        st.kids = Some((b.id[i], Instant::now(), compute_kids(b, i)));
+    }
+}
+
+/// The rename / scale boxes follow the selection: reset them when it changes.
+fn sync_edit_fields_to_selection(st: &mut UiState, b: &Bodies, i: usize) {
+    if st.edit_name_for != Some(b.id[i]) {
+        st.edit_name_for = Some(b.id[i]);
+        st.edit_name = b.name[i].clone().unwrap_or_default();
+        st.edit_mass = 1.0;
+        st.edit_vel = 1.0;
+        st.edit_confirm_delete = None;
+    }
+}
+
+/// Follow checkbox and the "select parent" shortcut at the top of the window.
+fn selection_follow_row(
+    ui: &mut egui::Ui,
+    view: &ViewInfo,
+    b: &Bodies,
+    parent: Option<usize>,
+    act: &mut Actions,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let mut follow = view.follow;
+        if ui.checkbox(&mut follow, "follow").changed() {
+            act.follow = Some(follow);
+        }
+        if let Some(p) = parent {
+            if ui
+                .small_button("select parent")
+                .on_hover_text(ph::tag(b, p))
+                .clicked()
+            {
+                act.select = Some(Some(b.id[p]));
+            }
+        }
+    });
+}
+
+/// Section toggles. Only the sections that exist for this body are offered.
+/// Returns which of the six sections are shown.
+fn section_toggles(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    stellar: bool,
+    planetish: bool,
+    has_parent: bool,
+) -> [bool; 6] {
+    const NAMES: [&str; 6] = ["Physical", "Stellar", "Climate", "Orbit", "State", "Orbiting it"];
+    let applicable = [true, stellar, planetish, has_parent, true, true];
+    ui.horizontal_wrapped(|ui| {
+        for k in 0..6 {
+            if !applicable[k] {
+                continue;
+            }
+            let on = st.sel_sections[k];
+            let colour = if on { theme().colors.accent() } else { theme().colors.dim() };
+            if ui.selectable_label(on, RichText::new(NAMES[k]).small().color(colour)).clicked() {
+                st.sel_sections[k] = !on;
+            }
+        }
+    });
+    [
+        st.sel_sections[0],
+        stellar && st.sel_sections[1],
+        planetish && st.sel_sections[2],
+        has_parent && st.sel_sections[3],
+        st.sel_sections[4],
+        st.sel_sections[5],
+    ]
+}
+
+/// The "Orbiting this body" list, or a note when it is empty or too large.
+fn kids_section(ui: &mut egui::Ui, kids: &Option<Vec<KidRow>>, si: bool, act: &mut Actions) {
+    let dim = theme().colors.dim();
+    match kids {
+        None => {
+            ui.label(
+                RichText::new("Too many bodies to list what orbits this one.")
+                    .small()
+                    .color(dim),
+            );
+        }
+        Some(rows) if rows.is_empty() => {
+            ui.label(RichText::new("Nothing orbits this body.").small().color(dim));
+        }
+        Some(rows) => {
+            ui.label(
+                RichText::new(format!("Orbiting this body ({})", rows.len()))
+                    .strong()
+                    .color(theme().colors.accent()),
+            );
+            egui::ScrollArea::vertical()
+                .max_height(170.0)
+                .id_salt("kids_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("kids_grid")
+                        .num_columns(4)
+                        .spacing([10.0, 2.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for r in rows.iter().take(KIDS_LISTED) {
+                                if ui.selectable_label(false, &r.label).clicked() {
+                                    act.select = Some(Some(r.id));
+                                }
+                                ui.label(&r.class);
+                                ui.label(RichText::new(fmt_len(r.dist, si)).monospace());
+                                ui.label(RichText::new(fmt_time(r.period, si)).monospace());
+                                ui.end_row();
+                            }
+                        });
+                    if rows.len() > KIDS_LISTED {
+                        ui.label(
+                            RichText::new(format!("+{} more", rows.len() - KIDS_LISTED))
+                                .small()
+                                .color(dim),
+                        );
+                    }
+                });
+        }
     }
 }
 
@@ -2995,13 +3079,15 @@ fn saves_fmt_age(t: Option<SystemTime>) -> String {
     }
 }
 
+/// How long a "confirm" button stays armed in the Saves window.
+const SAVE_CONFIRM_WINDOW: Duration = Duration::from_secs(4);
+/// How long the result message of a save / delete stays visible.
+const SAVE_MESSAGE_SHOWN: Duration = Duration::from_secs(10);
+
 /// The Saves window: save under a name, load, delete. Files live in
 /// `physics::SAVE_DIR`. Overwrite and delete need a second click.
 fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
     let mut open = st.show_saves;
-    let dim = theme().colors.dim();
-    let red = Color32::from_rgb(220, 90, 90);
-    let confirm_time = Duration::from_secs(4);
     egui::Window::new("Saves")
         .id(egui::Id::unique("saves_window"))
         .open(&mut open)
@@ -3017,151 +3103,143 @@ fn saves_window(ctx: &egui::Context, st: &mut UiState, act: &mut Actions) {
                     ph::SAVE_DIR
                 ))
                 .small()
-                .color(dim),
+                .color(theme().colors.dim()),
             );
-
-            // ---- Save box ----
-            let clean = ph::sanitize_save_name(&st.save_name);
-            let exists = clean.as_deref().is_some_and(ph::save_exists);
-            let armed = matches!(
-                &st.save_confirm,
-                Some((n, SaveConfirm::Overwrite, t))
-                    if Some(n.as_str()) == clean.as_deref() && t.elapsed() < confirm_time
-            );
-            ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut st.save_name)
-                        .hint_text("save name")
-                        .desired_width(180.0),
-                );
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let label = match (exists, armed) {
-                    (true, true) => "confirm overwrite",
-                    (true, false) => "save…",
-                    _ => "save",
-                };
-                let clicked = ui
-                    .add_enabled(clean.is_some(), egui::Button::new(label))
-                    .on_disabled_hover_text("Use letters, digits, space, - or _.")
-                    .clicked();
-                if (clicked || enter) && clean.is_some() {
-                    if let Some(name) = clean.clone() {
-                        if exists && !armed {
-                            st.save_confirm = Some((name, SaveConfirm::Overwrite, Instant::now()));
-                        } else {
-                            act.save = Some(name);
-                            st.save_confirm = None;
-                        }
-                    }
-                }
-            });
-            if !st.save_name.trim().is_empty() && clean.as_deref() != Some(st.save_name.trim()) {
-                let shown = clean.as_deref().unwrap_or("(no valid name)");
-                ui.label(
-                    RichText::new(format!("Name will be: {shown}"))
-                        .small()
-                        .color(dim),
-                );
-            }
-            if exists && armed {
-                ui.label(
-                    RichText::new("A save with this name exists. Click again to replace it.")
-                        .small()
-                        .color(theme().colors.warn()),
-                );
-            }
-
+            save_box(ui, st, act);
             ui.separator();
-
-            // ---- List ----
             if st.save_list.is_empty() {
-                ui.label(RichText::new("No saves yet.").color(dim));
+                ui.label(RichText::new("No saves yet.").color(theme().colors.dim()));
             } else {
-                let entries = st.save_list.clone();
-                egui::ScrollArea::vertical()
-                    .id_salt("saves_scroll")
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("saves_grid")
-                            .num_columns(4)
-                            .spacing([10.0, 4.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for e in &entries {
-                                    if ui
-                                        .selectable_label(false, &e.name)
-                                        .on_hover_text("Click to copy the name to the box.")
-                                        .clicked()
-                                    {
-                                        st.save_name = e.name.clone();
-                                    }
-                                    ui.label(
-                                        RichText::new(saves_fmt_size(e.bytes))
-                                            .small()
-                                            .monospace()
-                                            .color(dim),
-                                    );
-                                    ui.label(
-                                        RichText::new(saves_fmt_age(e.modified)).small().color(dim),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        if ui.small_button("load").clicked() {
-                                            act.load = Some(e.name.clone());
-                                        }
-                                        let del_armed = matches!(
-                                            &st.save_confirm,
-                                            Some((n, SaveConfirm::Delete, t))
-                                                if *n == e.name && t.elapsed() < confirm_time
-                                        );
-                                        if del_armed {
-                                            if ui
-                                                .small_button(RichText::new("confirm").color(red))
-                                                .clicked()
-                                            {
-                                                match ph::delete_save(&e.name) {
-                                                    Ok(()) => st.set_save_msg(
-                                                        format!("Deleted {}", e.name),
-                                                        true,
-                                                    ),
-                                                    Err(er) => st.set_save_msg(
-                                                        format!("Delete failed: {er}"),
-                                                        false,
-                                                    ),
-                                                }
-                                                st.save_confirm = None;
-                                                st.refresh_saves();
-                                            }
-                                        } else if ui.small_button("delete…").clicked() {
-                                            st.save_confirm = Some((
-                                                e.name.clone(),
-                                                SaveConfirm::Delete,
-                                                Instant::now(),
-                                            ));
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    });
+                save_list_table(ui, st, act);
             }
-
-            // ---- Message ----
-            if let Some((text, ok, t)) = &st.save_msg {
-                if t.elapsed() < Duration::from_secs(10) {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(text).small().color(if *ok {
-                        theme().colors.good()
-                    } else {
-                        theme().colors.warn()
-                    }));
-                }
-            }
+            save_message(ui, st);
             if st.save_confirm.is_some() {
                 // Redraw so a confirm button goes away when its time ends.
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
         });
     st.show_saves = open;
+}
+
+/// The name box and save button. Overwriting an existing save needs a second
+/// click within `SAVE_CONFIRM_WINDOW`.
+fn save_box(ui: &mut egui::Ui, st: &mut UiState, act: &mut Actions) {
+    let dim = theme().colors.dim();
+    let clean = ph::sanitize_save_name(&st.save_name);
+    let exists = clean.as_deref().is_some_and(ph::save_exists);
+    let armed = matches!(
+        &st.save_confirm,
+        Some((n, SaveConfirm::Overwrite, t))
+            if Some(n.as_str()) == clean.as_deref() && t.elapsed() < SAVE_CONFIRM_WINDOW
+    );
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut st.save_name)
+                .hint_text("save name")
+                .desired_width(180.0),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let label = match (exists, armed) {
+            (true, true) => "confirm overwrite",
+            (true, false) => "save…",
+            _ => "save",
+        };
+        let clicked = ui
+            .add_enabled(clean.is_some(), egui::Button::new(label))
+            .on_disabled_hover_text("Use letters, digits, space, - or _.")
+            .clicked();
+        if let (true, Some(name)) = (clicked || enter, clean.clone()) {
+            if exists && !armed {
+                st.save_confirm = Some((name, SaveConfirm::Overwrite, Instant::now()));
+            } else {
+                act.save = Some(name);
+                st.save_confirm = None;
+            }
+        }
+    });
+    if !st.save_name.trim().is_empty() && clean.as_deref() != Some(st.save_name.trim()) {
+        let shown = clean.as_deref().unwrap_or("(no valid name)");
+        ui.label(RichText::new(format!("Name will be: {shown}")).small().color(dim));
+    }
+    if exists && armed {
+        ui.label(
+            RichText::new("A save with this name exists. Click again to replace it.")
+                .small()
+                .color(theme().colors.warn()),
+        );
+    }
+}
+
+/// The saved games: name, size, age, and load / delete buttons.
+fn save_list_table(ui: &mut egui::Ui, st: &mut UiState, act: &mut Actions) {
+    let dim = theme().colors.dim();
+    let entries = st.save_list.clone();
+    egui::ScrollArea::vertical()
+        .id_salt("saves_scroll")
+        .max_height(260.0)
+        .show(ui, |ui| {
+            egui::Grid::new("saves_grid")
+                .num_columns(4)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for e in &entries {
+                        if ui
+                            .selectable_label(false, &e.name)
+                            .on_hover_text("Click to copy the name to the box.")
+                            .clicked()
+                        {
+                            st.save_name = e.name.clone();
+                        }
+                        ui.label(
+                            RichText::new(saves_fmt_size(e.bytes))
+                                .small()
+                                .monospace()
+                                .color(dim),
+                        );
+                        ui.label(RichText::new(saves_fmt_age(e.modified)).small().color(dim));
+                        ui.horizontal(|ui| save_row_buttons(ui, st, act, &e.name));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// "load" and the two-click "delete" for one save.
+fn save_row_buttons(ui: &mut egui::Ui, st: &mut UiState, act: &mut Actions, name: &str) {
+    let red = Color32::from_rgb(220, 90, 90);
+    if ui.small_button("load").clicked() {
+        act.load = Some(name.to_string());
+    }
+    let delete_armed = matches!(
+        &st.save_confirm,
+        Some((n, SaveConfirm::Delete, t)) if n == name && t.elapsed() < SAVE_CONFIRM_WINDOW
+    );
+    if delete_armed {
+        if ui.small_button(RichText::new("confirm").color(red)).clicked() {
+            match ph::delete_save(name) {
+                Ok(()) => st.set_save_msg(format!("Deleted {name}"), true),
+                Err(er) => st.set_save_msg(format!("Delete failed: {er}"), false),
+            }
+            st.save_confirm = None;
+            st.refresh_saves();
+        }
+    } else if ui.small_button("delete…").clicked() {
+        st.save_confirm = Some((name.to_string(), SaveConfirm::Delete, Instant::now()));
+    }
+}
+
+/// The result of the last save / delete, shown for a few seconds.
+fn save_message(ui: &mut egui::Ui, st: &UiState) {
+    let Some((text, ok, t)) = &st.save_msg else {
+        return;
+    };
+    if t.elapsed() >= SAVE_MESSAGE_SHOWN {
+        return;
+    }
+    ui.add_space(4.0);
+    let colour = if *ok { theme().colors.good() } else { theme().colors.warn() };
+    ui.label(RichText::new(text).small().color(colour));
 }
 
 /// A short message at the bottom of the screen after F5 or F9, when the
@@ -3207,11 +3285,6 @@ fn edit_menu(
     planetish: bool,
     act: &mut Actions,
 ) {
-    let si = st.units_si;
-    let dim = theme().colors.dim();
-    let id = b.id[i];
-    let red = Color32::from_rgb(220, 90, 90);
-
     egui::CollapsingHeader::new(RichText::new("Edit").strong())
         .id_salt("edit_header")
         .default_open(false)
@@ -3219,170 +3292,209 @@ fn edit_menu(
             ui.label(
                 RichText::new("Sliders apply when you release them.")
                     .small()
-                    .color(dim),
+                    .color(theme().colors.dim()),
             );
-
-            // ---- Mass ----
-            ui.add_space(4.0);
-            ui.label(RichText::new("Mass").strong());
-            ui.label(
-                RichText::new(format!(
-                    "{} → {}",
-                    fmt_mass(b.m[i], si),
-                    fmt_mass(b.m[i] * st.edit_mass, si)
-                ))
-                .small()
-                .monospace()
-                .color(dim),
-            );
-            let r = ui.add(
-                egui::Slider::new(&mut st.edit_mass, 0.1..=10.0)
-                    .logarithmic(true)
-                    .text("×"),
-            );
-            if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                if (st.edit_mass - 1.0).abs() > 1e-6 {
-                    act.edit = Some(Edit::MassMul(st.edit_mass));
-                }
-                st.edit_mass = 1.0;
-            }
-            ui.horizontal(|ui| {
-                for (label, f) in [("÷10", 0.1), ("÷2", 0.5), ("×2", 2.0), ("×10", 10.0)] {
-                    if ui.small_button(label).clicked() {
-                        act.edit = Some(Edit::MassMul(f));
-                    }
-                }
-            });
-
-            // ---- Orbit ----
-            ui.add_space(4.0);
-            ui.label(RichText::new("Orbit").strong());
-            let has_parent = parent.is_some();
-            ui.add_enabled_ui(has_parent, |ui| {
-                let r = ui
-                    .add(
-                        egui::Slider::new(&mut st.edit_vel, 0.25..=2.0)
-                            .logarithmic(true)
-                            .text("speed ×"),
-                    )
-                    .on_hover_text("Scale the speed relative to the parent when released.")
-                    .on_disabled_hover_text("This body has no parent.");
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    if (st.edit_vel - 1.0).abs() > 1e-6 {
-                        act.edit = Some(Edit::VelMul(st.edit_vel));
-                    }
-                    st.edit_vel = 1.0;
-                }
-            });
-            let can_circ = planetish && has_parent;
-            if ui
-                .add_enabled(can_circ, egui::Button::new("circularize"))
-                .on_hover_text("Set the speed for a circular orbit.")
-                .on_disabled_hover_text("Only a planet or dwarf planet with a parent can do this.")
-                .clicked()
-            {
-                act.edit = Some(Edit::Circularize);
-            }
-
-            // ---- Satellites ----
-            ui.add_space(4.0);
-            ui.label(RichText::new("Satellites").strong());
-            let can_moon = planetish && b.m[i] >= 0.1;
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    can_moon,
-                    egui::Slider::new(&mut st.edit_moons, 1..=8).text("moons"),
-                );
-                if ui
-                    .add_enabled(can_moon, egui::Button::new("add"))
-                    .on_disabled_hover_text("Needs a planet with mass of 0.1 or more.")
-                    .clicked()
-                {
-                    act.edit = Some(Edit::SpawnMoon(st.edit_moons));
-                }
-            });
-            let can_ring = planetish && b.m[i] >= 10.0;
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    can_ring,
-                    egui::Slider::new(&mut st.edit_ring, 5..=200).text("ring bodies"),
-                );
-                if ui
-                    .add_enabled(can_ring, egui::Button::new("add"))
-                    .on_disabled_hover_text("Needs a planet with mass of 10 or more.")
-                    .clicked()
-                {
-                    act.edit = Some(Edit::AddRing(st.edit_ring));
-                }
-            });
-
-            // ---- Name ----
-            ui.add_space(4.0);
-            ui.label(RichText::new("Name").strong());
-            ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut st.edit_name)
-                        .hint_text("name")
-                        .desired_width(140.0),
-                );
-                let enter = resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter));
-                let current = b.name[i].as_deref().unwrap_or("");
-                let changed = st.edit_name.trim() != current;
-                let clicked = ui
-                    .add_enabled(changed, egui::Button::new("rename"))
-                    .on_disabled_hover_text("The name is the same.")
-                    .clicked();
-                if (clicked || (enter && changed)) && act.edit.is_none() {
-                    act.edit = Some(Edit::Rename(st.edit_name.clone()));
-                }
-            });
-
-            // ---- Type ----
-            ui.add_space(4.0);
-            ui.label(RichText::new("Type").strong());
-            ui.horizontal_wrapped(|ui| {
-                // A click on the current type does nothing.
-                for (k, name) in KIND_CHOICES {
-                    if ui.selectable_label(b.kind[i] == k, name).clicked() && b.kind[i] != k {
-                        act.edit = Some(Edit::SetKind(k));
-                    }
-                }
-            });
-
-            // ---- Delete (two clicks) ----
-            ui.add_space(6.0);
-            ui.separator();
-            let armed = matches!(
-                st.edit_confirm_delete,
-                Some((cid, t)) if cid == id && t.elapsed() < Duration::from_secs(4)
-            );
-            if armed {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("confirm delete").color(red))
-                        .clicked()
-                    {
-                        act.edit = Some(Edit::Delete);
-                        st.edit_confirm_delete = None;
-                    }
-                    if ui.button("cancel").clicked() {
-                        st.edit_confirm_delete = None;
-                    }
-                });
-                // Redraw so the confirm button goes away when the time ends.
-                ui.ctx().request_repaint_after(Duration::from_millis(500));
-            } else {
-                st.edit_confirm_delete = None;
-                if ui.button(RichText::new("delete…").color(red)).clicked() {
-                    st.edit_confirm_delete = Some((id, Instant::now()));
-                }
-            }
-            ui.label(
-                RichText::new("Edits start a new energy baseline.")
-                    .small()
-                    .color(dim),
-            );
+            edit_mass_group(ui, st, b, i, act);
+            edit_orbit_group(ui, st, parent.is_some(), planetish, act);
+            edit_satellite_group(ui, st, b, i, planetish, act);
+            edit_name_group(ui, st, b, i, act);
+            edit_type_group(ui, b, i, act);
+            edit_delete_group(ui, st, b.id[i], act);
         });
+}
+
+/// A slider "commits" when released (or changed without dragging, e.g. by
+/// keyboard): the caller applies the factor and the slider snaps back to 1.
+fn slider_committed(r: &egui::Response) -> bool {
+    r.drag_stopped() || (r.changed() && !r.dragged())
+}
+
+/// Mass: a ×-factor slider plus quick ÷10 / ÷2 / ×2 / ×10 buttons.
+fn edit_mass_group(ui: &mut egui::Ui, st: &mut UiState, b: &Bodies, i: usize, act: &mut Actions) {
+    let si = st.units_si;
+    ui.add_space(4.0);
+    ui.label(RichText::new("Mass").strong());
+    ui.label(
+        RichText::new(format!(
+            "{} → {}",
+            fmt_mass(b.m[i], si),
+            fmt_mass(b.m[i] * st.edit_mass, si)
+        ))
+        .small()
+        .monospace()
+        .color(theme().colors.dim()),
+    );
+    let r = ui.add(
+        egui::Slider::new(&mut st.edit_mass, 0.1..=10.0)
+            .logarithmic(true)
+            .text("×"),
+    );
+    if slider_committed(&r) {
+        if (st.edit_mass - 1.0).abs() > 1e-6 {
+            act.edit = Some(Edit::MassMul(st.edit_mass));
+        }
+        st.edit_mass = 1.0;
+    }
+    ui.horizontal(|ui| {
+        for (label, f) in [("÷10", 0.1), ("÷2", 0.5), ("×2", 2.0), ("×10", 10.0)] {
+            if ui.small_button(label).clicked() {
+                act.edit = Some(Edit::MassMul(f));
+            }
+        }
+    });
+}
+
+/// Orbit: speed scaling relative to the parent, and circularize.
+fn edit_orbit_group(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    has_parent: bool,
+    planetish: bool,
+    act: &mut Actions,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Orbit").strong());
+    ui.add_enabled_ui(has_parent, |ui| {
+        let r = ui
+            .add(
+                egui::Slider::new(&mut st.edit_vel, 0.25..=2.0)
+                    .logarithmic(true)
+                    .text("speed ×"),
+            )
+            .on_hover_text("Scale the speed relative to the parent when released.")
+            .on_disabled_hover_text("This body has no parent.");
+        if slider_committed(&r) {
+            if (st.edit_vel - 1.0).abs() > 1e-6 {
+                act.edit = Some(Edit::VelMul(st.edit_vel));
+            }
+            st.edit_vel = 1.0;
+        }
+    });
+    let can_circularize = planetish && has_parent;
+    if ui
+        .add_enabled(can_circularize, egui::Button::new("circularize"))
+        .on_hover_text("Set the speed for a circular orbit.")
+        .on_disabled_hover_text("Only a planet or dwarf planet with a parent can do this.")
+        .clicked()
+    {
+        act.edit = Some(Edit::Circularize);
+    }
+}
+
+/// Smallest planet mass (M⊕) that can be given moons.
+const MIN_MASS_FOR_MOONS: f64 = 0.1;
+/// Smallest planet mass (M⊕) that can be given a ring.
+const MIN_MASS_FOR_RING: f64 = 10.0;
+
+/// Satellites: add moons or a ring of small bodies.
+fn edit_satellite_group(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    b: &Bodies,
+    i: usize,
+    planetish: bool,
+    act: &mut Actions,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Satellites").strong());
+    let can_moon = planetish && b.m[i] >= MIN_MASS_FOR_MOONS;
+    ui.horizontal(|ui| {
+        ui.add_enabled(can_moon, egui::Slider::new(&mut st.edit_moons, 1..=8).text("moons"));
+        if ui
+            .add_enabled(can_moon, egui::Button::new("add"))
+            .on_disabled_hover_text("Needs a planet with mass of 0.1 or more.")
+            .clicked()
+        {
+            act.edit = Some(Edit::SpawnMoon(st.edit_moons));
+        }
+    });
+    let can_ring = planetish && b.m[i] >= MIN_MASS_FOR_RING;
+    ui.horizontal(|ui| {
+        ui.add_enabled(
+            can_ring,
+            egui::Slider::new(&mut st.edit_ring, 5..=200).text("ring bodies"),
+        );
+        if ui
+            .add_enabled(can_ring, egui::Button::new("add"))
+            .on_disabled_hover_text("Needs a planet with mass of 10 or more.")
+            .clicked()
+        {
+            act.edit = Some(Edit::AddRing(st.edit_ring));
+        }
+    });
+}
+
+/// Name: a text box and a rename button (Enter also renames).
+fn edit_name_group(ui: &mut egui::Ui, st: &mut UiState, b: &Bodies, i: usize, act: &mut Actions) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Name").strong());
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut st.edit_name)
+                .hint_text("name")
+                .desired_width(140.0),
+        );
+        let enter = resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+        let current = b.name[i].as_deref().unwrap_or("");
+        let changed = st.edit_name.trim() != current;
+        let clicked = ui
+            .add_enabled(changed, egui::Button::new("rename"))
+            .on_disabled_hover_text("The name is the same.")
+            .clicked();
+        if (clicked || (enter && changed)) && act.edit.is_none() {
+            act.edit = Some(Edit::Rename(st.edit_name.clone()));
+        }
+    });
+}
+
+/// Type: pick a new body kind. A click on the current type does nothing.
+fn edit_type_group(ui: &mut egui::Ui, b: &Bodies, i: usize, act: &mut Actions) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Type").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (k, name) in KIND_CHOICES {
+            if ui.selectable_label(b.kind[i] == k, name).clicked() && b.kind[i] != k {
+                act.edit = Some(Edit::SetKind(k));
+            }
+        }
+    });
+}
+
+/// How long the "confirm delete" button stays armed.
+const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(4);
+
+/// Delete needs a second click within `DELETE_CONFIRM_WINDOW`.
+fn edit_delete_group(ui: &mut egui::Ui, st: &mut UiState, id: u64, act: &mut Actions) {
+    let red = Color32::from_rgb(220, 90, 90);
+    ui.add_space(6.0);
+    ui.separator();
+    let armed = matches!(
+        st.edit_confirm_delete,
+        Some((cid, t)) if cid == id && t.elapsed() < DELETE_CONFIRM_WINDOW
+    );
+    if armed {
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("confirm delete").color(red)).clicked() {
+                act.edit = Some(Edit::Delete);
+                st.edit_confirm_delete = None;
+            }
+            if ui.button("cancel").clicked() {
+                st.edit_confirm_delete = None;
+            }
+        });
+        // Redraw so the confirm button goes away when the time ends.
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    } else {
+        st.edit_confirm_delete = None;
+        if ui.button(RichText::new("delete…").color(red)).clicked() {
+            st.edit_confirm_delete = Some((id, Instant::now()));
+        }
+    }
+    ui.label(
+        RichText::new("Edits start a new energy baseline.")
+            .small()
+            .color(theme().colors.dim()),
+    );
 }
 
 /// Rows for the selection grid. Split out from `selection_window` so that
@@ -3404,347 +3516,369 @@ fn selection_rows(
     parent: Option<usize>,
     sec: [bool; 6],
 ) {
-    let m = b.m[i];
-    let r = b.r[i];
-    let kind = b.kind[i];
-    let t_unit = ph::time_unit_s();
-
     if sec[0] {
-        heading_row(ui, "Physical");
-        kv(ui, "mass", fmt_mass(m, si));
-        // "vs Earth" is shown only for sub-brown-dwarf masses; above that,
-        // the M_sun or M_jup display is more meaningful. The 0.05 threshold
-        // matches `fmt_mass`'s M_sun cutoff.
-        if si && kind != BodyKind::BlackHole && m < 0.05 * ph::M_SUN_ME {
-            kv(ui, "  vs Earth", format!("{:.3}×", m));
-        }
-        match kind {
-            BodyKind::BlackHole => {
-                // For a black hole, the "radius" is the Schwarzschild radius —
-                // the event horizon, not a surface. Showing "surface gravity"
-                // would be misleading; showing the horizon radius and capture
-                // radius is what a black-hole user actually wants.
-                kv(ui, "horizon radius", fmt_len(r, si));
-                kv(ui, "capture radius", fmt_len(b.contact_r(i), si));
-                kv(ui, "escape speed", "c (light)");
-            }
-            _ => {
-                kv(ui, "radius", fmt_len(r, si));
-                let rho = ph::density_gcc(b, i);
-                // `density_gcc` returns g/cm³, which is the standard unit
-                // for planetary densities. In non-SI mode, we show the
-                // (dimensionless) m/r³ instead, which is the raw sim unit.
-                kv(
-                    ui,
-                    // Planets and dwarf planets carry their own bulk density.
-                    if matches!(kind, BodyKind::Planet | BodyKind::DwarfPlanet) {
-                        "bulk density"
-                    } else {
-                        "density"
-                    },
-                    if si {
-                        format!("{:.2} g/cm³", rho)
-                    } else {
-                        format!("{:.3e} u", m / (r * r * r))
-                    },
-                );
-                // The surface gravity conversion is sim-units → m/s²:
-                //   g_code = G * m / r²       (sim units)
-                //   g_ms2  = g_code * LEN_m / TU_s²
-                // where LEN_m = LEN_KM * 1000 and TU_s = time_unit_s().
-                // Then divided by 9.80665 to get "× Earth gravity".
-                let g_code = ph::G * m / (r * r);
-                let g_ms2 = g_code * (ph::LEN_KM * 1000.0) / (t_unit * t_unit);
-                kv(
-                    ui,
-                    "surface gravity",
-                    if si {
-                        format!("{:.2} g⊕", g_ms2 / 9.80665)
-                    } else {
-                        format!("{:.2} u", g_code)
-                    },
-                );
-                // Escape speed from a (spherical) surface: v_esc = sqrt(2GM/R).
-                // Rendered via `fmt_speed` so the units match the rest of the
-                // UI (km/s in SI mode).
-                let ve = (2.0 * ph::G * m / r).sqrt();
-                kv(ui, "escape speed", fmt_speed(ve, si));
-            }
-        }
+        physical_rows(ui, si, b, i);
     }
-
-    match kind {
+    match b.kind[i] {
         BodyKind::Star | BodyKind::BrownDwarf | BodyKind::WhiteDwarf | BodyKind::NeutronStar
             if sec[1] =>
         {
-            heading_row(ui, "Stellar");
-            // Evolution-aware accessors: they follow a star's age and the
-            // cooling of white and brown dwarfs.
-            let l = ph::luminosity_of(b, i);
-            // Solar luminosities; neutron stars and white dwarfs get
-            // very small values, which `{:e}` handles gracefully.
-            kv(ui, "luminosity", format!("{:.3e} L☉", l));
-            kv(
-                ui,
-                "temperature",
-                format!("{:.0} K", ph::temperature_of(b, i)),
-            );
-            kv(
-                ui,
-                if kind == BodyKind::Star {
-                    "age"
-                } else {
-                    "cooling age"
-                },
-                format!("{:.3} Gyr", b.age_gyr[i]),
-            );
-            if b.m_init[i] > 0.0 && ((b.m_init[i] - m) / b.m_init[i]).abs() > 1e-6 {
-                kv(ui, "initial mass", fmt_mass(b.m_init[i], si));
-                kv(
-                    ui,
-                    "mass lost",
-                    format!("{:.2} %", 100.0 * (b.m_init[i] - m) / b.m_init[i]),
-                );
-            }
-            if let Some(phase) = ph::phase_of(b, i) {
-                kv(
-                    ui,
-                    "phase",
-                    match phase {
-                        ph::StellarPhase::MainSequence => "main sequence",
-                        ph::StellarPhase::RedGiant => "red giant",
-                        ph::StellarPhase::RedSupergiant => "red supergiant",
-                    },
-                );
-                let left = ph::star_time_left_gyr(b, i);
-                kv(
-                    ui,
-                    "time to remnant",
-                    if left >= 0.1 {
-                        format!("{:.2} Gyr", left)
-                    } else {
-                        format!("{:.0} Myr", left * 1000.0)
-                    },
-                );
-                let (rk, rm) = ph::remnant_of(b.m_init[i]);
-                let name = match rk {
-                    BodyKind::WhiteDwarf => "white dwarf",
-                    BodyKind::NeutronStar => "neutron star",
-                    _ => "black hole",
-                };
-                kv(
-                    ui,
-                    "will become",
-                    format!("{} ({})", name, ph::mass_str(rm)),
-                );
-            } else {
-                kv(ui, "stage", "remnant");
-            }
-            // Habitable zone is only defined for bodies that have a
-            // luminosity; `habitable_zone_of` returns `(NaN, NaN)` for
-            // dark ones, which the `hz0.is_finite()` check filters out.
-            let (hz0, hz1) = ph::habitable_zone_of(b, i);
-            if hz0.is_finite() {
-                kv(ui, "habitable zone", format!("{:.2} – {:.2} AU", hz0, hz1));
-            }
+            stellar_rows(ui, si, b, i);
         }
-        BodyKind::Planet | BodyKind::DwarfPlanet if sec[2] => {
-            // Stellar flux at the body's current position, summed over all
-            // luminous bodies in the system. A planet in a binary system
-            // sees both stars, and this correctly accounts for that.
-            let s = ph::stellar_flux(b, b.x[i], b.y[i], i);
-            if s > 0.0 {
-                heading_row(ui, "Climate");
-                kv(ui, "stellar flux", format!("{:.2} S⊕", s));
-                // Equilibrium temperature: T = 255 K * S^(1/4) (Bond albedo 0.3). No greenhouse — actual surface
-                // temperatures are higher, but the user gets the right idea.
-                kv(
-                    ui,
-                    "equilibrium temp",
-                    format!(
-                        "{:.0} K ({:.0} °C)",
-                        ph::equilibrium_temp(s),
-                        ph::equilibrium_temp(s) - 273.15
-                    ),
-                );
-                // "Habitable zone" here is a very rough 0.36..1.1 S_earth
-                // (the standard Kasting-ish bounds). Labeled "zone" not
-                // "habitable" because the sim doesn't know about atmosphere.
-                let (hz_in, hz_out) =
-                    ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
-                let (txt, col) = if s > hz_in {
-                    ("too hot", theme().colors.warn())
-                } else if s >= hz_out {
-                    ("in habitable zone", theme().colors.good())
-                } else {
-                    ("too cold", theme().colors.accent())
-                };
-                kv_color(ui, "zone", txt, col);
-            }
-            // Rotation and tidal heating (needs a parent to compare against).
-            if let Some(p) = parent {
-                let inertia = 0.3 * b.m[i] * b.r[i] * b.r[i];
-                if inertia > 0.0 && b.spin[i] != 0.0 {
-                    let omega = b.spin[i] / inertia;
-                    let o = ph::orbit_info(b, i, p);
-                    let day_s = std::f64::consts::TAU / omega.abs() * ph::time_unit_s();
-                    let locked = o.bound
-                        && o.period.is_finite()
-                        && (omega.abs() * o.period / std::f64::consts::TAU - 1.0).abs() < 0.02;
-                    let txt = if locked {
-                        "tidally locked".to_string()
-                    } else if day_s < 172_800.0 {
-                        format!("{:.1} h day", day_s / 3600.0)
-                    } else {
-                        format!("{:.1} d day", day_s / 86_400.0)
-                    };
-                    kv(ui, "rotation", txt);
-                }
-                let w = ph::tidal_heating_w(b, i, p);
-                if w > 1e8 {
-                    let area = 4.0 * std::f64::consts::PI * (b.r[i] * ph::LEN_KM * 1e3).powi(2);
-                    kv(
-                        ui,
-                        "tidal heating",
-                        format!("{:.1e} W ({:.2} W/m²)", w, w / area),
-                    );
-                }
-            }
-        }
+        BodyKind::Planet | BodyKind::DwarfPlanet if sec[2] => climate_rows(ui, b, i, parent),
         _ => {}
     }
-
     if let (true, Some(p)) = (sec[3], parent) {
-        let o = ph::orbit_info(b, i, p);
-        heading_row(ui, "Orbit");
-        kv(
-            ui,
-            "orbits",
-            format!("#{} {}", b.id[p], ph::class_name(b, p)),
-        );
-        kv(ui, "distance", fmt_len(o.dist, si));
-        kv(ui, "speed", fmt_speed(o.speed_rel, si));
-        {
-            let rx = b.x[i] - b.x[p];
-            let ry = b.y[i] - b.y[p];
-            let rvx = b.vx[i] - b.vx[p];
-            let rvy = b.vy[i] - b.vy[p];
-            let h = rx * rvy - ry * rvx;
+        orbit_rows(ui, si, b, i, p);
+    }
+    if sec[4] {
+        state_rows(ui, si, b, i, parent);
+    }
+}
+
+/// "Physical" section: mass, radius, density, gravity, escape speed (a black
+/// hole shows its horizon and capture radius instead).
+fn physical_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize) {
+    let (m, r, kind) = (b.m[i], b.r[i], b.kind[i]);
+    let t_unit = ph::time_unit_s();
+    heading_row(ui, "Physical");
+    kv(ui, "mass", fmt_mass(m, si));
+    // "vs Earth" is shown only for sub-brown-dwarf masses; above that,
+    // the M_sun or M_jup display is more meaningful. The 0.05 threshold
+    // matches `fmt_mass`'s M_sun cutoff.
+    if si && kind != BodyKind::BlackHole && m < 0.05 * ph::M_SUN_ME {
+        kv(ui, "  vs Earth", format!("{:.3}×", m));
+    }
+    match kind {
+        BodyKind::BlackHole => {
+            // For a black hole, the "radius" is the Schwarzschild radius —
+            // the event horizon, not a surface. Showing "surface gravity"
+            // would be misleading; showing the horizon radius and capture
+            // radius is what a black-hole user actually wants.
+            kv(ui, "horizon radius", fmt_len(r, si));
+            kv(ui, "capture radius", fmt_len(b.contact_r(i), si));
+            kv(ui, "escape speed", "c (light)");
+        }
+        _ => {
+            kv(ui, "radius", fmt_len(r, si));
+            let rho = ph::density_gcc(b, i);
+            // `density_gcc` returns g/cm³, which is the standard unit
+            // for planetary densities. In non-SI mode, we show the
+            // (dimensionless) m/r³ instead, which is the raw sim unit.
             kv(
                 ui,
-                "direction",
-                if h >= 0.0 {
-                    "counter-clockwise"
+                // Planets and dwarf planets carry their own bulk density.
+                if matches!(kind, BodyKind::Planet | BodyKind::DwarfPlanet) {
+                    "bulk density"
                 } else {
-                    "clockwise"
+                    "density"
+                },
+                if si {
+                    format!("{:.2} g/cm³", rho)
+                } else {
+                    format!("{:.3e} u", m / (r * r * r))
                 },
             );
-            if o.dist > 0.0 {
-                let vc = (ph::G * (b.m[p] + m) / o.dist).sqrt();
-                if vc > 0.0 {
-                    kv(ui, "speed / circular", format!("{:.3}", o.speed_rel / vc));
-                }
-            }
-            kv(ui, "specific ang. mom.", format!("{:.3e}", h.abs()));
-            kv(ui, "mass / parent", format!("{:.3e}", m / b.m[p]));
-        }
-        if o.bound {
-            kv(ui, "semi-major axis", fmt_len(o.semi_major, si));
-            kv(ui, "eccentricity", format!("{:.4}", o.ecc));
-            kv(ui, "period", fmt_time(o.period, si));
-            kv(ui, "periapsis", fmt_len(o.peri, si));
-            kv(ui, "apoapsis", fmt_len(o.apo, si));
-            // The "periapsis inside parent" warning fires when the body's
-            // closest approach passes through the parent's physical radius.
-            // This is a collision-on-next-periapsis warning — the body is
-            // going to merge or impact within one orbit.
-            if o.peri < b.contact_r(p) + b.contact_r(i) {
-                kv_color(
-                    ui,
-                    "warning",
-                    "periapsis inside parent",
-                    theme().colors.warn(),
-                );
-            }
-        } else {
-            // Hyperbolic / parabolic orbit. Not necessarily a problem — a
-            // recently-created debris fragment has an escape trajectory
-            // and is still "in the system" in any meaningful sense — but
-            // the user needs to know the orbit isn't closed.
-            kv_color(ui, "state", "unbound (escape orbit)", theme().colors.warn());
-        }
-        if matches!(kind, BodyKind::Planet | BodyKind::DwarfPlanet) {
-            if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet) {
-                // Moon case: show the *parent's* Hill sphere around its own
-                // host (e.g. a moon of Jupiter shows Jupiter's Hill sphere
-                // around the Sun). This is the relevant scale for moon
-                // stability, not the moon's own tiny Hill sphere.
-                kv(
-                    ui,
-                    "Hill sphere of parent",
-                    fmt_len(ph::hill_radius(b, p, ph::primary_index(b).unwrap_or(p)), si),
-                );
-            } else {
-                // Planet-of-star case: show the planet's own Hill sphere
-                // (the region within which it can host moons).
-                kv(ui, "Hill radius", fmt_len(ph::hill_radius(b, i, p), si));
-            }
-            if b.m[p] > b.m[i] && b.origin[i] == BodyOrigin::Spawned {
-                // Roche limit: within this distance, tidal forces exceed
-                // self-gravity and the body will be torn apart. Shown in
-                // orange within 1.5× the limit — that's the "you're about
-                // to be disrupted" pre-warning.
-                let roche = ph::roche_limit(b, i, p);
-                let col = if o.dist < 1.5 * roche {
-                    theme().colors.warn()
+            // The surface gravity conversion is sim-units → m/s²:
+            //   g_code = G * m / r²       (sim units)
+            //   g_ms2  = g_code * LEN_m / TU_s²
+            // where LEN_m = LEN_KM * 1000 and TU_s = time_unit_s().
+            // Then divided by 9.80665 to get "× Earth gravity".
+            let g_code = ph::G * m / (r * r);
+            let g_ms2 = g_code * (ph::LEN_KM * 1000.0) / (t_unit * t_unit);
+            kv(
+                ui,
+                "surface gravity",
+                if si {
+                    format!("{:.2} g⊕", g_ms2 / 9.80665)
                 } else {
-                    Color32::GRAY
-                };
-                kv_color(ui, "Roche limit", fmt_len(roche, si), col);
-            }
+                    format!("{:.2} u", g_code)
+                },
+            );
+            // Escape speed from a (spherical) surface: v_esc = sqrt(2GM/R).
+            // Rendered via `fmt_speed` so the units match the rest of the
+            // UI (km/s in SI mode).
+            let ve = (2.0 * ph::G * m / r).sqrt();
+            kv(ui, "escape speed", fmt_speed(ve, si));
         }
     }
+}
 
-    if sec[4] {
-        heading_row(ui, "State");
+/// "Stellar" section for stars and stellar remnants.
+fn stellar_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize) {
+    let (m, kind) = (b.m[i], b.kind[i]);
+        heading_row(ui, "Stellar");
+        // Evolution-aware accessors: they follow a star's age and the
+        // cooling of white and brown dwarfs.
+        let l = ph::luminosity_of(b, i);
+        // Solar luminosities; neutron stars and white dwarfs get
+        // very small values, which `{:e}` handles gracefully.
+        kv(ui, "luminosity", format!("{:.3e} L☉", l));
         kv(
             ui,
-            "position",
-            format!("{}, {}", fmt_len(b.x[i], si), fmt_len(b.y[i], si)),
+            "temperature",
+            format!("{:.0} K", ph::temperature_of(b, i)),
         );
-        // "speed (frame)" is the body's speed in the simulation's inertial
-        // frame — *not* relative to the primary. The orbit section shows
-        // relative speed if the body has a parent.
-        let v = (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i]).sqrt();
-        kv(ui, "speed (frame)", fmt_speed(v, si));
-        kv(ui, "momentum", format!("{:.3e}", m * v));
-        kv(ui, "kinetic energy", format!("{:.3e}", 0.5 * m * v * v));
-        if b.spin[i] != 0.0 {
-            kv(ui, "spin ang. momentum", format!("{:.3e}", b.spin[i]));
+        kv(
+            ui,
+            if kind == BodyKind::Star {
+                "age"
+            } else {
+                "cooling age"
+            },
+            format!("{:.3} Gyr", b.age_gyr[i]),
+        );
+        if b.m_init[i] > 0.0 && ((b.m_init[i] - m) / b.m_init[i]).abs() > 1e-6 {
+            kv(ui, "initial mass", fmt_mass(b.m_init[i], si));
+            kv(
+                ui,
+                "mass lost",
+                format!("{:.2} %", 100.0 * (b.m_init[i] - m) / b.m_init[i]),
+            );
         }
-        if let Some(prim) = ph::primary_index(b) {
-            if prim != i && parent != Some(prim) {
-                let dx = b.x[i] - b.x[prim];
-                let dy = b.y[i] - b.y[prim];
+        if let Some(phase) = ph::phase_of(b, i) {
+            kv(
+                ui,
+                "phase",
+                match phase {
+                    ph::StellarPhase::MainSequence => "main sequence",
+                    ph::StellarPhase::RedGiant => "red giant",
+                    ph::StellarPhase::RedSupergiant => "red supergiant",
+                },
+            );
+            let left = ph::star_time_left_gyr(b, i);
+            kv(
+                ui,
+                "time to remnant",
+                if left >= 0.1 {
+                    format!("{:.2} Gyr", left)
+                } else {
+                    format!("{:.0} Myr", left * 1000.0)
+                },
+            );
+            let (rk, rm) = ph::remnant_of(b.m_init[i]);
+            let name = match rk {
+                BodyKind::WhiteDwarf => "white dwarf",
+                BodyKind::NeutronStar => "neutron star",
+                _ => "black hole",
+            };
+            kv(
+                ui,
+                "will become",
+                format!("{} ({})", name, ph::mass_str(rm)),
+            );
+        } else {
+            kv(ui, "stage", "remnant");
+        }
+        // Habitable zone is only defined for bodies that have a
+        // luminosity; `habitable_zone_of` returns `(NaN, NaN)` for
+        // dark ones, which the `hz0.is_finite()` check filters out.
+        let (hz0, hz1) = ph::habitable_zone_of(b, i);
+        if hz0.is_finite() {
+            kv(ui, "habitable zone", format!("{:.2} – {:.2} AU", hz0, hz1));
+        }
+}
+
+/// "Climate" section (flux, temperature, zone, rotation, tidal heating) for
+/// planets that receive stellar flux.
+fn climate_rows(ui: &mut egui::Ui, b: &Bodies, i: usize, parent: Option<usize>) {
+        // Stellar flux at the body's current position, summed over all
+        // luminous bodies in the system. A planet in a binary system
+        // sees both stars, and this correctly accounts for that.
+        let s = ph::stellar_flux(b, b.x[i], b.y[i], i);
+        if s > 0.0 {
+            heading_row(ui, "Climate");
+            kv(ui, "stellar flux", format!("{:.2} S⊕", s));
+            // Equilibrium temperature: T = 255 K * S^(1/4) (Bond albedo 0.3). No greenhouse — actual surface
+            // temperatures are higher, but the user gets the right idea.
+            kv(
+                ui,
+                "equilibrium temp",
+                format!(
+                    "{:.0} K ({:.0} °C)",
+                    ph::equilibrium_temp(s),
+                    ph::equilibrium_temp(s) - 273.15
+                ),
+            );
+            // "Habitable zone" here is a very rough 0.36..1.1 S_earth
+            // (the standard Kasting-ish bounds). Labeled "zone" not
+            // "habitable" because the sim doesn't know about atmosphere.
+            let (hz_in, hz_out) =
+                ph::hz_flux_limits(ph::stellar_flux_teff(b, b.x[i], b.y[i], i));
+            let (txt, col) = if s > hz_in {
+                ("too hot", theme().colors.warn())
+            } else if s >= hz_out {
+                ("in habitable zone", theme().colors.good())
+            } else {
+                ("too cold", theme().colors.accent())
+            };
+            kv_color(ui, "zone", txt, col);
+        }
+        // Rotation and tidal heating (needs a parent to compare against).
+        if let Some(p) = parent {
+            let inertia = 0.3 * b.m[i] * b.r[i] * b.r[i];
+            if inertia > 0.0 && b.spin[i] != 0.0 {
+                let omega = b.spin[i] / inertia;
+                let o = ph::orbit_info(b, i, p);
+                let day_s = std::f64::consts::TAU / omega.abs() * ph::time_unit_s();
+                let locked = o.bound
+                    && o.period.is_finite()
+                    && (omega.abs() * o.period / std::f64::consts::TAU - 1.0).abs() < 0.02;
+                let txt = if locked {
+                    "tidally locked".to_string()
+                } else if day_s < 172_800.0 {
+                    format!("{:.1} h day", day_s / 3600.0)
+                } else {
+                    format!("{:.1} d day", day_s / 86_400.0)
+                };
+                kv(ui, "rotation", txt);
+            }
+            let w = ph::tidal_heating_w(b, i, p);
+            if w > 1e8 {
+                let area = 4.0 * std::f64::consts::PI * (b.r[i] * ph::LEN_KM * 1e3).powi(2);
                 kv(
                     ui,
-                    "distance from primary",
-                    fmt_len((dx * dx + dy * dy).sqrt(), si),
+                    "tidal heating",
+                    format!("{:.1e} W ({:.2} W/m²)", w, w / area),
                 );
             }
         }
-        let heavier = (0..b.len()).filter(|&k| b.m[k] > m).count();
-        kv(ui, "mass rank", format!("#{} of {}", heavier + 1, b.len()));
-        // Collision immunity: a short post-collision grace period during which
-        // the body can't hit anything (so a fragment doesn't immediately
-        // re-impact the surviving body). Showing it makes it clear why two
-        // overlapping bodies don't immediately merge.
-        if b.time < b.imm[i] {
-            kv(ui, "collision immunity", fmt_time(b.imm[i] - b.time, si));
+}
+
+/// "Orbit" section relative to the parent `p`.
+fn orbit_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize, p: usize) {
+    let (m, kind) = (b.m[i], b.kind[i]);
+    let o = ph::orbit_info(b, i, p);
+    heading_row(ui, "Orbit");
+    kv(
+        ui,
+        "orbits",
+        format!("#{} {}", b.id[p], ph::class_name(b, p)),
+    );
+    kv(ui, "distance", fmt_len(o.dist, si));
+    kv(ui, "speed", fmt_speed(o.speed_rel, si));
+    {
+        let rx = b.x[i] - b.x[p];
+        let ry = b.y[i] - b.y[p];
+        let rvx = b.vx[i] - b.vx[p];
+        let rvy = b.vy[i] - b.vy[p];
+        let h = rx * rvy - ry * rvx;
+        kv(
+            ui,
+            "direction",
+            if h >= 0.0 {
+                "counter-clockwise"
+            } else {
+                "clockwise"
+            },
+        );
+        if o.dist > 0.0 {
+            let vc = (ph::G * (b.m[p] + m) / o.dist).sqrt();
+            if vc > 0.0 {
+                kv(ui, "speed / circular", format!("{:.3}", o.speed_rel / vc));
+            }
         }
-        if b.origin[i] != BodyOrigin::Spawned {
-            kv(ui, "origin", ph::class_name(b, i));
+        kv(ui, "specific ang. mom.", format!("{:.3e}", h.abs()));
+        kv(ui, "mass / parent", format!("{:.3e}", m / b.m[p]));
+    }
+    if o.bound {
+        kv(ui, "semi-major axis", fmt_len(o.semi_major, si));
+        kv(ui, "eccentricity", format!("{:.4}", o.ecc));
+        kv(ui, "period", fmt_time(o.period, si));
+        kv(ui, "periapsis", fmt_len(o.peri, si));
+        kv(ui, "apoapsis", fmt_len(o.apo, si));
+        // The "periapsis inside parent" warning fires when the body's
+        // closest approach passes through the parent's physical radius.
+        // This is a collision-on-next-periapsis warning — the body is
+        // going to merge or impact within one orbit.
+        if o.peri < b.contact_r(p) + b.contact_r(i) {
+            kv_color(
+                ui,
+                "warning",
+                "periapsis inside parent",
+                theme().colors.warn(),
+            );
         }
+    } else {
+        // Hyperbolic / parabolic orbit. Not necessarily a problem — a
+        // recently-created debris fragment has an escape trajectory
+        // and is still "in the system" in any meaningful sense — but
+        // the user needs to know the orbit isn't closed.
+        kv_color(ui, "state", "unbound (escape orbit)", theme().colors.warn());
+    }
+    if matches!(kind, BodyKind::Planet | BodyKind::DwarfPlanet) {
+        if matches!(b.kind[p], BodyKind::Planet | BodyKind::DwarfPlanet) {
+            // Moon case: show the *parent's* Hill sphere around its own
+            // host (e.g. a moon of Jupiter shows Jupiter's Hill sphere
+            // around the Sun). This is the relevant scale for moon
+            // stability, not the moon's own tiny Hill sphere.
+            kv(
+                ui,
+                "Hill sphere of parent",
+                fmt_len(ph::hill_radius(b, p, ph::primary_index(b).unwrap_or(p)), si),
+            );
+        } else {
+            // Planet-of-star case: show the planet's own Hill sphere
+            // (the region within which it can host moons).
+            kv(ui, "Hill radius", fmt_len(ph::hill_radius(b, i, p), si));
+        }
+        if b.m[p] > b.m[i] && b.origin[i] == BodyOrigin::Spawned {
+            // Roche limit: within this distance, tidal forces exceed
+            // self-gravity and the body will be torn apart. Shown in
+            // orange within 1.5× the limit — that's the "you're about
+            // to be disrupted" pre-warning.
+            let roche = ph::roche_limit(b, i, p);
+            let col = if o.dist < 1.5 * roche {
+                theme().colors.warn()
+            } else {
+                Color32::GRAY
+            };
+            kv_color(ui, "Roche limit", fmt_len(roche, si), col);
+        }
+    }
+}
+
+/// "State" section: position, velocity-derived quantities, rank, immunity.
+fn state_rows(ui: &mut egui::Ui, si: bool, b: &Bodies, i: usize, parent: Option<usize>) {
+    let m = b.m[i];
+    heading_row(ui, "State");
+    kv(
+        ui,
+        "position",
+        format!("{}, {}", fmt_len(b.x[i], si), fmt_len(b.y[i], si)),
+    );
+    // "speed (frame)" is the body's speed in the simulation's inertial
+    // frame — *not* relative to the primary. The orbit section shows
+    // relative speed if the body has a parent.
+    let v = (b.vx[i] * b.vx[i] + b.vy[i] * b.vy[i]).sqrt();
+    kv(ui, "speed (frame)", fmt_speed(v, si));
+    kv(ui, "momentum", format!("{:.3e}", m * v));
+    kv(ui, "kinetic energy", format!("{:.3e}", 0.5 * m * v * v));
+    if b.spin[i] != 0.0 {
+        kv(ui, "spin ang. momentum", format!("{:.3e}", b.spin[i]));
+    }
+    if let Some(prim) = ph::primary_index(b) {
+        if prim != i && parent != Some(prim) {
+            let dx = b.x[i] - b.x[prim];
+            let dy = b.y[i] - b.y[prim];
+            kv(
+                ui,
+                "distance from primary",
+                fmt_len((dx * dx + dy * dy).sqrt(), si),
+            );
+        }
+    }
+    let heavier = (0..b.len()).filter(|&k| b.m[k] > m).count();
+    kv(ui, "mass rank", format!("#{} of {}", heavier + 1, b.len()));
+    // Collision immunity: a short post-collision grace period during which
+    // the body can't hit anything (so a fragment doesn't immediately
+    // re-impact the surviving body). Showing it makes it clear why two
+    // overlapping bodies don't immediately merge.
+    if b.time < b.imm[i] {
+        kv(ui, "collision immunity", fmt_time(b.imm[i] - b.time, si));
+    }
+    if b.origin[i] != BodyOrigin::Spawned {
+        kv(ui, "origin", ph::class_name(b, i));
     }
 }
 
@@ -4096,6 +4230,11 @@ fn refresh_rows(st: &mut UiState, b: &Bodies) {
         .collect();
 }
 
+/// Make the next frame rebuild the body list (after a sort / filter change).
+fn force_list_refresh(st: &mut UiState) {
+    st.list_time = Instant::now() - Duration::from_secs(5);
+}
+
 fn list_window(
     ctx: &egui::Context,
     st: &mut UiState,
@@ -4116,164 +4255,11 @@ fn list_window(
         .default_pos([320.0, 60.0])
         .default_width(600.0)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let sys_txt = st
-                    .system_filter
-                    .and_then(|id| st.systems.iter().position(|s| s.root_id == id))
-                    .map(|k| format!("system {}: ", k + 1))
-                    .unwrap_or_default();
-                ui.label(
-                    RichText::new(format!(
-                        "{}{} bodies",
-                        sys_txt,
-                        if sys_txt.is_empty() {
-                            b.len()
-                        } else {
-                            st.list_rows.len()
-                        }
-                    ))
-                    .color(theme().colors.dim()),
-                );
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut st.list_query)
-                        .hint_text("search name or class")
-                        .desired_width(170.0),
-                );
-                if r.changed() {
-                    st.list_time = Instant::now() - Duration::from_secs(5);
-                }
-                if !st.list_query.is_empty() && ui.small_button("✕").clicked() {
-                    st.list_query.clear();
-                    st.list_time = Instant::now() - Duration::from_secs(5);
-                }
-                ui.label("show");
-                let mut lim = st.list_limit;
-                egui::ComboBox::from_id_salt("list_limit")
-                    .selected_text(lim.to_string())
-                    .show_ui(ui, |ui| {
-                        for v in [50usize, 100, 250, 500, 1000] {
-                            ui.selectable_value(&mut lim, v, v.to_string());
-                        }
-                    });
-                if lim != st.list_limit {
-                    st.list_limit = lim;
-                    st.list_time = Instant::now() - Duration::from_secs(5);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.small_button("tick all shown").clicked() {
-                    for r in &st.list_rows {
-                        st.multi.insert(r.id);
-                    }
-                }
-                if !st.multi.is_empty() {
-                    let ids: Vec<u64> = st.multi.iter().copied().collect();
-                    ui.label(
-                        RichText::new(format!("{} ticked", ids.len()))
-                            .color(theme().colors.accent()),
-                    );
-                    if ui.small_button("mass ÷2").clicked() {
-                        act.multi_edit = Some((ids.clone(), Edit::MassMul(0.5)));
-                    }
-                    if ui.small_button("mass ×2").clicked() {
-                        act.multi_edit = Some((ids.clone(), Edit::MassMul(2.0)));
-                    }
-                    if ui.small_button("circularize").clicked() {
-                        act.multi_edit = Some((ids.clone(), Edit::Circularize));
-                    }
-                    egui::ComboBox::from_id_salt("multi_kind")
-                        .selected_text("set type…")
-                        .show_ui(ui, |ui| {
-                            for (k, name) in KIND_CHOICES {
-                                if ui.selectable_label(false, name).clicked() {
-                                    act.multi_edit = Some((ids.clone(), Edit::SetKind(k)));
-                                }
-                            }
-                        });
-                    if ui.small_button("delete").clicked() {
-                        act.multi_edit = Some((ids.clone(), Edit::Delete));
-                        st.multi.clear();
-                    }
-                    if ui.small_button("clear ticks").clicked() {
-                        st.multi.clear();
-                    }
-                }
-            });
-            let headers = [
-                ("name", SortKey::Id),
-                ("class", SortKey::Id),
-                ("mass", SortKey::Mass),
-                ("radius", SortKey::Radius),
-                ("dist", SortKey::Dist),
-                ("speed", SortKey::Speed),
-                ("period", SortKey::Period),
-            ];
+            list_toolbar(ui, st, b);
+            list_bulk_actions(ui, st, act);
             egui::ScrollArea::vertical()
                 .max_height(420.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("list_grid")
-                        .num_columns(8)
-                        .spacing([12.0, 3.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("");
-                            for (k, (name, key)) in headers.iter().enumerate() {
-                                let active = st.sort == *key && k != 1;
-                                let arrow = if active {
-                                    if st.sort_desc {
-                                        " ▼"
-                                    } else {
-                                        " ▲"
-                                    }
-                                } else {
-                                    ""
-                                };
-                                let txt = RichText::new(format!("{}{}", name, arrow))
-                                    .strong()
-                                    .color(if active {
-                                        theme().colors.accent()
-                                    } else {
-                                        Color32::WHITE
-                                    });
-                                if k == 1 {
-                                    ui.label(txt);
-                                } else if ui
-                                    .add(egui::Label::new(txt).sense(egui::Sense::click()))
-                                    .clicked()
-                                {
-                                    if st.sort == *key {
-                                        st.sort_desc = !st.sort_desc;
-                                    } else {
-                                        st.sort = *key;
-                                        st.sort_desc = *key != SortKey::Id;
-                                    }
-                                    st.list_time = Instant::now() - Duration::from_secs(5);
-                                }
-                            }
-                            ui.end_row();
-                            for row in &st.list_rows {
-                                let mut ticked = st.multi.contains(&row.id);
-                                if ui.checkbox(&mut ticked, "").changed() {
-                                    if ticked {
-                                        st.multi.insert(row.id);
-                                    } else {
-                                        st.multi.remove(&row.id);
-                                    }
-                                }
-                                let selected = view.selected == Some(row.id);
-                                if ui.selectable_label(selected, &row.label).clicked() {
-                                    act.select = Some(Some(row.id));
-                                }
-                                ui.label(&row.class);
-                                ui.label(RichText::new(fmt_mass(row.m, si)).monospace());
-                                ui.label(RichText::new(fmt_len(row.r, si)).monospace());
-                                ui.label(RichText::new(fmt_len(row.dist, si)).monospace());
-                                ui.label(RichText::new(fmt_speed(row.speed, si)).monospace());
-                                ui.label(RichText::new(fmt_time(row.period, si)).monospace());
-                                ui.end_row();
-                            }
-                        });
-                });
+                .show(ui, |ui| list_table(ui, st, view, si, act));
             ui.label(
                 RichText::new(
                     "Click a name to select it. Tick boxes to edit many bodies at once. \
@@ -4285,6 +4271,164 @@ fn list_window(
             );
         });
     st.show_list = open;
+}
+
+/// Body count, search box and the "show N" limit.
+fn list_toolbar(ui: &mut egui::Ui, st: &mut UiState, b: &Bodies) {
+    ui.horizontal(|ui| {
+        let sys_txt = st
+            .system_filter
+            .and_then(|id| st.systems.iter().position(|s| s.root_id == id))
+            .map(|k| format!("system {}: ", k + 1))
+            .unwrap_or_default();
+        let shown = if sys_txt.is_empty() { b.len() } else { st.list_rows.len() };
+        ui.label(RichText::new(format!("{}{} bodies", sys_txt, shown)).color(theme().colors.dim()));
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut st.list_query)
+                .hint_text("search name or class")
+                .desired_width(170.0),
+        );
+        if r.changed() {
+            force_list_refresh(st);
+        }
+        if !st.list_query.is_empty() && ui.small_button("✕").clicked() {
+            st.list_query.clear();
+            force_list_refresh(st);
+        }
+        ui.label("show");
+        let mut lim = st.list_limit;
+        egui::ComboBox::from_id_salt("list_limit")
+            .selected_text(lim.to_string())
+            .show_ui(ui, |ui| {
+                for v in [50usize, 100, 250, 500, 1000] {
+                    ui.selectable_value(&mut lim, v, v.to_string());
+                }
+            });
+        if lim != st.list_limit {
+            st.list_limit = lim;
+            force_list_refresh(st);
+        }
+    });
+}
+
+/// "Tick all shown" and the batch edits that apply to the ticked bodies.
+fn list_bulk_actions(ui: &mut egui::Ui, st: &mut UiState, act: &mut Actions) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("tick all shown").clicked() {
+            for r in &st.list_rows {
+                st.multi.insert(r.id);
+            }
+        }
+        if st.multi.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = st.multi.iter().copied().collect();
+        ui.label(RichText::new(format!("{} ticked", ids.len())).color(theme().colors.accent()));
+        if ui.small_button("mass ÷2").clicked() {
+            act.multi_edit = Some((ids.clone(), Edit::MassMul(0.5)));
+        }
+        if ui.small_button("mass ×2").clicked() {
+            act.multi_edit = Some((ids.clone(), Edit::MassMul(2.0)));
+        }
+        if ui.small_button("circularize").clicked() {
+            act.multi_edit = Some((ids.clone(), Edit::Circularize));
+        }
+        egui::ComboBox::from_id_salt("multi_kind")
+            .selected_text("set type…")
+            .show_ui(ui, |ui| {
+                for (k, name) in KIND_CHOICES {
+                    if ui.selectable_label(false, name).clicked() {
+                        act.multi_edit = Some((ids.clone(), Edit::SetKind(k)));
+                    }
+                }
+            });
+        if ui.small_button("delete").clicked() {
+            act.multi_edit = Some((ids.clone(), Edit::Delete));
+            st.multi.clear();
+        }
+        if ui.small_button("clear ticks").clicked() {
+            st.multi.clear();
+        }
+    });
+}
+
+/// The sortable table of bodies.
+fn list_table(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, si: bool, act: &mut Actions) {
+    const HEADERS: [(&str, SortKey); 7] = [
+        ("name", SortKey::Id),
+        ("class", SortKey::Id),
+        ("mass", SortKey::Mass),
+        ("radius", SortKey::Radius),
+        ("dist", SortKey::Dist),
+        ("speed", SortKey::Speed),
+        ("period", SortKey::Period),
+    ];
+    /// The "class" column (index 1) is not sortable.
+    const CLASS_COLUMN: usize = 1;
+    egui::Grid::new("list_grid")
+        .num_columns(8)
+        .spacing([12.0, 3.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("");
+            for (k, (name, key)) in HEADERS.iter().enumerate() {
+                list_header_cell(ui, st, name, *key, k != CLASS_COLUMN);
+            }
+            ui.end_row();
+            for row in &st.list_rows {
+                let mut ticked = st.multi.contains(&row.id);
+                if ui.checkbox(&mut ticked, "").changed() {
+                    if ticked {
+                        st.multi.insert(row.id);
+                    } else {
+                        st.multi.remove(&row.id);
+                    }
+                }
+                let selected = view.selected == Some(row.id);
+                if ui.selectable_label(selected, &row.label).clicked() {
+                    act.select = Some(Some(row.id));
+                }
+                ui.label(&row.class);
+                ui.label(RichText::new(fmt_mass(row.m, si)).monospace());
+                ui.label(RichText::new(fmt_len(row.r, si)).monospace());
+                ui.label(RichText::new(fmt_len(row.dist, si)).monospace());
+                ui.label(RichText::new(fmt_speed(row.speed, si)).monospace());
+                ui.label(RichText::new(fmt_time(row.period, si)).monospace());
+                ui.end_row();
+            }
+        });
+}
+
+/// One header cell: shows the sort arrow and, when `sortable`, a click
+/// toggles the direction (or switches the sort key).
+fn list_header_cell(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    name: &str,
+    key: SortKey,
+    sortable: bool,
+) {
+    let active = st.sort == key && sortable;
+    let arrow = match (active, st.sort_desc) {
+        (true, true) => " ▼",
+        (true, false) => " ▲",
+        _ => "",
+    };
+    let colour = if active { theme().colors.accent() } else { Color32::WHITE };
+    let text = RichText::new(format!("{}{}", name, arrow)).strong().color(colour);
+    if !sortable {
+        ui.label(text);
+        return;
+    }
+    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).clicked() {
+        if st.sort == key {
+            st.sort_desc = !st.sort_desc;
+        } else {
+            st.sort = key;
+            st.sort_desc = key != SortKey::Id;
+        }
+        force_list_refresh(st);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4415,27 +4559,11 @@ fn plot_series(
         .iter()
         .map(|s| get(s).filter(|v| v.is_finite()))
         .collect();
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for v in vals.iter().flatten() {
-        lo = lo.min(*v);
-        hi = hi.max(*v);
-    }
-    if !lo.is_finite() {
-        let msg = if diag.samples.is_empty() {
-            "collecting…"
-        } else {
-            spec.empty
-        };
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            msg,
-            FontId::monospace(10.0),
-            theme().colors.dim(),
-        );
+    let Some((lo, hi)) = finite_range(&vals) else {
+        let msg = if diag.samples.is_empty() { "collecting…" } else { spec.empty };
+        painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::monospace(10.0), theme().colors.dim());
         return;
-    }
+    };
 
     let (y0, y1) = if spec.symmetric {
         let m = lo.abs().max(hi.abs()).max(1e-12) * 1.1;
@@ -4445,15 +4573,7 @@ fn plot_series(
     };
     let t0 = diag.samples.front().map(|s| s.t).unwrap_or(0.0);
     let t1 = diag.samples.back().map(|s| s.t).unwrap_or(0.0);
-    let t_span = (t1 - t0).max(1e-9);
-    let map = |t: f64, v: f64| -> egui::Pos2 {
-        let fx = ((t - t0) / t_span).clamp(0.0, 1.0) as f32;
-        let fy = ((v - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32;
-        egui::pos2(
-            rect.left() + fx * rect.width(),
-            rect.bottom() - fy * rect.height(),
-        )
-    };
+    let frame = PlotFrame { rect, t0, t_span: (t1 - t0).max(1e-9), y0, y1 };
 
     if spec.symmetric {
         let zy = rect.center().y;
@@ -4464,30 +4584,81 @@ fn plot_series(
     }
 
     let current = vals.iter().rev().flatten().next().copied().unwrap_or(0.0);
-    let line_col = if current.abs() > spec.warn_at {
-        theme().colors.warn()
-    } else {
-        spec.color
-    };
+    let line_col = if current.abs() > spec.warn_at { theme().colors.warn() } else { spec.color };
+    draw_series_line(&painter, &frame, diag, &vals, line_col);
+    draw_series_labels(&painter, &frame, spec, si, current, t1);
+    if let Some(pos) = resp.hover_pos() {
+        draw_series_hover(&painter, &frame, diag, &vals, spec, si, pos);
+    }
+}
 
+/// Where a plot sits on screen and what time and value range it covers.
+struct PlotFrame {
+    rect: egui::Rect,
+    t0: f64,
+    t_span: f64,
+    y0: f64,
+    y1: f64,
+}
+
+impl PlotFrame {
+    fn map(&self, t: f64, v: f64) -> egui::Pos2 {
+        let fx = ((t - self.t0) / self.t_span).clamp(0.0, 1.0) as f32;
+        let fy = ((v - self.y0) / (self.y1 - self.y0)).clamp(0.0, 1.0) as f32;
+        egui::pos2(
+            self.rect.left() + fx * self.rect.width(),
+            self.rect.bottom() - fy * self.rect.height(),
+        )
+    }
+}
+
+/// Smallest and largest value, or `None` when there are none.
+fn finite_range(vals: &[Option<f64>]) -> Option<(f64, f64)> {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for v in vals.iter().flatten() {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    lo.is_finite().then_some((lo, hi))
+}
+
+/// The line through the samples. A gap (value not available) breaks it.
+fn draw_series_line(
+    painter: &egui::Painter,
+    frame: &PlotFrame,
+    diag: &DiagHistory,
+    vals: &[Option<f64>],
+    color: Color32,
+) {
     let mut prev: Option<egui::Pos2> = None;
     for (s, v) in diag.samples.iter().zip(vals.iter()) {
         match v {
             Some(v) => {
-                let p = map(s.t, *v);
+                let p = frame.map(s.t, *v);
                 if let Some(q) = prev {
-                    painter.line_segment([q, p], Stroke::new(1.0_f32, line_col));
+                    painter.line_segment([q, p], Stroke::new(1.0_f32, color));
                 }
                 prev = Some(p);
             }
-            // A gap (value not available) breaks the line.
             None => prev = None,
         }
     }
     if let Some(p) = prev {
-        painter.circle_filled(p, 2.0, line_col);
+        painter.circle_filled(p, 2.0, color);
     }
+}
 
+/// Title with the current value, and the time at each end of the axis.
+fn draw_series_labels(
+    painter: &egui::Painter,
+    frame: &PlotFrame,
+    spec: &PlotSpec,
+    si: bool,
+    current: f64,
+    t1: f64,
+) {
+    let rect = frame.rect;
     painter.text(
         rect.left_top() + egui::vec2(4.0, 2.0),
         Align2::LEFT_TOP,
@@ -4498,7 +4669,7 @@ fn plot_series(
     painter.text(
         rect.left_bottom() + egui::vec2(2.0, -2.0),
         Align2::LEFT_BOTTOM,
-        fmt_time(t0, si),
+        fmt_time(frame.t0, si),
         FontId::monospace(9.0),
         theme().colors.dim(),
     );
@@ -4509,34 +4680,42 @@ fn plot_series(
         FontId::monospace(9.0),
         theme().colors.dim(),
     );
+}
 
-    if let Some(pos) = resp.hover_pos() {
-        let fx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-        let th = t0 + fx * t_span;
-        let nearest = diag.samples.iter().enumerate().min_by(|p, q| {
-            (p.1.t - th)
-                .abs()
-                .partial_cmp(&(q.1.t - th).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if let Some((k, s)) = nearest {
-            if let Some(v) = vals[k] {
-                let p = map(s.t, v);
-                painter.line_segment(
-                    [egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())],
-                    Stroke::new(1.0_f32, Color32::from_gray(90)),
-                );
-                painter.circle_filled(p, 3.0, spec.color);
-                painter.text(
-                    rect.right_top() + egui::vec2(-4.0, 2.0),
-                    Align2::RIGHT_TOP,
-                    format!("{}  {}", fmt_time(s.t, si), (spec.fmt)(v)),
-                    FontId::monospace(10.0),
-                    Color32::WHITE,
-                );
-            }
-        }
-    }
+/// Cursor line, marker and readout for the sample nearest the pointer.
+fn draw_series_hover(
+    painter: &egui::Painter,
+    frame: &PlotFrame,
+    diag: &DiagHistory,
+    vals: &[Option<f64>],
+    spec: &PlotSpec,
+    si: bool,
+    pos: egui::Pos2,
+) {
+    let rect = frame.rect;
+    let fx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+    let th = frame.t0 + fx * frame.t_span;
+    let nearest = diag.samples.iter().enumerate().min_by(|p, q| {
+        (p.1.t - th)
+            .abs()
+            .partial_cmp(&(q.1.t - th).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some((k, s)) = nearest else { return };
+    let Some(v) = vals[k] else { return };
+    let p = frame.map(s.t, v);
+    painter.line_segment(
+        [egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())],
+        Stroke::new(1.0_f32, Color32::from_gray(90)),
+    );
+    painter.circle_filled(p, 3.0, spec.color);
+    painter.text(
+        rect.right_top() + egui::vec2(-4.0, 2.0),
+        Align2::RIGHT_TOP,
+        format!("{}  {}", fmt_time(s.t, si), (spec.fmt)(v)),
+        FontId::monospace(10.0),
+        Color32::WHITE,
+    );
 }
 
 fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
@@ -4628,152 +4807,139 @@ fn diag_window(
         .default_width(380.0)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("clear")
-                    .on_hover_text("forget the history and the angular-momentum baseline")
-                    .clicked()
-                {
-                    st.diag.clear();
-                }
-                if ui
-                    .button("copy CSV")
-                    .on_hover_text("copy the sample history to the clipboard")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(st.diag.to_csv());
-                }
-                ui.label("history");
-                let mut maxs = st.diag.max_samples;
-                egui::ComboBox::from_id_salt("diag_history")
-                    .selected_text(format!("{} min", maxs / 60))
-                    .show_ui(ui, |ui| {
-                        for (v, name) in [(300usize, "5 min"), (900, "15 min"), (1800, "30 min")] {
-                            ui.selectable_value(&mut maxs, v, name);
-                        }
-                    });
-                st.diag.max_samples = maxs;
-            });
-
-            let last = st.diag.samples.back();
-
-            let col_w = (ui.available_width() - 14.0) / 2.0;
-            egui::Grid::new("diag_summary")
-                .num_columns(2)
-                .spacing([14.0, 2.0])
-                .min_col_width(col_w)
-                .show(ui, |ui| {
-                    kv(ui, "bodies", format!("{}", b.len()));
-                    kv(ui, "energy drift", fmt_pct(last.and_then(|s| s.drift)));
-                    kv(
-                        ui,
-                        "energy dissipated",
-                        fmt_pct(last.and_then(|s| s.dissipated)),
-                    );
-                    kv(
-                        ui,
-                        "ang. momentum change",
-                        fmt_pct(last.and_then(|s| s.l_drift)),
-                    );
-                    kv(ui, "steps / s", format!("{:.0}", view.steps_per_sec));
-                    kv(ui, "fine steps", format!("{}", b.stats.last_nsub));
-                    kv(ui, "events logged", format!("{}", b.events.len()));
-                });
-            if b.len() > ph::ENERGY_MAX_N {
-                ui.label(
-                    RichText::new(format!(
-                        "Energy values are off above {} bodies (too slow to compute).",
-                        ph::ENERGY_MAX_N
-                    ))
-                    .small()
-                    .color(theme().colors.warn()),
-                );
-            }
+            diag_toolbar(ui, st);
+            diag_summary(ui, &st.diag, view, b);
             ui.separator();
-
             egui::ScrollArea::vertical()
                 .max_height((ctx.content_rect().height() - 220.0).max(160.0))
-                .show(ui, |ui| {
-                    let d = &st.diag;
-                    plot_series(
-                        ui,
-                        d,
-                        si,
-                        &PlotSpec {
-                            title: "bodies",
-                            empty: "no data",
-                            color: theme().colors.good(),
-                            warn_at: f64::INFINITY,
-                            symmetric: false,
-                            fmt: fmt_int,
-                        },
-                        |s| Some(s.n as f64),
-                    );
-                    ui.add_space(4.0);
-                    plot_series(
-                        ui,
-                        d,
-                        si,
-                        &PlotSpec {
-                            title: "energy drift",
-                            empty: "n/a (system too large)",
-                            color: theme().colors.accent(),
-                            warn_at: 1.0,
-                            symmetric: true,
-                            fmt: fmt_pct_value,
-                        },
-                        |s| s.drift,
-                    );
-                    ui.add_space(4.0);
-                    plot_series(
-                        ui,
-                        d,
-                        si,
-                        &PlotSpec {
-                            title: "energy dissipated",
-                            empty: "n/a (system too large)",
-                            color: Color32::from_rgb(255, 170, 90),
-                            warn_at: f64::INFINITY,
-                            symmetric: false,
-                            fmt: fmt_pct_value,
-                        },
-                        |s| s.dissipated,
-                    );
-                    ui.add_space(4.0);
-                    plot_series(
-                        ui,
-                        d,
-                        si,
-                        &PlotSpec {
-                            title: "angular momentum change",
-                            empty: "no baseline",
-                            color: Color32::from_rgb(220, 130, 255),
-                            warn_at: 1.0,
-                            symmetric: true,
-                            fmt: fmt_pct_value,
-                        },
-                        |s| s.l_drift,
-                    );
-                    ui.add_space(4.0);
-                    plot_series(
-                        ui,
-                        d,
-                        si,
-                        &PlotSpec {
-                            title: "fine steps (close encounters)",
-                            empty: "no data",
-                            color: Color32::from_rgb(150, 220, 255),
-                            warn_at: f64::INFINITY,
-                            symmetric: false,
-                            fmt: fmt_int,
-                        },
-                        |s| Some(s.nsub as f64),
-                    );
-                    ui.add_space(4.0);
-                    plot_ecc(ui, d);
-                });
+                .show(ui, |ui| diag_plots(ui, &st.diag, si));
         });
     st.diag.visible = open;
+}
+
+/// Clear, copy-as-CSV and the history length.
+fn diag_toolbar(ui: &mut egui::Ui, st: &mut UiState) {
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("clear")
+            .on_hover_text("forget the history and the angular-momentum baseline")
+            .clicked()
+        {
+            st.diag.clear();
+        }
+        if ui
+            .button("copy CSV")
+            .on_hover_text("copy the sample history to the clipboard")
+            .clicked()
+        {
+            ui.ctx().copy_text(st.diag.to_csv());
+        }
+        ui.label("history");
+        let mut maxs = st.diag.max_samples;
+        egui::ComboBox::from_id_salt("diag_history")
+            .selected_text(format!("{} min", maxs / 60))
+            .show_ui(ui, |ui| {
+                for (v, name) in [(300usize, "5 min"), (900, "15 min"), (1800, "30 min")] {
+                    ui.selectable_value(&mut maxs, v, name);
+                }
+            });
+        st.diag.max_samples = maxs;
+    });
+}
+
+/// Latest values of the conserved quantities and solver counters.
+fn diag_summary(ui: &mut egui::Ui, diag: &DiagHistory, view: &ViewInfo, b: &Bodies) {
+    let last = diag.samples.back();
+    let col_w = (ui.available_width() - 14.0) / 2.0;
+    egui::Grid::new("diag_summary")
+        .num_columns(2)
+        .spacing([14.0, 2.0])
+        .min_col_width(col_w)
+        .show(ui, |ui| {
+            kv(ui, "bodies", format!("{}", b.len()));
+            kv(ui, "energy drift", fmt_pct(last.and_then(|s| s.drift)));
+            kv(ui, "energy dissipated", fmt_pct(last.and_then(|s| s.dissipated)));
+            kv(ui, "ang. momentum change", fmt_pct(last.and_then(|s| s.l_drift)));
+            kv(ui, "steps / s", format!("{:.0}", view.steps_per_sec));
+            kv(ui, "fine steps", format!("{}", b.stats.last_nsub));
+            kv(ui, "events logged", format!("{}", b.events.len()));
+        });
+    if b.len() > ph::ENERGY_MAX_N {
+        ui.label(
+            RichText::new(format!(
+                "Energy values are off above {} bodies (too slow to compute).",
+                ph::ENERGY_MAX_N
+            ))
+            .small()
+            .color(theme().colors.warn()),
+        );
+    }
+}
+
+/// The time-series plots, one per tracked quantity.
+fn diag_plots(ui: &mut egui::Ui, d: &DiagHistory, si: bool) {
+    let plots: [(PlotSpec, fn(&DiagSample) -> Option<f64>); 5] = [
+        (
+            PlotSpec {
+                title: "bodies",
+                empty: "no data",
+                color: theme().colors.good(),
+                warn_at: f64::INFINITY,
+                symmetric: false,
+                fmt: fmt_int,
+            },
+            |s| Some(s.n as f64),
+        ),
+        (
+            PlotSpec {
+                title: "energy drift",
+                empty: "n/a (system too large)",
+                color: theme().colors.accent(),
+                warn_at: 1.0,
+                symmetric: true,
+                fmt: fmt_pct_value,
+            },
+            |s| s.drift,
+        ),
+        (
+            PlotSpec {
+                title: "energy dissipated",
+                empty: "n/a (system too large)",
+                color: Color32::from_rgb(255, 170, 90),
+                warn_at: f64::INFINITY,
+                symmetric: false,
+                fmt: fmt_pct_value,
+            },
+            |s| s.dissipated,
+        ),
+        (
+            PlotSpec {
+                title: "angular momentum change",
+                empty: "no baseline",
+                color: Color32::from_rgb(220, 130, 255),
+                warn_at: 1.0,
+                symmetric: true,
+                fmt: fmt_pct_value,
+            },
+            |s| s.l_drift,
+        ),
+        (
+            PlotSpec {
+                title: "fine steps (close encounters)",
+                empty: "no data",
+                color: Color32::from_rgb(150, 220, 255),
+                warn_at: f64::INFINITY,
+                symmetric: false,
+                fmt: fmt_int,
+            },
+            |s| Some(s.nsub as f64),
+        ),
+    ];
+    for (spec, pick) in &plots {
+        plot_series(ui, d, si, spec, pick);
+        ui.add_space(4.0);
+    }
+    plot_ecc(ui, d);
 }
 
 #[cfg(test)]

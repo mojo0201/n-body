@@ -241,79 +241,17 @@ pub(super) fn build_subtree(
     if n_here == 0 {
         return Vec::new();
     }
-
     // Single body: leaf.
     if n_here == 1 {
-        let i = indices[0] as usize;
-        let m = b.m[i];
-        let (com_x, com_y, com_z) = if m > 0.0 {
-            (b.x[i], b.y[i], b.z[i])
-        } else {
-            (cx, cy, cz)
-        };
-        return vec![Node {
-            cx,
-            cy,
-            cz,
-            size,
-            m,
-            com_x,
-            com_y,
-            com_z,
-            body: indices[0] as i32,
-            children: [-1; 8],
-        }];
+        return vec![single_body_leaf(b, indices[0] as usize, cx, cy, cz, size)];
     }
-
     // Coincident bodies below the resolution limit: collapse into one
     // leaf carrying the group's aggregate mass and center of mass.
     if size < MIN_NODE_SIZE {
-        let mut total_m = 0.0;
-        let mut com_x = 0.0;
-        let mut com_y = 0.0;
-        let mut com_z = 0.0;
-        for &i in indices.iter() {
-            let i = i as usize;
-            total_m += b.m[i];
-            com_x += b.m[i] * b.x[i];
-            com_y += b.m[i] * b.y[i];
-            com_z += b.m[i] * b.z[i];
-        }
-        let (com_x, com_y, com_z) = if total_m > 0.0 {
-            (com_x / total_m, com_y / total_m, com_z / total_m)
-        } else {
-            (cx, cy, cz)
-        };
-        return vec![Node {
-            cx,
-            cy,
-            cz,
-            size,
-            m: total_m,
-            com_x,
-            com_y,
-            com_z,
-            body: -2,
-            children: [-1; 8],
-        }];
+        return vec![collapsed_leaf(b, indices, cx, cy, cz, size)];
     }
 
-    // Split the slice into eight octants by partitioning z, then y within
-    // each half, then x within each quarter. O(n_here) per level. Octant
-    // order is x | y << 1 | z << 2.
-    let nz = partition_in_place(indices, |i| b.z[i as usize] < cz);
-    let (zlo, zhi) = indices.split_at_mut(nz);
-    let mut slices: Vec<&mut [u32]> = Vec::with_capacity(8);
-    for half in [zlo, zhi] {
-        let ny = partition_in_place(half, |i| b.y[i as usize] < cy);
-        let (ylo, yhi) = half.split_at_mut(ny);
-        for quarter in [ylo, yhi] {
-            let nx = partition_in_place(quarter, |i| b.x[i as usize] < cx);
-            let (xlo, xhi) = quarter.split_at_mut(nx);
-            slices.push(xlo);
-            slices.push(xhi);
-        }
-    }
+    let slices = split_into_octants(b, indices, cx, cy, cz);
     let h = size * 0.5;
     let centre = |q: usize| {
         (
@@ -347,29 +285,8 @@ pub(super) fn build_subtree(
             .collect()
     };
 
-    // Aggregate moments from the child subtree roots.
-    let mut total_m = 0.0;
-    let mut com_x = 0.0;
-    let mut com_y = 0.0;
-    let mut com_z = 0.0;
-    for t in trees.iter() {
-        if let Some(root) = t.first() {
-            total_m += root.m;
-            com_x += root.m * root.com_x;
-            com_y += root.m * root.com_y;
-            com_z += root.m * root.com_z;
-        }
-    }
-    let (com_x, com_y, com_z) = if total_m > 0.0 {
-        (com_x / total_m, com_y / total_m, com_z / total_m)
-    } else {
-        (cx, cy, cz)
-    };
-
-    // Concatenate: parent first, then each child in octant order with
-    // its internal indices shifted by the running offset.
-    let mut out = Vec::with_capacity(1 + trees.iter().map(|t| t.len()).sum::<usize>());
-    out.push(Node {
+    let (total_m, com_x, com_y, com_z) = aggregate_moments(&trees, (cx, cy, cz));
+    let parent = Node {
         cx,
         cy,
         cz,
@@ -380,7 +297,93 @@ pub(super) fn build_subtree(
         com_z,
         body: -1,
         children: [-1; 8],
-    });
+    };
+    concatenate_subtrees(parent, trees)
+}
+
+/// A leaf holding exactly one body (centre of the cell if it is massless).
+fn single_body_leaf(b: &Bodies, i: usize, cx: f64, cy: f64, cz: f64, size: f64) -> Node {
+    let m = b.m[i];
+    let (com_x, com_y, com_z) = if m > 0.0 {
+        (b.x[i], b.y[i], b.z[i])
+    } else {
+        (cx, cy, cz)
+    };
+    Node { cx, cy, cz, size, m, com_x, com_y, com_z, body: i as i32, children: [-1; 8] }
+}
+
+/// A leaf standing for several bodies too close to separate (`body == -2`).
+fn collapsed_leaf(b: &Bodies, indices: &[u32], cx: f64, cy: f64, cz: f64, size: f64) -> Node {
+    let mut total_m = 0.0;
+    let mut com_x = 0.0;
+    let mut com_y = 0.0;
+    let mut com_z = 0.0;
+    for &i in indices {
+        let i = i as usize;
+        total_m += b.m[i];
+        com_x += b.m[i] * b.x[i];
+        com_y += b.m[i] * b.y[i];
+        com_z += b.m[i] * b.z[i];
+    }
+    let (com_x, com_y, com_z) = if total_m > 0.0 {
+        (com_x / total_m, com_y / total_m, com_z / total_m)
+    } else {
+        (cx, cy, cz)
+    };
+    Node { cx, cy, cz, size, m: total_m, com_x, com_y, com_z, body: -2, children: [-1; 8] }
+}
+
+/// Split the slice into eight octants by partitioning z, then y within each
+/// half, then x within each quarter. O(n_here) per level. Octant order is
+/// `x | y << 1 | z << 2`.
+fn split_into_octants<'a>(
+    b: &Bodies,
+    indices: &'a mut [u32],
+    cx: f64,
+    cy: f64,
+    cz: f64,
+) -> Vec<&'a mut [u32]> {
+    let nz = partition_in_place(indices, |i| b.z[i as usize] < cz);
+    let (zlo, zhi) = indices.split_at_mut(nz);
+    let mut slices: Vec<&mut [u32]> = Vec::with_capacity(8);
+    for half in [zlo, zhi] {
+        let ny = partition_in_place(half, |i| b.y[i as usize] < cy);
+        let (ylo, yhi) = half.split_at_mut(ny);
+        for quarter in [ylo, yhi] {
+            let nx = partition_in_place(quarter, |i| b.x[i as usize] < cx);
+            let (xlo, xhi) = quarter.split_at_mut(nx);
+            slices.push(xlo);
+            slices.push(xhi);
+        }
+    }
+    slices
+}
+
+/// Total mass and centre of mass of a cell, from its child subtree roots.
+/// A massless cell falls back to `centre`.
+fn aggregate_moments(trees: &[Vec<Node>], centre: (f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let mut total_m = 0.0;
+    let mut com_x = 0.0;
+    let mut com_y = 0.0;
+    let mut com_z = 0.0;
+    for root in trees.iter().filter_map(|t| t.first()) {
+        total_m += root.m;
+        com_x += root.m * root.com_x;
+        com_y += root.m * root.com_y;
+        com_z += root.m * root.com_z;
+    }
+    if total_m > 0.0 {
+        (total_m, com_x / total_m, com_y / total_m, com_z / total_m)
+    } else {
+        (total_m, centre.0, centre.1, centre.2)
+    }
+}
+
+/// Concatenate: parent first, then each child subtree in octant order with
+/// its internal indices shifted by the running offset.
+fn concatenate_subtrees(parent: Node, trees: Vec<Vec<Node>>) -> Vec<Node> {
+    let mut out = Vec::with_capacity(1 + trees.iter().map(|t| t.len()).sum::<usize>());
+    out.push(parent);
     for (q, mut sub) in trees.into_iter().enumerate() {
         if sub.is_empty() {
             continue;

@@ -230,6 +230,35 @@ pub(super) fn move_rung(
 // Block stepper
 // ---------------------------------------------------------------------------
 
+/// The rung a body takes after a sub-tick: at most one step finer per
+/// sub-tick (so the half-kicks on either side stay consistent), and never
+/// finer than the sub-tick grid allows at this position in the block.
+fn next_rung(dtl: f64, dt: f64, current: u8, kmax: u8, trailing_zeros: usize) -> u8 {
+    let mut k = rung_for(dtl, dt).min(kmax);
+    while k < current && trailing_zeros < (kmax - k) as usize {
+        k += 1;
+    }
+    k
+}
+
+/// Keep `hot` (the sorted set of bodies with rung > 0) in sync when a body
+/// crosses the rung-0 boundary.
+fn track_hot(hot: &mut Vec<usize>, body: usize, old_rung: usize, new_rung: usize) {
+    match (old_rung == 0, new_rung == 0) {
+        (true, false) => {
+            if let Err(pos) = hot.binary_search(&body) {
+                hot.insert(pos, body);
+            }
+        }
+        (false, true) => {
+            if let Ok(pos) = hot.binary_search(&body) {
+                hot.remove(pos);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Advance by `dt` using `2^kmax` sub-ticks of the leapfrog, with per-body
 /// step sizes `dt / 2^rung`.
 ///
@@ -254,7 +283,30 @@ pub(super) fn move_rung(
 /// Using different half-kicks across a rung change is what keeps the
 /// symplectic structure across the transition — both halves correspond to the
 /// same kick-drift-kick interval, just at different resolutions.
-pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
+/// A rung block in progress. `begin` does the block prelude, `run` executes
+/// sub-ticks (optionally pausing between them so the physics thread can
+/// release the shared lock), and the last `run` does the block epilogue.
+/// Running it to completion in one call is arithmetically identical to the
+/// old single-function `step_block`.
+pub(super) struct BlockJob {
+    dt: f64,
+    kmax: u8,
+    ticks: u32,
+    dtf: f64,
+    tick: u32,
+    p0: (f64, f64, f64),
+    rung_dt: Vec<f64>,
+    tree: Option<Tree>,
+    tree_len: usize,
+    by_rung: Vec<Vec<u32>>,
+    bucket_pos: Vec<u32>,
+    hot: Vec<usize>,
+    active: Vec<u32>,
+    stale_accel: bool,
+}
+
+impl BlockJob {
+    pub(super) fn begin(b: &mut Bodies, dt: f64, kmax: u8) -> BlockJob {
     let ticks = 1u32 << kmax;
     let dtf = dt / ticks as f64;
     // Momentum at the start of the block. The full-force path removes the
@@ -278,12 +330,12 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
 
     // Build the BH tree once for the whole block. See the doc comment above
     // for why reuse is safe and when it gets rebuilt.
-    let mut tree = if b.len() >= BH_THRESHOLD {
+    let tree = if b.len() >= BH_THRESHOLD {
         Some(Tree::build(&*b))
     } else {
         None
     };
-    let mut tree_len = b.len();
+    let tree_len = b.len();
 
     // Per-rung index lists and the sorted `hot` set (rung >= 1). Both are
     // rebuilt whenever the body set changes.
@@ -295,12 +347,41 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
     // Sized for the worst case: every body active, plus up to
     // FRAG_COUNT_MAX spawned during this block. Reallocs if a bigger
     // disruption lands, but a quiet block never grows.
-    let mut active: Vec<u32> = Vec::with_capacity(b.len() + FRAG_COUNT_MAX);
+    let active: Vec<u32> = Vec::with_capacity(b.len() + FRAG_COUNT_MAX);
     // Set when the final sub-tick's collision pass changed the body set: the
     // accelerations from that tick's force evaluation are then stale.
-    let mut stale_accel = false;
 
-    for tick in 1..=ticks {
+    BlockJob {
+        dt,
+        kmax,
+        ticks,
+        dtf,
+        tick: 0,
+        p0: (p0x, p0y, p0z),
+        rung_dt,
+        tree,
+        tree_len,
+        by_rung,
+        bucket_pos,
+        hot,
+        active,
+        stale_accel: false,
+    }
+    }
+
+    /// Run sub-ticks until the block is done (returns true) or `keep_going`
+    /// returns false after a tick (returns false; call again to resume).
+    pub(super) fn run(&mut self, b: &mut Bodies, mut keep_going: impl FnMut() -> bool) -> bool {
+    let (dt, kmax, ticks, dtf) = (self.dt, self.kmax, self.ticks, self.dtf);
+    let rung_dt = std::mem::take(&mut self.rung_dt);
+    let mut tree = self.tree.take();
+    let mut tree_len = self.tree_len;
+    let mut by_rung = std::mem::take(&mut self.by_rung);
+    let mut bucket_pos = std::mem::take(&mut self.bucket_pos);
+    let mut hot = std::mem::take(&mut self.hot);
+    let mut active = std::mem::take(&mut self.active);
+    let mut stale_accel = self.stale_accel;
+    for tick in (self.tick + 1)..=ticks {
         // Drift everyone by the sub-tick dtf, snapshotting the old position
         // for the swept collision test in the same pass.
         let n = b.len();
@@ -355,32 +436,11 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
             b.vz[i] += 0.5 * b.az[i] * h;
 
             if tick < ticks {
-                // Rung change: at most one step finer is taken per sub-tick
-                // (so the two half-kicks above and below stay consistent).
-                // `k` walks up to `r` until the body can no longer afford
-                // to step every `2^(kmax-k)` sub-ticks.
-                let mut k = rung_for(b.dtl[i], dt).min(kmax);
-                while k < r && tz < (kmax - k) as usize {
-                    k += 1;
-                }
-                let old_r = r as usize;
-                let new_r = k as usize;
+                let k = next_rung(b.dtl[i], dt, r, kmax, tz);
+                let (old_r, new_r) = (r as usize, k as usize);
                 if new_r != old_r {
                     move_rung(iu, old_r, new_r, &mut by_rung, &mut bucket_pos);
-                    // Keep `hot` (sorted set of rung > 0 bodies) in sync
-                    // when the body crosses the rung-0 boundary.
-                    match (old_r == 0, new_r == 0) {
-                        (true, false) => match hot.binary_search(&i) {
-                            Ok(_) => {}
-                            Err(pos) => hot.insert(pos, i),
-                        },
-                        (false, true) => {
-                            if let Ok(pos) = hot.binary_search(&i) {
-                                hot.remove(pos);
-                            }
-                        }
-                        _ => {}
-                    }
+                    track_hot(&mut hot, i, old_r, new_r);
                 }
                 b.rung[i] = k;
                 let h2 = rung_dt[k as usize];
@@ -427,19 +487,32 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
         }
 
         b.time += dtf;
+        self.tick = tick;
+        if tick < ticks && !keep_going() {
+            self.rung_dt = rung_dt;
+            self.tree = tree;
+            self.tree_len = tree_len;
+            self.by_rung = by_rung;
+            self.bucket_pos = bucket_pos;
+            self.hot = hot;
+            self.active = active;
+            self.stale_accel = stale_accel;
+            return false;
+        }
     }
-
     // Refresh accelerations for the next block's opening half-kick if the last
     // collision pass reshuffled the bodies.
     if stale_accel {
         compute_accel(b);
     }
-    remove_momentum_drift(b, (p0x, p0y, p0z));
+    remove_momentum_drift(b, self.p0);
 
     // Flashes are cosmetic. One O(F) retain at block end gives the same
     // survivor set as per-sub-tick aging would, because age is linear in
     // time and nothing in the block reads flashes.
     age_flashes(b);
+    true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,40 +532,93 @@ pub(super) fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
 /// when a body crosses into a different Hill sphere, so amortising over 100
 /// steps is more than fast enough even at n = 1000.
 pub fn advance(b: &mut Bodies, dt: f64) {
+    if let Some(mut job) = advance_begin(b, dt) {
+        advance_run(&mut job, b, || true);
+    }
+}
+
+/// An `advance` in progress; see `advance_begin` / `advance_run`.
+pub struct AdvanceJob {
+    dt: f64,
+    block: Option<BlockJob>,
+    /// Yoshida path: sub-steps still to take, each of size `yh`.
+    yoshida_left: usize,
+    yh: f64,
+    /// Set once integration is done; the dust pass may still be pending.
+    integrated: bool,
+    dust: Option<dust::DustPass>,
+}
+
+/// Start an advance of `dt`. Small quiet systems (Yoshida path) integrate
+/// right here; larger ones only prepare a rung block that `advance_run`
+/// executes. `None` when there is nothing to do.
+pub fn advance_begin(b: &mut Bodies, dt: f64) -> Option<AdvanceJob> {
     let n = b.len();
     if n == 0 {
-        return;
+        return None;
     }
     if !b.parent_cache_valid || b.stats.steps.saturating_sub(b.parent_cache_step) >= 100 {
         b.refresh_parent_cache();
     }
     let kmax = assign_rungs(b, dt);
     b.stats.max_rung = kmax;
-    // Small systems keep the 4th-order Yoshida step even when a moon needs
-    // a short step. All bodies share one step `dt / 2^kmax`. Each Yoshida
-    // step costs 3 force evaluations. `work` counts the pair evaluations.
     let substeps = 1usize << kmax;
     let work = n.saturating_mul(n).saturating_mul(3 * substeps);
     if n < YOSHIDA_MAX_N && work <= YOSHIDA_WORK_MAX {
         let h = dt / substeps as f64;
-        for _ in 0..substeps {
-            yoshida_step(b, h);
-        }
         b.stats.last_nsub = substeps as u32;
+        Some(AdvanceJob { dt, block: None, yoshida_left: substeps, yh: h, integrated: false, dust: None })
     } else {
-        step_block(b, dt, kmax);
         b.stats.last_nsub = 1u32 << kmax;
+        Some(AdvanceJob {
+            dt,
+            block: Some(BlockJob::begin(b, dt, kmax)),
+            yoshida_left: 0,
+            yh: 0.0,
+            integrated: false,
+            dust: None,
+        })
     }
-    account_gw_loss(b, dt);
-    tidal_dissipation(b, dt);
-    yarkovsky(b, dt);
-    gas_disk_migration(b, dt);
-    evolve_stars(b, dt);
-    dust::evolve(b, dt);
+}
+
+/// Continue an advance. `keep_going` is polled after each sub-tick; when it
+/// returns false the call returns `false` and can be resumed later (the
+/// caller may release and retake the lock in between). Returns `true` once
+/// the whole step, including the housekeeping, has finished.
+pub fn advance_run(job: &mut AdvanceJob, b: &mut Bodies, mut keep_going: impl FnMut() -> bool) -> bool {
+    let dt = job.dt;
+    if !job.integrated {
+        while job.yoshida_left > 0 {
+            yoshida_step(b, job.yh);
+            job.yoshida_left -= 1;
+            if job.yoshida_left > 0 && !keep_going() {
+                return false;
+            }
+        }
+        if let Some(block) = job.block.as_mut() {
+            if !block.run(b, &mut keep_going) {
+                return false;
+            }
+        }
+        job.integrated = true;
+        account_gw_loss(b, dt);
+        tidal_dissipation(b, dt);
+        yarkovsky(b, dt);
+        gas_disk_migration(b, dt);
+        evolve_stars(b, dt);
+        job.dust = dust::evolve_begin(b, dt);
+    }
+    if let Some(pass) = job.dust.as_mut() {
+        if !dust::evolve_run(b, pass, &mut keep_going) {
+            return false;
+        }
+        job.dust = None;
+    }
     coalesce_debris(b);
     tidal_breakup(b);
     comet_sublimate(b, dt);
     cull_escaped(b);
     settle_energy(b);
     b.stats.steps += 1;
+    true
 }

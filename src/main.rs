@@ -76,6 +76,9 @@ struct Shared {
     speed_bits: AtomicU64,
     clear_accum: AtomicBool,
     behind: AtomicBool,
+    /// True while a physics step is paused mid-way (velocities of a rung
+    /// block are staggered then, so energy must not be sampled).
+    mid_step: AtomicBool,
     phys_ns: AtomicU64,
     orbit_req: Mutex<Option<(u64, OrbitReq)>>,
     orbit_out: Mutex<Option<(u64, Vec<OrbitVertex>)>>,
@@ -94,6 +97,7 @@ impl Shared {
             speed_bits: AtomicU64::new((speed * SPEED_SCALE).to_bits()),
             clear_accum: AtomicBool::new(false),
             behind: AtomicBool::new(false),
+            mid_step: AtomicBool::new(false),
             phys_ns: AtomicU64::new(0),
             orbit_req: Mutex::new(None),
             orbit_out: Mutex::new(None),
@@ -140,78 +144,168 @@ impl Drop for RenderGuard<'_> {
     }
 }
 
-fn physics_loop(sh: Arc<Shared>) {
-    let mut last = Instant::now();
-    let mut accum = 0.0_f64;
-    let mut behind_until: Option<Instant> = None;
+/// Longest real time the physics thread will "owe" before it gives up
+/// catching up and drops the backlog (scaled by the simulation speed).
+const MAX_BACKLOG_REAL_S: f64 = 0.25;
+/// Backlog below this many physics steps is never dropped.
+const MIN_BACKLOG_STEPS: f64 = 8.0;
+/// How long the "behind" indicator stays lit after a backlog was dropped.
+const BEHIND_INDICATOR: Duration = Duration::from_secs(1);
+/// Longest real time a single frame's worth of owed simulation can be.
+const MAX_FRAME_REAL_S: f64 = 0.1;
+/// Idle sleep bounds while waiting for the next step to become due.
+const IDLE_SLEEP_MIN_S: f64 = 2.0e-4;
+const IDLE_SLEEP_MAX_S: f64 = 2.0e-3;
 
-    while !sh.quit.load(Ordering::Relaxed) {
+/// The physics thread's pacing state: how much simulated time is owed, the
+/// step currently in flight (if any), and the "behind" indicator.
+struct PhysicsPacer {
+    last_tick: Instant,
+    /// Simulated time owed to the world, in time units.
+    owed: f64,
+    behind_until: Option<Instant>,
+    /// A physics step paused mid-way to let the render thread in.
+    job: Option<physics::AdvanceJob>,
+}
+
+impl PhysicsPacer {
+    fn new() -> Self {
+        Self { last_tick: Instant::now(), owed: 0.0, behind_until: None, job: None }
+    }
+
+    /// Forget owed time and any step in flight (reset / load / spawn).
+    fn discard_pending_work(&mut self, sh: &Shared) {
+        self.owed = 0.0;
+        self.job = None;
+        sh.mid_step.store(false, Ordering::Release);
+    }
+
+    /// Add the real time since the previous tick, scaled by `speed`.
+    fn accrue(&mut self, speed: f64, paused: bool) {
         let now = Instant::now();
-        let dt_real = now.duration_since(last).as_secs_f64();
-        last = now;
+        let real_dt = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+        if !paused {
+            self.owed += real_dt.min(MAX_FRAME_REAL_S) * speed;
+        }
+    }
 
+    fn step_is_due(&self) -> bool {
+        self.job.is_some() || self.owed >= physics::DT
+    }
+
+    /// Advance the simulation while time is owed, holding the bodies lock
+    /// only until the render thread asks for it or the slice runs out.
+    fn run_slice(&mut self, sh: &Shared) {
+        sh.yield_to_render();
+        let mut b = lock_ok(&sh.bodies);
+        // The render thread raises `clear_accum` while it holds this lock, when it
+        // replaces the bodies. Checking it here, under the lock, makes sure a step
+        // started on the old bodies never resumes on the new ones.
         if sh.clear_accum.swap(false, Ordering::AcqRel) {
-            accum = 0.0;
+            self.discard_pending_work(sh);
+            return;
+        }
+        let started = Instant::now();
+        let must_pause = || {
+            sh.render_wants.load(Ordering::Acquire) || started.elapsed() >= PHYS_SLICE
+        };
+        // A step can span several lock holds: it pauses after a sub-tick when
+        // `must_pause` and resumes on the next slice.
+        loop {
+            if self.job.is_none() {
+                if self.owed < physics::DT {
+                    break;
+                }
+                self.owed -= physics::DT;
+                self.job = physics::advance_begin(&mut b, physics::DT);
+                if self.job.is_none() {
+                    continue;
+                }
+            }
+            let finished = self
+                .job
+                .as_mut()
+                .is_none_or(|job| physics::advance_run(job, &mut b, || !must_pause()));
+            if finished {
+                self.job = None;
+            }
+            if must_pause() {
+                break;
+            }
+        }
+        lock_ok(&sh.history).maybe_record(&b);
+        sh.mid_step.store(self.job.is_some(), Ordering::Release);
+        drop(b);
+        sh.phys_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Drop a hopeless backlog and light the "behind" indicator for a while.
+    fn drop_backlog_if_hopeless(&mut self, speed: f64) {
+        let limit = (MAX_BACKLOG_REAL_S * speed).max(MIN_BACKLOG_STEPS * physics::DT);
+        if self.owed > limit {
+            self.owed = 0.0;
+            self.behind_until = Some(Instant::now() + BEHIND_INDICATOR);
+        }
+    }
+
+    fn is_behind(&self, paused: bool) -> bool {
+        !paused && self.behind_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    fn idle_sleep(&self, speed: f64, paused: bool) {
+        let seconds = if paused {
+            IDLE_SLEEP_MAX_S
+        } else {
+            ((physics::DT - self.owed).max(0.0) / speed).clamp(IDLE_SLEEP_MIN_S, IDLE_SLEEP_MAX_S)
+        };
+        std::thread::sleep(Duration::from_secs_f64(seconds));
+    }
+}
+
+/// Record the starting state so the timeline has a frame even while paused.
+fn seed_timeline(sh: &Shared) {
+    if lock_ok(&sh.history).is_empty() {
+        let b = lock_ok(&sh.bodies);
+        lock_ok(&sh.history).maybe_record(&b);
+    }
+}
+
+/// Build the orbit lines the render thread asked for. Returns whether it did.
+fn serve_orbit_request(sh: &Shared) -> bool {
+    let Some((id, req)) = lock_ok(&sh.orbit_req).take() else {
+        return false;
+    };
+    sh.yield_to_render();
+    let segments = {
+        let b = lock_ok(&sh.bodies);
+        physics::compute_orbit_segments(&b, req.zoom, req.planets, req.debris)
+    };
+    *lock_ok(&sh.orbit_out) = Some((id, render::segments_to_vertices(&segments)));
+    true
+}
+
+fn physics_loop(sh: Arc<Shared>) {
+    let mut pacer = PhysicsPacer::new();
+    while !sh.quit.load(Ordering::Relaxed) {
+        if sh.clear_accum.swap(false, Ordering::AcqRel) {
+            pacer.discard_pending_work(&sh);
         }
         let paused = sh.paused.load(Ordering::Relaxed);
         let speed = f64::from_bits(sh.speed_bits.load(Ordering::Relaxed)).max(1e-6);
-        if !paused {
-            accum += dt_real.min(0.1) * speed;
-        }
+        pacer.accrue(speed, paused);
 
-        let mut worked = false;
-
-        // Seed the timeline with the starting state, even while paused.
-        if lock_ok(&sh.history).is_empty() {
-            let b = lock_ok(&sh.bodies);
-            lock_ok(&sh.history).maybe_record(&b);
-        }
-
-        let req = lock_ok(&sh.orbit_req).take();
-        if let Some((id, req)) = req {
-            sh.yield_to_render();
-            let segs = {
-                let b = lock_ok(&sh.bodies);
-                physics::compute_orbit_segments(&b, req.zoom, req.planets, req.debris)
-            };
-            let verts = render::segments_to_vertices(&segs);
-            *lock_ok(&sh.orbit_out) = Some((id, verts));
+        seed_timeline(&sh);
+        let mut worked = serve_orbit_request(&sh);
+        if !paused && pacer.step_is_due() {
+            pacer.run_slice(&sh);
             worked = true;
         }
-
-        if !paused && accum >= physics::DT {
-            sh.yield_to_render();
-            let mut b = lock_ok(&sh.bodies);
-            let t0 = Instant::now();
-            while accum >= physics::DT {
-                physics::advance(&mut b, physics::DT);
-                accum -= physics::DT;
-                if sh.render_wants.load(Ordering::Acquire) || t0.elapsed() >= PHYS_SLICE {
-                    break;
-                }
-            }
-            lock_ok(&sh.history).maybe_record(&b);
-            drop(b);
-            sh.phys_ns
-                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            worked = true;
-        }
-
-        let limit = (0.25 * speed).max(8.0 * physics::DT);
-        if accum > limit {
-            accum = 0.0;
-            behind_until = Some(Instant::now() + Duration::from_secs(1));
-        }
-        let behind = !paused && behind_until.is_some_and(|t| Instant::now() < t);
-        sh.behind.store(behind, Ordering::Relaxed);
-
+        pacer.drop_backlog_if_hopeless(speed);
+        sh.behind.store(pacer.is_behind(paused), Ordering::Relaxed);
         if !worked {
-            let wait = if paused {
-                2.0e-3
-            } else {
-                ((physics::DT - accum).max(0.0) / speed).clamp(2.0e-4, 2.0e-3)
-            };
-            std::thread::sleep(Duration::from_secs_f64(wait));
+            pacer.idle_sleep(speed, paused);
         }
     }
 }
@@ -604,6 +698,139 @@ struct SimState {
     pending_load: Option<String>,
 }
 
+/// What the locked part of a redraw hands to the unlocked part.
+struct FrameData {
+    full_output: egui::FullOutput,
+    flashes_active: bool,
+    n_bodies: usize,
+    new_title: Option<String>,
+    trail_snapshot: Vec<TrailSample>,
+    comet_tail_verts: Vec<OrbitVertex>,
+    /// Orbit vertices from the physics thread, applied after the lock drops.
+    orbit_out: Option<(u64, Vec<OrbitVertex>)>,
+    /// The recorded frame shown this redraw, if any.
+    replaying: Option<u64>,
+}
+
+impl SimState {
+    /// Everything a redraw does while it holds the bodies lock: replay, UI,
+    /// actions, camera, orbit lines and the render instances.
+    fn update_locked(
+        &mut self,
+        ui_state: &mut UiState,
+        shared: &Arc<Shared>,
+        gfx: &mut GfxState,
+        vp: [f32; 2],
+        frame_dt: f64,
+        timing_log: bool,
+    ) -> FrameData {
+        let mut actions = Actions::default();
+        let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
+        // Time spent waiting for the physics thread to release the lock, then
+        // time spent holding it (NBODY_TIMING only).
+        let t_wait0 = Instant::now();
+        let mut b = shared.lock_for_render();
+        let t_held0 = Instant::now();
+        // Replay: show a recorded snapshot in place of the live state. It is
+        // swapped back before this lock is released.
+        let replaying = self.enter_replay(shared, &mut b, frame_dt);
+        self.t_wait_accum += t_wait0.elapsed().as_secs_f64() * 1e6;
+
+        let new_title = self.update_fps_title(&b);
+
+        let selected_idx = self.selected.and_then(|id| b.index_of_id(id));
+        self.update_follow(&b, selected_idx, frame_dt);
+        if self.selected.is_some() && selected_idx.is_none() {
+            self.selected = None;
+            self.follow = false;
+        }
+
+        if replaying.is_none() && !shared.mid_step.load(Ordering::Acquire) {
+            ui_state.diag.maybe_sample(&b);
+        }
+
+        let view_info = self.make_view_info(shared, vp, gfx.egui_ctx.pixels_per_point(), b.len());
+        let full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
+            actions = ui::draw(ui, ui_state, &view_info, &b);
+        });
+        if let Some(t) = actions.timeline.take() {
+            self.handle_timeline(t, shared);
+        }
+        // A replay is view-only: edits, spawns, resets and loads are dropped;
+        // camera, selection and display options stay.
+        if replaying.is_some() {
+            actions = actions.view_only();
+        }
+        self.apply_actions(actions, ui_state, vp, &mut b, shared);
+        let trail_snapshot = self.trail.snapshot(&b, self.follow_smooth);
+
+        self.pause_on_new_events(&b, replaying.is_some());
+
+        shared.paused.store(self.paused, Ordering::Relaxed);
+        shared
+            .speed_bits
+            .store((self.speed * SPEED_SCALE).to_bits(), Ordering::Relaxed);
+
+        let orbit_out = self.orbit_lines_for_frame(&b, shared, replaying, vp);
+        let comet_tail_verts = self.build_render_instances(&b, gfx, vp);
+        let flashes_active = !b.flashes.is_empty();
+        let n_bodies = b.len();
+        if timing_log {
+            self.last_comets = b.origin.iter().filter(|&&o| o == BodyOrigin::Comet).count();
+            self.last_comet_verts = comet_tail_verts.len();
+        }
+        self.t_held_accum += t_held0.elapsed().as_secs_f64() * 1e6;
+        if replaying.is_some() {
+            self.leave_replay(&mut b);
+        }
+        FrameData {
+            full_output,
+            flashes_active,
+            n_bodies,
+            new_title,
+            trail_snapshot,
+            comet_tail_verts,
+            orbit_out,
+            replaying,
+        }
+    }
+
+    /// Fill the renderer's instance buffers; returns the comet tail vertices.
+    fn build_render_instances(&mut self, b: &Bodies, gfx: &mut GfxState, vp: [f32; 2]) -> Vec<OrbitVertex> {
+        let t_inst0 = Instant::now();
+        let override_body = self
+            .follow_smooth
+            .and_then(|(id, pos)| b.index_of_id(id).map(|idx| (idx, pos)));
+        let scene_view = self.view();
+        gfx.renderer.build_instances(b, &scene_view, vp, override_body);
+        self.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
+        let t_comet0 = Instant::now();
+        let verts = nbody_rust::render::build_comet_tails(b, &scene_view);
+        self.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
+        verts
+    }
+
+    /// Update the trails (live run only) and upload the scene to the GPU.
+    fn upload_frame(&mut self, gfx: &mut GfxState, data: &FrameData, vp: [f32; 2]) {
+        let cam_view = self.view();
+        // Trails belong to the live run: hidden while replaying, and only
+        // rebuilt when enabled.
+        let trail_verts = if data.replaying.is_none() && self.trail.cfg.enabled {
+            self.trail.update(&data.trail_snapshot);
+            Some(self.trail.build_vertices(cam_view.cam))
+        } else {
+            None
+        };
+        gfx.upload_scene(
+            data.orbit_out.as_ref().map(|(_, v)| v.as_slice()),
+            &cam_view,
+            vp,
+            &data.comet_tail_verts,
+            trail_verts.as_deref(),
+        );
+    }
+}
+
 impl SimState {
     fn new() -> Self {
         Self {
@@ -677,6 +904,354 @@ impl SimState {
     /// the Solar preset takes the body count from the spawn (13 planets +
     /// ~200 belt bodies, not the old hard-coded 9). `seed` is used by both:
     /// `Random` uses it as the RNG seed, `Solar` as the planet-phase seed.
+    /// Count a frame and, twice a second, refresh fps / steps-per-second.
+    /// Returns the new window title when the numbers were refreshed.
+    fn update_fps_title(&mut self, b: &Bodies) -> Option<String> {
+        let mut new_title = None;
+        self.fps_frames += 1;
+        let win = self.fps_timer.elapsed().as_secs_f32();
+        if win >= 0.5 {
+            self.fps = self.fps_frames as f32 / win;
+            let steps = b.stats.steps;
+            self.steps_per_sec =
+                (steps.saturating_sub(self.steps_at_fps)) as f32 / win;
+            self.steps_at_fps = steps;
+            self.fps_frames = 0;
+            self.fps_timer = Instant::now();
+            new_title = Some(format!(
+                "N-Body Rust — {} — {:.0} fps — {:.2}×",
+                primary_label(b),
+                self.fps,
+                self.speed
+            ));
+        }
+
+        new_title
+    }
+
+    /// Move the camera to the followed body (smoothed), or drop follow mode
+    /// when that body no longer exists.
+    fn update_follow(&mut self, b: &Bodies, selected_idx: Option<usize>, frame_dt: f64) {
+        if self.follow {
+            match selected_idx {
+                Some(i) => {
+                    let id = b.id[i];
+                    const TAU: f64 = 0.06;
+                    let alpha = 1.0 - (-frame_dt / TAU).exp();
+                    let prev = match self.follow_smooth {
+                        Some((prev_id, pos)) if prev_id == id => pos,
+                        _ => [b.x[i], b.y[i], b.z[i]],
+                    };
+                    let new_pos = [
+                        prev[0] + (b.x[i] - prev[0]) * alpha,
+                        prev[1] + (b.y[i] - prev[1]) * alpha,
+                        prev[2] + (b.z[i] - prev[2]) * alpha,
+                    ];
+                    self.follow_smooth = Some((id, new_pos));
+                    self.cam = [new_pos[0], new_pos[1]];
+                    self.cam_z = new_pos[2];
+                }
+                None => {
+                    self.follow = false;
+                    self.follow_smooth = None;
+                }
+            }
+        } else {
+            self.follow_smooth = None;
+        }
+    }
+
+    /// Everything the UI needs to know about the current state of the view.
+    fn make_view_info(&self, shared: &Shared, vp: [f32; 2], ppp: f32, total_bodies: usize) -> ViewInfo {
+        let effective_systems = if self.preset == Preset::Random
+            && self.last_loaded_preset.is_none()
+        {
+            self.systems
+        } else {
+            1
+        };
+        ViewInfo {
+            paused: self.paused,
+            speed: self.speed,
+            fps: self.fps,
+            steps_per_sec: self.steps_per_sec,
+            zoom: self.zoom,
+            cam: [self.cam[0], self.cam[1], self.cam_z],
+            yaw: self.yaw,
+            pitch: self.pitch,
+            viewport_px: vp,
+            ppp: ppp,
+            seed: self.seed,
+            body_count: self.body_count,
+            systems: effective_systems,
+            total_bodies,
+            show_orbits: self.show_orbits,
+            show_debris_orbits: self.show_debris_orbits,
+            follow: self.follow,
+            selected: self.selected,
+            follow_smooth: self.follow_smooth,
+            preset: self.preset,
+            vsync: self.vsync,
+            behind: shared.behind.load(Ordering::Relaxed),
+            pause_on_event: self.pause_on_event,
+            trails_enabled: self.trail.cfg.enabled,
+            trail_age: self.trail.cfg.max_age,
+            trail_bodies: self.trail.cfg.max_bodies,
+            trail_non_rubble: self.trail.cfg.non_rubble_only,
+            sn_kicks: self.sn_kicks,
+            mass_transfer: self.mass_transfer,
+            aging_mult: self.aging_mult,
+            timeline: {
+                let hist = lock_ok(&shared.history);
+                hist.span().map(|(t_min, t_max)| TimelineInfo {
+                    t_min,
+                    t_max,
+                    t_now: self.replay.as_ref().map(|r| r.time),
+                    playing: self.replay.as_ref().is_some_and(|r| r.playing),
+                    frames: hist.len(),
+                    mb: hist.megabytes(),
+                })
+            },
+        }
+    }
+
+    /// Pause when the merger / impact / tidal count grows. A drop means a new
+    /// system replaced the old one: no pause then. Replays never pause.
+    fn pause_on_new_events(&mut self, b: &Bodies, replaying: bool) {
+        // Pause when the merger / impact / tidal count grows. A drop
+        // means a new system replaced the old one: no pause then.
+        let pause_events = b
+            .stats
+            .merges
+            .wrapping_add(b.stats.impacts)
+            .wrapping_add(b.stats.tidal);
+        if !replaying
+            && self.pause_on_event
+            && !self.paused
+            && pause_events > self.last_pause_events
+        {
+            self.paused = true;
+        }
+        if !replaying {
+            self.last_pause_events = pause_events;
+        }
+    }
+
+    /// Orbit lines for this frame. Live: take what the physics thread built
+    /// and ask it for a refresh when the view or the system changed. Replay:
+    /// build them here from the shown snapshot.
+    fn orbit_lines_for_frame(
+        &mut self,
+        b: &Bodies,
+        shared: &Shared,
+        replaying: Option<u64>,
+        vp: [f32; 2],
+    ) -> Option<(u64, Vec<OrbitVertex>)> {
+        let mut orbit_out_taken = lock_ok(&shared.orbit_out).take();
+        if let Some(fid) = replaying {
+            // Orbit lines for the recorded frame, built here from
+            // the snapshot; the physics thread's live lines are dropped.
+            orbit_out_taken = None;
+            let key = (fid, self.zoom);
+            if self.replay_orbit != key || !self.orbit_buf_valid {
+                let segs = physics::compute_orbit_segments(
+                    b,
+                    self.zoom as f64,
+                    self.show_orbits,
+                    self.show_debris_orbits,
+                );
+                orbit_out_taken = Some((0, render::segments_to_vertices(&segs)));
+                self.replay_orbit = key;
+                self.orbit_buf_valid = true;
+            }
+        }
+        let events_total = b
+            .stats
+            .merges
+            .wrapping_add(b.stats.impacts)
+            .wrapping_add(b.stats.tidal)
+            .wrapping_add(b.stats.escaped);
+        let orbits_visible = self.show_orbits || self.show_debris_orbits;
+        let zoom_ratio = self.zoom / self.last_orbit_zoom.max(1e-6);
+        let zoom_changed = (zoom_ratio - 1.0).abs() > 0.3;
+        let span_x = 0.35 * vp[0] as f64 / self.zoom as f64;
+        let span_y = 0.35 * vp[1] as f64 / self.zoom as f64;
+        let cam_moved = (self.cam[0] - self.last_orbit_cam[0]).abs() > span_x
+            || (self.cam[1] - self.last_orbit_cam[1]).abs() > span_y;
+        let events_changed = events_total != self.last_orbit_events;
+        let stale = !self.paused
+            && self.last_orbit_update.elapsed().as_millis() > ORBIT_REFRESH_MS;
+        if replaying.is_none()
+            && (!self.orbit_buf_valid
+            || (orbits_visible
+                && (zoom_changed || cam_moved || events_changed || stale)))
+        {
+            self.orbit_posted += 1;
+            *lock_ok(&shared.orbit_req) = Some((
+                self.orbit_posted,
+                OrbitReq {
+                    zoom: self.zoom as f64,
+                    planets: self.show_orbits,
+                    debris: self.show_debris_orbits,
+                    cam: [self.cam[0], self.cam[1], self.cam_z],
+                    viewport: vp,
+                },
+            ));
+            self.last_orbit_update = Instant::now();
+            self.last_orbit_zoom = self.zoom;
+            self.last_orbit_cam = self.cam;
+            self.last_orbit_events = events_total;
+            self.orbit_buf_valid = true;
+        }
+        orbit_out_taken
+    }
+
+    /// Accumulate per-frame timings and, once a second, print the
+    /// `NBODY_TIMING` summary line.
+    fn log_frame_timing(&mut self, shared: &Shared, t_frame: Instant, n_bodies: usize) {
+        self.t_frame_accum += t_frame.elapsed().as_secs_f64() * 1e6;
+        self.t_window_frames += 1;
+        let secs = self.t_window_start.elapsed().as_secs_f64();
+        if secs >= 1.0 {
+            let frames = self.t_window_frames as f64;
+            let phys_busy = shared.phys_ns.swap(0, Ordering::Relaxed) as f64
+                / (secs * 1e9)
+                * 100.0;
+            let ms = |us: f64| us / frames / 1000.0;
+            let dust_busy = physics::DUST_STAT_NS.swap(0, Ordering::Relaxed) as f64
+                / (secs * 1e9)
+                * 100.0;
+            let dust_grains = physics::DUST_STAT_GRAINS.load(Ordering::Relaxed);
+            println!(
+                "[timing] n={} comets={} (tail verts {}) fps={:.0} frame={:.2}ms \
+                 lock_wait={:.2}ms lock_held={:.2}ms (instances={:.2} comet_tails={:.2}) \
+                 physics_busy={:.0}% (dust={:.0}%, {} grains){}",
+                n_bodies,
+                self.last_comets,
+                self.last_comet_verts,
+                frames / secs,
+                ms(self.t_frame_accum),
+                ms(self.t_wait_accum),
+                ms(self.t_held_accum),
+                ms(self.t_inst_accum),
+                ms(self.t_comet_accum),
+                phys_busy,
+                dust_busy,
+                dust_grains,
+                if shared.behind.load(Ordering::Relaxed) {
+                    " (behind)"
+                } else {
+                    ""
+                }
+            );
+            self.t_window_start = Instant::now();
+            self.t_window_frames = 0;
+            self.t_frame_accum = 0.0;
+            self.t_wait_accum = 0.0;
+            self.t_held_accum = 0.0;
+            self.t_inst_accum = 0.0;
+            self.t_comet_accum = 0.0;
+        }
+    }
+
+    /// Left button: press starts a canvas drag; a release without movement is
+    /// a click that picks the body under the cursor (or clears the selection).
+    fn on_left_button(&mut self, pressed: bool, vp: [f32; 2], shared: &Shared) {
+        if pressed {
+            self.dragging = true;
+            self.press_pos = self.cursor;
+            self.moved_px = 0.0;
+            return;
+        }
+        if !self.dragging {
+            return;
+        }
+        self.dragging = false;
+        if self.moved_px >= CLICK_SLOP_PX {
+            return;
+        }
+        let hit = match &self.replay_cache {
+            Some((_, rb)) if self.replay.is_some() => self.pick(rb, self.cursor, vp),
+            _ => {
+                let b = shared.lock_for_render();
+                self.pick(&b, self.cursor, vp)
+            }
+        };
+        self.selected = hit;
+        if hit.is_none() {
+            self.follow = false;
+        }
+    }
+
+    /// Right button: press starts turning the camera about the point under
+    /// the cursor, not the screen centre. Zoomed in on one system among many,
+    /// the centre can be far from it and the system would sweep away.
+    fn on_right_button(&mut self, pressed: bool, vp: [f32; 2]) {
+        if !pressed {
+            self.rotating = false;
+            self.rot_anchor = None;
+            return;
+        }
+        self.rotating = true;
+        let p = self.cursor;
+        self.rot_anchor = if self.follow {
+            None // following already pivots about the body
+        } else {
+            Some((self.view().screen_to_world(p, vp), p))
+        };
+    }
+
+    /// Cursor motion: turns the camera while the right button is held, pans
+    /// while the left is dragged past the click slop.
+    fn on_cursor_moved(&mut self, pos: [f32; 2], vp: [f32; 2]) {
+        if self.rotating {
+            let mut v = self.view();
+            v.orbit_px((pos[0] - self.cursor[0]) as f64, (pos[1] - self.cursor[1]) as f64);
+            if let Some((world, screen)) = self.rot_anchor {
+                // Slide the focus so the anchor stays where it was.
+                let s = v.to_screen(world, vp);
+                v.pan_px(screen[0] as f64 - s[0], screen[1] as f64 - s[1]);
+            }
+            self.set_view(&v);
+            self.orbit_buf_valid = false;
+        }
+        if self.dragging {
+            let dx = pos[0] - self.cursor[0];
+            let dy = pos[1] - self.cursor[1];
+            self.moved_px += dx.abs() + dy.abs();
+            if self.moved_px >= CLICK_SLOP_PX {
+                self.pan_by_pixels(dx, dy);
+            }
+        }
+        self.cursor = pos;
+    }
+
+    /// Pan by a screen-space drag. Always leaves follow mode and clears the
+    /// stale smoothed position.
+    fn pan_by_pixels(&mut self, dx: f32, dy: f32) {
+        self.pan_gm(-dx as f64 / self.zoom as f64, -dy as f64 / self.zoom as f64);
+        self.follow = false;
+        self.follow_smooth = None;
+    }
+
+    /// Scroll: a mouse wheel (or Ctrl/Cmd + scroll, a pinch on Windows and
+    /// Linux) zooms at the cursor; a two-finger touchpad scroll pans.
+    fn on_scroll(&mut self, delta: MouseScrollDelta, zoom_modifier: bool, vp: [f32; 2]) {
+        // Convert to pixels. A mouse wheel sends whole lines on the y axis
+        // only. A touchpad sends fractions or sideways motion.
+        let (dx, dy, touchpad) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (x * 30.0, y * 30.0, x != 0.0 || y.fract() != 0.0),
+            MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
+        };
+        if zoom_modifier || !touchpad {
+            let cursor = self.cursor;
+            let dz = if dy.abs() >= dx.abs() { dy } else { dx };
+            self.zoom_at((dz / 30.0 * 0.15).exp(), cursor, vp);
+        } else {
+            self.pan_by_pixels(dx, dy);
+        }
+    }
+
     /// Leave replay and return to the live simulation.
     fn exit_replay(&mut self) {
         if self.replay.take().is_some() {
@@ -1109,9 +1684,28 @@ impl SimState {
         self.selected = Some(list[next as usize].1);
     }
 
+    /// Apply one frame's worth of UI actions to the simulation state.
+    /// Order matters: spawning comes first so later actions see the new
+    /// system, edits come after selection so they act on the new target.
     fn apply_actions(
         &mut self,
-        act: Actions,
+        mut act: Actions,
+        ui_state: &mut UiState,
+        vp: [f32; 2],
+        b: &mut Bodies,
+        shared: &Shared,
+    ) {
+        self.apply_spawn_actions(&mut act, ui_state, vp, b, shared);
+        self.apply_run_control(&mut act, ui_state, b);
+        self.apply_view_actions(&act, vp, b);
+        self.apply_edit_actions(&mut act, b);
+        self.apply_display_settings(&act, ui_state, b);
+    }
+
+    /// Systems slider, preset loading, preset / seed / count changes, reset.
+    fn apply_spawn_actions(
+        &mut self,
+        act: &mut Actions,
         ui_state: &mut UiState,
         vp: [f32; 2],
         b: &mut Bodies,
@@ -1131,7 +1725,7 @@ impl SimState {
             }
         }
 
-        if let Some(slug) = act.load_preset {
+        if let Some(slug) = act.load_preset.take() {
             if let Some(preset) = physics::load_preset_by_slug(&slug) {
                 physics::spawn_from_preset(b, &preset);
                 physics::set_evolution_rate(b, self.evolution_rate);
@@ -1152,7 +1746,7 @@ impl SimState {
             }
         }
 
-        if let Some(p) = act.preset {
+        if let Some(p) = act.preset.take() {
             self.preset = p;
             self.last_loaded_preset = None;
             ui_state.loaded_preset_slug = None;
@@ -1178,10 +1772,14 @@ impl SimState {
             self.fit(b, vp); // ← added
             ui_state.set_pending_seed(self.seed);
         }
-        if let Some(name) = act.save {
+    }
+
+    /// Save / load, pause, single step, speed, vsync and orbit-line toggles.
+    fn apply_run_control(&mut self, act: &mut Actions, ui_state: &mut UiState, b: &mut Bodies) {
+        if let Some(name) = act.save.take() {
             self.save_game(b, &name, ui_state);
         }
-        if let Some(name) = act.load {
+        if let Some(name) = act.load.take() {
             // Read from disk after the lock is released (see `App::flush_io`).
             self.pending_load = Some(name);
         }
@@ -1205,6 +1803,10 @@ impl SimState {
             self.show_debris_orbits = o;
             self.orbit_buf_valid = false;
         }
+    }
+
+    /// Camera, zoom, selection and follow.
+    fn apply_view_actions(&mut self, act: &Actions, vp: [f32; 2], b: &mut Bodies) {
         if let Some((yaw, pitch)) = act.view_angles {
             self.yaw = yaw;
             self.pitch = pitch.clamp(-view::PITCH_LIMIT, view::PITCH_LIMIT);
@@ -1239,88 +1841,107 @@ impl SimState {
         if act.cycle != 0 {
             self.cycle_selection(b, act.cycle);
         }
-        if let Some(edit) = act.edit {
+    }
+
+    /// Edits to the selected body, or to a multi-selection.
+    fn apply_edit_actions(&mut self, act: &mut Actions, b: &mut Bodies) {
+        if let Some(edit) = act.edit.take() {
             if let Some(i) = self.selected.and_then(|id| b.index_of_id(id)) {
-                match edit {
-                    Edit::MassMul(f) => physics::scale_mass(b, i, f),
-                    Edit::SetKind(k) => physics::set_kind(b, i, k),
-                    Edit::Circularize => {
-                        physics::circularize(b, i);
-                    }
-                    Edit::Delete => {
-                        physics::delete_body(b, i);
+                self.apply_edit(b, i, edit);
+                self.orbit_buf_valid = false;
+            }
+        }
+        if let Some((ids, edit)) = act.multi_edit.take() {
+            self.apply_multi_edit(b, &ids, edit);
+        }
+    }
+
+    /// Apply one edit to body `i`.
+    fn apply_edit(&mut self, b: &mut Bodies, i: usize, edit: Edit) {
+        match edit {
+            Edit::MassMul(f) => physics::scale_mass(b, i, f),
+            Edit::SetKind(k) => physics::set_kind(b, i, k),
+            Edit::Circularize => {
+                physics::circularize(b, i);
+            }
+            Edit::Delete => {
+                physics::delete_body(b, i);
+                self.selected = None;
+                self.follow = false;
+            }
+            Edit::SpawnMoon(n) => {
+                let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
+                for _ in 0..n.clamp(1, 8) {
+                    physics::spawn_moon(b, i, &mut rng);
+                }
+                b.rng = rng;
+                self.orbit_buf_valid = false;
+            }
+            Edit::VelMul(f) => {
+                // Scale the speed relative to the parent (or the
+                // primary); with neither, scale the absolute speed.
+                let refb = physics::find_parent(b, i)
+                    .or_else(|| physics::primary_index(b).filter(|&p| p != i));
+                let (rvx, rvy) = match refb {
+                    Some(p) => (b.vx[p], b.vy[p]),
+                    None => (0.0, 0.0),
+                };
+                b.vx[i] = rvx + (b.vx[i] - rvx) * f;
+                b.vy[i] = rvy + (b.vy[i] - rvy) * f;
+                b.parent_cache_valid = false;
+                self.orbit_buf_valid = false;
+            }
+            Edit::Rename(name) => {
+                let t = name.trim();
+                b.name[i] = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            Edit::AddRing(n) => {
+                let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
+                physics::add_ring(b, i, n.clamp(5, 200), &mut rng);
+                b.rng = rng;
+                self.orbit_buf_valid = false;
+            }
+        }
+    }
+
+    /// Apply one edit to every body of a multi-selection, in batched calls
+    /// so the O(N^2) physics commit runs once for the whole selection.
+    fn apply_multi_edit(&mut self, b: &mut Bodies, ids: &[u64], edit: Edit) {
+        let idx: Vec<usize> = ids.iter().filter_map(|&id| b.index_of_id(id)).collect();
+        if !idx.is_empty() {
+            // One batched call each: the O(N^2) physics commit runs once
+            // for the whole selection, not once per body.
+            match edit {
+                Edit::MassMul(f) => {
+                    let e: Vec<(usize, f64)> = idx.iter().map(|&i| (i, f)).collect();
+                    physics::scale_masses(b, &e);
+                }
+                Edit::SetKind(k) => {
+                    let e: Vec<(usize, BodyKind)> = idx.iter().map(|&i| (i, k)).collect();
+                    physics::set_kinds(b, &e);
+                }
+                Edit::Circularize => {
+                    physics::circularize_many(b, &idx);
+                }
+                Edit::Delete => {
+                    if self.selected.is_some_and(|s| ids.contains(&s)) {
                         self.selected = None;
                         self.follow = false;
                     }
-                    Edit::SpawnMoon(n) => {
-                        let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
-                        for _ in 0..n.clamp(1, 8) {
-                            physics::spawn_moon(b, i, &mut rng);
-                        }
-                        b.rng = rng;
-                        self.orbit_buf_valid = false;
-                    }
-                    Edit::VelMul(f) => {
-                        // Scale the speed relative to the parent (or the
-                        // primary); with neither, scale the absolute speed.
-                        let refb = physics::find_parent(b, i)
-                            .or_else(|| physics::primary_index(b).filter(|&p| p != i));
-                        let (rvx, rvy) = match refb {
-                            Some(p) => (b.vx[p], b.vy[p]),
-                            None => (0.0, 0.0),
-                        };
-                        b.vx[i] = rvx + (b.vx[i] - rvx) * f;
-                        b.vy[i] = rvy + (b.vy[i] - rvy) * f;
-                        b.parent_cache_valid = false;
-                        self.orbit_buf_valid = false;
-                    }
-                    Edit::Rename(name) => {
-                        let t = name.trim();
-                        b.name[i] = if t.is_empty() {
-                            None
-                        } else {
-                            Some(t.to_string())
-                        };
-                    }
-                    Edit::AddRing(n) => {
-                        let mut rng = std::mem::replace(&mut b.rng, physics::XorShift::new(1));
-                        physics::add_ring(b, i, n.clamp(5, 200), &mut rng);
-                        b.rng = rng;
-                        self.orbit_buf_valid = false;
-                    }
+                    physics::delete_bodies(b, idx);
                 }
-                self.orbit_buf_valid = false;
+                Edit::SpawnMoon(_) | Edit::AddRing(_) | Edit::VelMul(_) | Edit::Rename(_) => {}
             }
+            self.orbit_buf_valid = false;
         }
-        if let Some((ids, edit)) = act.multi_edit {
-            let idx: Vec<usize> = ids.iter().filter_map(|&id| b.index_of_id(id)).collect();
-            if !idx.is_empty() {
-                // One batched call each: the O(N^2) physics commit runs once
-                // for the whole selection, not once per body.
-                match edit {
-                    Edit::MassMul(f) => {
-                        let e: Vec<(usize, f64)> = idx.iter().map(|&i| (i, f)).collect();
-                        physics::scale_masses(b, &e);
-                    }
-                    Edit::SetKind(k) => {
-                        let e: Vec<(usize, BodyKind)> = idx.iter().map(|&i| (i, k)).collect();
-                        physics::set_kinds(b, &e);
-                    }
-                    Edit::Circularize => {
-                        physics::circularize_many(b, &idx);
-                    }
-                    Edit::Delete => {
-                        if self.selected.is_some_and(|s| ids.contains(&s)) {
-                            self.selected = None;
-                            self.follow = false;
-                        }
-                        physics::delete_bodies(b, idx);
-                    }
-                    Edit::SpawnMoon(_) | Edit::AddRing(_) | Edit::VelMul(_) | Edit::Rename(_) => {}
-                }
-                self.orbit_buf_valid = false;
-            }
-        }
+    }
+
+    /// Trails, diagnostics, stellar-evolution options, pause-on-event.
+    fn apply_display_settings(&mut self, act: &Actions, ui_state: &mut UiState, b: &mut Bodies) {
         if let Some(t) = act.trails {
             self.trail.cfg.enabled = t;
         }
@@ -1355,8 +1976,135 @@ impl SimState {
     }
 }
 
+impl GfxState {
+    /// Reconfigure the surface when the vsync setting changed.
+    fn apply_present_mode(&mut self, vsync: bool) {
+        let want_mode = if vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        if self.config.present_mode != want_mode {
+            self.config.present_mode = want_mode;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    /// The next surface texture, or `None` when the surface had to be
+    /// reconfigured or is unavailable this frame.
+    fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                self.surface.configure(&self.device, &self.config);
+                Some(f)
+            }
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            _ => None,
+        }
+    }
+
 // ---------------------------------------------------------------------------
 // App
+
+    /// Push this frame's geometry to the GPU: orbit lines (when new ones
+    /// arrived), camera uniforms, body instances, comet tails and trails
+    /// (`None` clears any trails still on screen).
+    fn upload_scene(
+        &mut self,
+        orbit_lines: Option<&[OrbitVertex]>,
+        cam_view: &view::View3,
+        vp: [f32; 2],
+        comet_tails: &[OrbitVertex],
+        trails: Option<&[OrbitVertex]>,
+    ) {
+        if let Some(verts) = orbit_lines {
+            self.renderer.set_orbit_vertices(&self.device, &self.queue, verts);
+        }
+        self.renderer.update_camera(&self.queue, cam_view, vp);
+        self.renderer.upload_instances(&self.device, &self.queue);
+        self.renderer
+            .set_comet_tail_vertices(&self.device, &self.queue, comet_tails);
+        match trails {
+            Some(verts) => self.renderer.set_trail_vertices(&self.device, &self.queue, verts),
+            None if self.renderer.trail_count() > 0 => {
+                self.renderer.set_trail_vertices(&self.device, &self.queue, &[]);
+            }
+            None => {}
+        }
+    }
+
+    /// Tessellate the egui output, draw the scene and the UI into the MSAA
+    /// target, resolve it into `view`, and present `frame`.
+    fn present_frame(
+        &mut self,
+        view: &wgpu::TextureView,
+        frame: wgpu::SurfaceTexture,
+        full_output: egui::FullOutput,
+    ) {
+    self.egui_state
+        .handle_platform_output(&self.window, full_output.platform_output);
+    let pixels_per_point = self.egui_ctx.pixels_per_point();
+    let clipped = self
+        .egui_ctx
+        .tessellate(full_output.shapes, pixels_per_point);
+
+    for (id, deltas) in &full_output.textures_delta.set {
+        for delta in deltas {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+    }
+
+    let screen_desc = ScreenDescriptor {
+        size_in_pixels: [self.config.width, self.config.height],
+        pixels_per_point,
+    };
+    let mut encoder = self
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    self.egui_renderer.update_buffers(
+        &self.device,
+        &self.queue,
+        &mut encoder,
+        &clipped,
+        &screen_desc,
+    );
+
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("main-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.msaa_view,
+                depth_slice: None,
+                resolve_target: Some(view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let mut pass = pass.forget_lifetime();
+        self.renderer.draw(&mut pass);
+        self.egui_renderer.render(&mut pass, &clipped, &screen_desc);
+    }
+
+    self.queue.submit([encoder.finish()]);
+    self.queue.present(frame);
+
+    for id in &full_output.textures_delta.free {
+        self.egui_renderer.free_texture(id);
+    }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 struct App {
@@ -1418,6 +2166,239 @@ impl App {
             let _ = gfx.device.poll(wgpu::PollType::wait_indefinitely());
         }
         self.gfx = None;
+    }
+}
+
+impl App {
+    /// Handle one key press. `egui_has_keyboard` is true while a text field
+    /// or similar widget owns the keyboard, in which case the key is ignored.
+    fn on_key(&mut self, event: winit::event::KeyEvent, vp: [f32; 2], egui_has_keyboard: bool) {
+        if event.state != ElementState::Pressed || egui_has_keyboard {
+            return;
+        }
+        if event.repeat && !is_repeatable_key(&event.logical_key) {
+            return;
+        }
+        let pan = 40.0 / self.sim.zoom as f64;
+        match event.logical_key.as_ref() {
+            Key::Named(named) => self.on_named_key(named, pan),
+            Key::Character(c)
+                if !self.mods.control_key() && !self.mods.alt_key() && !self.mods.super_key() =>
+            {
+                self.on_char_key(&c.to_lowercase(), pan, vp)
+            }
+            _ => {}
+        }
+    }
+
+    fn on_named_key(&mut self, key: NamedKey, pan: f64) {
+        match key {
+            NamedKey::Space => self.sim.paused = !self.sim.paused,
+            NamedKey::ArrowUp => self.pan_and_unfollow(0.0, -pan),
+            NamedKey::ArrowDown => self.pan_and_unfollow(0.0, pan),
+            NamedKey::ArrowLeft => self.pan_and_unfollow(-pan, 0.0),
+            NamedKey::ArrowRight => self.pan_and_unfollow(pan, 0.0),
+            NamedKey::Escape => {
+                self.sim.selected = None;
+                self.sim.follow = false;
+            }
+            NamedKey::Delete | NamedKey::Backspace => self.delete_selected(),
+            NamedKey::F5 => {
+                {
+                    let b = self.shared.lock_for_render();
+                    self.sim.save_game(&b, "quicksave", &mut self.ui);
+                }
+                self.flush_io();
+            }
+            NamedKey::F9 => {
+                self.sim.pending_load = Some("quicksave".to_string());
+                self.flush_io();
+            }
+            _ => {}
+        }
+    }
+
+    /// Letter and symbol shortcuts; `c` is already lower-cased.
+    fn on_char_key(&mut self, c: &str, pan: f64, vp: [f32; 2]) {
+        let centre = [vp[0] * 0.5, vp[1] * 0.5];
+        match c {
+            "r" => {
+                let mut b = self.shared.lock_for_render();
+                self.sim.reset(&mut b, &self.shared);
+                self.sim.fit(&b, vp);
+                self.ui.set_pending_seed(self.sim.seed);
+            }
+            "+" | "=" => self.sim.zoom_at(1.25, centre, vp),
+            "-" | "_" => self.sim.zoom_at(0.8, centre, vp),
+            "w" => self.move_cam_and_unfollow(0.0, -pan),
+            "s" => self.move_cam_and_unfollow(0.0, pan),
+            "a" => self.move_cam_and_unfollow(-pan, 0.0),
+            "d" => self.move_cam_and_unfollow(pan, 0.0),
+            "o" => {
+                self.sim.show_orbits = !self.sim.show_orbits;
+                self.sim.orbit_buf_valid = false;
+            }
+            ";" => {
+                self.sim.show_debris_orbits = !self.sim.show_debris_orbits;
+                self.sim.orbit_buf_valid = false;
+            }
+            "v" => self.sim.vsync = !self.sim.vsync,
+            "f" | "0" => {
+                let b = self.shared.lock_for_render();
+                self.sim.fit(&b, vp);
+            }
+            "c" => {
+                if self.sim.selected.is_some() {
+                    self.sim.follow = !self.sim.follow;
+                }
+            }
+            "t" => {
+                // Back to the top-down view.
+                self.sim.yaw = 0.0;
+                self.sim.pitch = 0.0;
+            }
+            "n" | "p" => self.cycle_selection_key(if c == "n" { 1 } else { -1 }),
+            "." if self.sim.replay.is_none() => {
+                let mut b = self.shared.lock_for_render();
+                physics::advance(&mut b, physics::DT);
+            }
+            _ => self.toggle_window_key(c),
+        }
+    }
+
+    /// Show or hide a window or overlay.
+    fn toggle_window_key(&mut self, c: &str) {
+        match c {
+            "`" => self.ui.show_dock = !self.ui.show_dock,
+            "l" => self.ui.show_labels = !self.ui.show_labels,
+            "u" => self.ui.units_si = !self.ui.units_si,
+            "b" => self.ui.show_list = !self.ui.show_list,
+            "y" => self.ui.show_systems = !self.ui.show_systems,
+            "e" => self.ui.show_events = !self.ui.show_events,
+            "k" => self.ui.show_saves = !self.ui.show_saves,
+            "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
+            "g" => self.ui.diag.visible = !self.ui.diag.visible,
+            "j" => self.ui.show_timeline = !self.ui.show_timeline,
+            _ => {}
+        }
+    }
+
+    fn pan_and_unfollow(&mut self, dx: f64, dy: f64) {
+        self.sim.pan_gm(dx, dy);
+        self.sim.follow = false;
+        self.sim.follow_smooth = None;
+    }
+
+    fn move_cam_and_unfollow(&mut self, dx: f64, dy: f64) {
+        self.sim.cam[0] += dx;
+        self.sim.cam[1] += dy;
+        self.sim.follow = false;
+        self.sim.follow_smooth = None;
+    }
+
+    fn delete_selected(&mut self) {
+        let mut b = self.shared.lock_for_render();
+        if let Some(i) = self.sim.selected.and_then(|id| b.index_of_id(id)) {
+            physics::delete_body(&mut b, i);
+            self.sim.selected = None;
+            self.sim.follow = false;
+            self.sim.orbit_buf_valid = false;
+        }
+    }
+
+    /// Select the next or previous body, from the replayed snapshot while scrubbing.
+    fn cycle_selection_key(&mut self, dir: i32) {
+        if self.sim.replay.is_some() {
+            if let Some(cache) = self.sim.replay_cache.take() {
+                self.sim.cycle_selection(&cache.1, dir);
+                self.sim.replay_cache = Some(cache);
+            }
+        } else {
+            let b = self.shared.lock_for_render();
+            self.sim.cycle_selection(&b, dir);
+        }
+    }
+}
+
+/// Held keys repeat only for panning and zooming. Toggles, R (new system),
+/// F5 and the like fire once per press.
+fn is_repeatable_key(key: &Key) -> bool {
+    match key.as_ref() {
+        Key::Named(
+            NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::ArrowLeft | NamedKey::ArrowRight,
+        ) => true,
+        Key::Character(c) => {
+            matches!(c.to_lowercase().as_str(), "w" | "a" | "s" | "d" | "+" | "=" | "-" | "_")
+        }
+        _ => false,
+    }
+}
+
+impl App {
+    /// Draw one frame: update the shared state under the lock, then upload and present.
+    fn redraw(&mut self, vp: [f32; 2]) {
+        let Some(gfx) = self.gfx.as_mut() else {
+            return;
+        };
+        if gfx.size.width == 0 || gfx.size.height == 0 {
+            self.idle_frames = self.idle_frames.saturating_add(1);
+            return;
+        }
+        let t_frame = Instant::now();
+        let frame_dt = (t_frame - self.sim.last_frame_time).as_secs_f64().min(0.1);
+        self.sim.last_frame_time = t_frame;
+
+        gfx.apply_present_mode(self.sim.vsync);
+        let Some(frame) = gfx.acquire_frame() else {
+            return;
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let data = self.sim.update_locked(&mut self.ui, &self.shared, gfx, vp, frame_dt, self.timing_log);
+
+        // ---- Everything below runs WITHOUT the bodies lock. ----
+        // Queued disk work (save write, save read). Inlined instead of
+        // `self.flush_io()` because `gfx` still borrows `self.gfx`.
+        if let Some(io) = self.sim.deferred_io.take() {
+            io(&mut self.ui);
+        }
+        if let Some(name) = self.sim.pending_load.take() {
+            self.sim.load_game(&name, &mut self.ui, &self.shared);
+            self.idle_frames = 0;
+        }
+        if let Some((id, _)) = &data.orbit_out {
+            self.sim.orbit_applied = *id;
+        }
+        self.sim.upload_frame(gfx, &data, vp);
+
+        let repaint_delay = data
+            .full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay);
+        let repaint_now = repaint_delay.is_some_and(|d| d.is_zero());
+        // A finite, non-zero delay (egui's `request_repaint_after`) must
+        // still wake an idle app. A huge delay means "no request".
+        self.repaint_at = repaint_delay
+            .filter(|d| !d.is_zero() && *d < Duration::from_secs(3600))
+            .map(|d| Instant::now() + d);
+
+        let (flashes_active, n_bodies, new_title) = (data.flashes_active, data.n_bodies, data.new_title);
+        gfx.present_frame(&view, frame, data.full_output);
+
+        if self.timing_log {
+            self.sim.log_frame_timing(&self.shared, t_frame, n_bodies);
+        }
+        if let Some(t) = new_title {
+            gfx.window.set_title(&t);
+        }
+
+        let busy = !self.sim.paused
+            || flashes_active
+            || self.sim.follow
+            || repaint_now
+            || self.sim.orbit_posted > self.sim.orbit_applied;
+        self.idle_frames = if busy { 0 } else { self.idle_frames.saturating_add(1) };
     }
 }
 
@@ -1590,165 +2571,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || gfx.egui_ctx.egui_wants_keyboard_input() {
-                    return;
-                }
-                // Held keys repeat only for panning and zooming. Toggles,
-                // R (new system), F5 and the like fire once per press.
-                let repeatable = match event.logical_key.as_ref() {
-                    Key::Named(
-                        NamedKey::ArrowUp
-                        | NamedKey::ArrowDown
-                        | NamedKey::ArrowLeft
-                        | NamedKey::ArrowRight,
-                    ) => true,
-                    Key::Character(c) => matches!(
-                        c.to_lowercase().as_str(),
-                        "w" | "a" | "s" | "d" | "+" | "=" | "-" | "_"
-                    ),
-                    _ => false,
-                };
-                if event.repeat && !repeatable {
-                    return;
-                }
-                let pan = 40.0 / self.sim.zoom as f64;
-                match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Space) => self.sim.paused = !self.sim.paused,
-                    Key::Named(NamedKey::ArrowUp) => {
-                        self.sim.pan_gm(0.0, -pan);
-                        self.sim.follow = false;
-                        self.sim.follow_smooth = None;
-                    }
-                    Key::Named(NamedKey::ArrowDown) => {
-                        self.sim.pan_gm(0.0, pan);
-                        self.sim.follow = false;
-                        self.sim.follow_smooth = None;
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        self.sim.pan_gm(-pan, 0.0);
-                        self.sim.follow = false;
-                        self.sim.follow_smooth = None;
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        self.sim.pan_gm(pan, 0.0);
-                        self.sim.follow = false;
-                        self.sim.follow_smooth = None;
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.sim.selected = None;
-                        self.sim.follow = false;
-                    }
-                    Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                        let mut b = self.shared.lock_for_render();
-                        if let Some(i) = self.sim.selected.and_then(|id| b.index_of_id(id)) {
-                            physics::delete_body(&mut b, i);
-                            self.sim.selected = None;
-                            self.sim.follow = false;
-                            self.sim.orbit_buf_valid = false;
-                        }
-                    }
-                    Key::Named(NamedKey::F5) => {
-                        {
-                            let b = self.shared.lock_for_render();
-                            self.sim.save_game(&b, "quicksave", &mut self.ui);
-                        }
-                        self.flush_io();
-                    }
-                    Key::Named(NamedKey::F9) => {
-                        self.sim.pending_load = Some("quicksave".to_string());
-                        self.flush_io();
-                    }
-                    Key::Character(c)
-                        if !self.mods.control_key()
-                            && !self.mods.alt_key()
-                            && !self.mods.super_key() =>
-                    {
-                        match c.to_lowercase().as_str() {
-                            "r" => {
-                                let mut b = self.shared.lock_for_render();
-                                self.sim.reset(&mut b, &self.shared);
-                                self.sim.fit(&b, vp); // ← added
-                                self.ui.set_pending_seed(self.sim.seed);
-                            }
-                            "+" | "=" => self.sim.zoom_at(1.25, [vp[0] * 0.5, vp[1] * 0.5], vp),
-                            "-" | "_" => self.sim.zoom_at(0.8, [vp[0] * 0.5, vp[1] * 0.5], vp),
-                            "w" => {
-                                self.sim.cam[1] -= pan;
-                                self.sim.follow = false;
-                                self.sim.follow_smooth = None;
-                            }
-                            "s" => {
-                                self.sim.cam[1] += pan;
-                                self.sim.follow = false;
-                                self.sim.follow_smooth = None;
-                            }
-                            "a" => {
-                                self.sim.cam[0] -= pan;
-                                self.sim.follow = false;
-                                self.sim.follow_smooth = None;
-                            }
-                            "d" => {
-                                self.sim.cam[0] += pan;
-                                self.sim.follow = false;
-                                self.sim.follow_smooth = None;
-                            }
-                            "`" => self.ui.show_dock = !self.ui.show_dock,
-                            "o" => {
-                                self.sim.show_orbits = !self.sim.show_orbits;
-                                self.sim.orbit_buf_valid = false;
-                            }
-                            ";" => {
-                                self.sim.show_debris_orbits = !self.sim.show_debris_orbits;
-                                self.sim.orbit_buf_valid = false;
-                            }
-                            "l" => self.ui.show_labels = !self.ui.show_labels,
-                            "u" => self.ui.units_si = !self.ui.units_si,
-                            "v" => self.sim.vsync = !self.sim.vsync,
-                            "b" => self.ui.show_list = !self.ui.show_list,
-                            "y" => self.ui.show_systems = !self.ui.show_systems,
-                            "e" => self.ui.show_events = !self.ui.show_events,
-                            "k" => self.ui.show_saves = !self.ui.show_saves,
-                            "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
-                            "f" | "0" => {
-                                let b = self.shared.lock_for_render();
-                                self.sim.fit(&b, vp);
-                            }
-                            "g" => self.ui.diag.visible = !self.ui.diag.visible,
-                            "c" => {
-                                if self.sim.selected.is_some() {
-                                    self.sim.follow = !self.sim.follow;
-                                }
-                            }
-                            "j" => {
-                                self.ui.show_timeline = !self.ui.show_timeline;
-                            }
-                            "t" => {
-                                // Back to the top-down view.
-                                self.sim.yaw = 0.0;
-                                self.sim.pitch = 0.0;
-                            }
-                            "n" | "p" => {
-                                let dir = if &*c == "n" { 1 } else { -1 };
-                                if self.sim.replay.is_some() {
-                                    // Cycle through the bodies of the shown snapshot.
-                                    if let Some(cache) = self.sim.replay_cache.take() {
-                                        self.sim.cycle_selection(&cache.1, dir);
-                                        self.sim.replay_cache = Some(cache);
-                                    }
-                                } else {
-                                    let b = self.shared.lock_for_render();
-                                    self.sim.cycle_selection(&b, dir);
-                                }
-                            }
-                            "." if self.sim.replay.is_none() => {
-                                let mut b = self.shared.lock_for_render();
-                                physics::advance(&mut b, physics::DT);
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
+                let egui_has_keyboard = gfx.egui_ctx.egui_wants_keyboard_input();
+                self.on_key(event, vp, egui_has_keyboard);
             }
 
             WindowEvent::MouseInput {
@@ -1756,31 +2580,11 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if state == ElementState::Pressed {
-                    if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
-                        return;
-                    }
-                    self.sim.dragging = true;
-                    self.sim.press_pos = self.sim.cursor;
-                    self.sim.moved_px = 0.0;
-                } else if self.sim.dragging {
-                    self.sim.dragging = false;
-                    if self.sim.moved_px < CLICK_SLOP_PX {
-                        let hit = match &self.sim.replay_cache {
-                            Some((_, rb)) if self.sim.replay.is_some() => {
-                                self.sim.pick(rb, self.sim.cursor, vp)
-                            }
-                            _ => {
-                                let b = self.shared.lock_for_render();
-                                self.sim.pick(&b, self.sim.cursor, vp)
-                            }
-                        };
-                        self.sim.selected = hit;
-                        if hit.is_none() {
-                            self.sim.follow = false;
-                        }
-                    }
+                let pressed = state == ElementState::Pressed;
+                if pressed && (response.consumed || gfx.egui_ctx.is_pointer_over_egui()) {
+                    return;
                 }
+                self.sim.on_left_button(pressed, vp, &self.shared);
             }
 
             // Right button: drag to turn the camera (spin and tilt).
@@ -1789,82 +2593,26 @@ impl ApplicationHandler for App {
                 button: MouseButton::Right,
                 ..
             } => {
-                if state == ElementState::Pressed {
-                    if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
-                        return;
-                    }
-                    self.sim.rotating = true;
-                    // Turn about the point under the cursor, not the screen
-                    // centre: zoomed in on one system among many, the centre
-                    // can be far from it and the system would sweep away.
-                    let p = self.sim.cursor;
-                    self.sim.rot_anchor = if self.sim.follow {
-                        None // following already pivots about the body
-                    } else {
-                        Some((self.sim.view().screen_to_world(p, vp), p))
-                    };
-                } else {
-                    self.sim.rotating = false;
-                    self.sim.rot_anchor = None;
+                let pressed = state == ElementState::Pressed;
+                if pressed && (response.consumed || gfx.egui_ctx.is_pointer_over_egui()) {
+                    return;
                 }
+                self.sim.on_right_button(pressed, vp);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let pos = [position.x as f32, position.y as f32];
-                if self.sim.rotating {
-                    let mut v = self.sim.view();
-                    v.orbit_px((pos[0] - self.sim.cursor[0]) as f64, (pos[1] - self.sim.cursor[1]) as f64);
-                    if let Some((world, screen)) = self.sim.rot_anchor {
-                        // Slide the focus so the anchor stays where it was.
-                        let s = v.to_screen(world, vp);
-                        v.pan_px(screen[0] as f64 - s[0], screen[1] as f64 - s[1]);
-                    }
-                    self.sim.set_view(&v);
-                    self.sim.orbit_buf_valid = false;
-                }
-                if self.sim.dragging {
-                    let dx = pos[0] - self.sim.cursor[0];
-                    let dy = pos[1] - self.sim.cursor[1];
-                    self.sim.moved_px += dx.abs() + dy.abs();
-                    if self.sim.moved_px >= CLICK_SLOP_PX {
-                        self.sim.pan_gm(-dx as f64 / self.sim.zoom as f64, -dy as f64 / self.sim.zoom as f64);
-                        // ALWAYS disable follow and clear the stale smooth position
-                        // when dragging the canvas.
-                        self.sim.follow = false;
-                        self.sim.follow_smooth = None;
-                    }
-                }
-                self.sim.cursor = pos;
+                self.sim.on_cursor_moved([position.x as f32, position.y as f32], vp);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if response.consumed || gfx.egui_ctx.is_pointer_over_egui() {
                     return;
                 }
-                let zoom_mod = self.mods.control_key()
+                let zoom_modifier = self.mods.control_key()
                     || self.mods.super_key()
                     || self.mods.shift_key()
                     || self.mods.alt_key();
-                // Convert to pixels. A mouse wheel sends whole lines on the
-                // y axis only. A touchpad sends fractions or sideways motion.
-                let (dx, dy, touchpad) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => {
-                        (x * 30.0, y * 30.0, x != 0.0 || y.fract() != 0.0)
-                    }
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
-                };
-                if zoom_mod || !touchpad {
-                    // Mouse wheel, or Ctrl/Cmd with scroll (a pinch on
-                    // Windows and Linux): zoom at the cursor.
-                    let cursor = self.sim.cursor;
-                    let dz = if dy.abs() >= dx.abs() { dy } else { dx };
-                    self.sim.zoom_at((dz / 30.0 * 0.15).exp(), cursor, vp);
-                } else {
-                    // Two-finger scroll: pan, like a phone.
-                    self.sim.pan_gm(-dx as f64 / self.sim.zoom as f64, -dy as f64 / self.sim.zoom as f64);
-                    self.sim.follow = false;
-                    self.sim.follow_smooth = None;
-                }
+                self.sim.on_scroll(delta, zoom_modifier, vp);
             }
 
             // macOS pinch gesture. `delta` is the fractional change in scale.
@@ -1876,458 +2624,7 @@ impl ApplicationHandler for App {
                 self.sim.zoom_at((delta as f32).exp(), cursor, vp);
             }
 
-            WindowEvent::RedrawRequested => {
-                if gfx.size.width == 0 || gfx.size.height == 0 {
-                    self.idle_frames = self.idle_frames.saturating_add(1);
-                    return;
-                }
-                let t_frame = Instant::now();
-                let frame_dt = (t_frame - self.sim.last_frame_time).as_secs_f64().min(0.1);
-                self.sim.last_frame_time = t_frame;
-
-                let want_mode = if self.sim.vsync {
-                    wgpu::PresentMode::AutoVsync
-                } else {
-                    wgpu::PresentMode::AutoNoVsync
-                };
-                if gfx.config.present_mode != want_mode {
-                    gfx.config.present_mode = want_mode;
-                    gfx.surface.configure(&gfx.device, &gfx.config);
-                }
-
-                let frame = match gfx.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(f) => f,
-                    wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                        gfx.surface.configure(&gfx.device, &gfx.config);
-                        f
-                    }
-                    wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                        gfx.surface.configure(&gfx.device, &gfx.config);
-                        return;
-                    }
-                    _ => return,
-                };
-                let view = frame
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-
-                let mut actions = Actions::default();
-                let raw_input = gfx.egui_state.take_egui_input(&gfx.window);
-                let full_output;
-                let flashes_active;
-                let n_bodies;
-                let mut new_title: Option<String> = None;
-                let trail_snapshot: Vec<TrailSample>;
-                let comet_tail_verts: Vec<OrbitVertex>;
-                // Orbit vertices arrive from the physics thread. Hoisted
-                // out of the lock block so `set_orbit_vertices` (a pure
-                // GPU upload) runs after the lock drops.
-                #[allow(unused_assignments)]
-                let mut orbit_out_taken: Option<(u64, Vec<OrbitVertex>)> = None;
-                // Replay: the recorded frame shown this redraw, if any.
-                #[allow(unused_assignments)]
-                let mut replaying: Option<u64> = None;
-
-                {
-                    // Time spent waiting for the physics thread to release the
-                    // lock, then time spent holding it (NBODY_TIMING only).
-                    let t_wait0 = Instant::now();
-                    let mut b = self.shared.lock_for_render();
-                    let t_held0 = Instant::now();
-                    // Replay: show a recorded snapshot in place of the live
-                    // state. It is swapped back before this lock is released.
-                    replaying = self.sim.enter_replay(&self.shared, &mut b, frame_dt);
-                    self.sim.t_wait_accum += t_wait0.elapsed().as_secs_f64() * 1e6;
-
-                    self.sim.fps_frames += 1;
-                    let win = self.sim.fps_timer.elapsed().as_secs_f32();
-                    if win >= 0.5 {
-                        self.sim.fps = self.sim.fps_frames as f32 / win;
-                        let steps = b.stats.steps;
-                        self.sim.steps_per_sec =
-                            (steps.saturating_sub(self.sim.steps_at_fps)) as f32 / win;
-                        self.sim.steps_at_fps = steps;
-                        self.sim.fps_frames = 0;
-                        self.sim.fps_timer = Instant::now();
-                        new_title = Some(format!(
-                            "N-Body Rust — {} — {:.0} fps — {:.2}×",
-                            primary_label(&b),
-                            self.sim.fps,
-                            self.sim.speed
-                        ));
-                    }
-
-                    let selected_idx = self.sim.selected.and_then(|id| b.index_of_id(id));
-                    if self.sim.follow {
-                        match selected_idx {
-                            Some(i) => {
-                                let id = b.id[i];
-                                const TAU: f64 = 0.06;
-                                let alpha = 1.0 - (-frame_dt / TAU).exp();
-                                let prev = match self.sim.follow_smooth {
-                                    Some((prev_id, pos)) if prev_id == id => pos,
-                                    _ => [b.x[i], b.y[i], b.z[i]],
-                                };
-                                let new_pos = [
-                                    prev[0] + (b.x[i] - prev[0]) * alpha,
-                                    prev[1] + (b.y[i] - prev[1]) * alpha,
-                                    prev[2] + (b.z[i] - prev[2]) * alpha,
-                                ];
-                                self.sim.follow_smooth = Some((id, new_pos));
-                                self.sim.cam = [new_pos[0], new_pos[1]];
-                                self.sim.cam_z = new_pos[2];
-                            }
-                            None => {
-                                self.sim.follow = false;
-                                self.sim.follow_smooth = None;
-                            }
-                        }
-                    } else {
-                        self.sim.follow_smooth = None;
-                    }
-                    if self.sim.selected.is_some() && selected_idx.is_none() {
-                        self.sim.selected = None;
-                        self.sim.follow = false;
-                    }
-
-                    if replaying.is_none() {
-                        self.ui.diag.maybe_sample(&b);
-                    }
-
-                    let effective_systems = if self.sim.preset == Preset::Random
-                        && self.sim.last_loaded_preset.is_none()
-                    {
-                        self.sim.systems
-                    } else {
-                        1
-                    };
-                    let view_info = ViewInfo {
-                        paused: self.sim.paused,
-                        speed: self.sim.speed,
-                        fps: self.sim.fps,
-                        steps_per_sec: self.sim.steps_per_sec,
-                        zoom: self.sim.zoom,
-                        cam: [self.sim.cam[0], self.sim.cam[1], self.sim.cam_z],
-                        yaw: self.sim.yaw,
-                        pitch: self.sim.pitch,
-                        viewport_px: vp,
-                        ppp: gfx.egui_ctx.pixels_per_point(),
-                        seed: self.sim.seed,
-                        body_count: self.sim.body_count,
-                        systems: effective_systems,
-                        total_bodies: b.len(),
-                        show_orbits: self.sim.show_orbits,
-                        show_debris_orbits: self.sim.show_debris_orbits,
-                        follow: self.sim.follow,
-                        selected: self.sim.selected,
-                        follow_smooth: self.sim.follow_smooth,
-                        preset: self.sim.preset,
-                        vsync: self.sim.vsync,
-                        behind: self.shared.behind.load(Ordering::Relaxed),
-                        pause_on_event: self.sim.pause_on_event,
-                        trails_enabled: self.sim.trail.cfg.enabled,
-                        trail_age: self.sim.trail.cfg.max_age,
-                        trail_bodies: self.sim.trail.cfg.max_bodies,
-                        trail_non_rubble: self.sim.trail.cfg.non_rubble_only,
-                        sn_kicks: self.sim.sn_kicks,
-                        mass_transfer: self.sim.mass_transfer,
-                        aging_mult: self.sim.aging_mult,
-                        timeline: {
-                            let hist = lock_ok(&self.shared.history);
-                            hist.span().map(|(t_min, t_max)| TimelineInfo {
-                                t_min,
-                                t_max,
-                                t_now: self.sim.replay.as_ref().map(|r| r.time),
-                                playing: self.sim.replay.as_ref().is_some_and(|r| r.playing),
-                                frames: hist.len(),
-                                mb: hist.megabytes(),
-                            })
-                        },
-                    };
-                    full_output = gfx.egui_ctx.run_ui(raw_input, |ui| {
-                        actions = ui::draw(ui, &mut self.ui, &view_info, &b);
-                    });
-                    if let Some(t) = actions.timeline.take() {
-                        self.sim.handle_timeline(t, &self.shared);
-                    }
-                    // A replay is view-only: edits, spawns, resets and loads
-                    // are dropped; camera, selection and display options stay.
-                    if replaying.is_some() {
-                        actions = actions.view_only();
-                    }
-                    self.sim
-                        .apply_actions(actions, &mut self.ui, vp, &mut b, &self.shared);
-                    trail_snapshot = self.sim.trail.snapshot(&b, self.sim.follow_smooth);
-
-                    // Pause when the merger / impact / tidal count grows. A drop
-                    // means a new system replaced the old one: no pause then.
-                    let pause_events = b
-                        .stats
-                        .merges
-                        .wrapping_add(b.stats.impacts)
-                        .wrapping_add(b.stats.tidal);
-                    if replaying.is_none()
-                        && self.sim.pause_on_event
-                        && !self.sim.paused
-                        && pause_events > self.sim.last_pause_events
-                    {
-                        self.sim.paused = true;
-                    }
-                    if replaying.is_none() {
-                        self.sim.last_pause_events = pause_events;
-                    }
-
-                    self.shared.paused.store(self.sim.paused, Ordering::Relaxed);
-                    self.shared
-                        .speed_bits
-                        .store((self.sim.speed * SPEED_SCALE).to_bits(), Ordering::Relaxed);
-
-                    orbit_out_taken = lock_ok(&self.shared.orbit_out).take();
-                    if let Some(fid) = replaying {
-                        // Orbit lines for the recorded frame, built here from
-                        // the snapshot; the physics thread's live lines are dropped.
-                        orbit_out_taken = None;
-                        let key = (fid, self.sim.zoom);
-                        if self.sim.replay_orbit != key || !self.sim.orbit_buf_valid {
-                            let segs = physics::compute_orbit_segments(
-                                &b,
-                                self.sim.zoom as f64,
-                                self.sim.show_orbits,
-                                self.sim.show_debris_orbits,
-                            );
-                            orbit_out_taken = Some((0, render::segments_to_vertices(&segs)));
-                            self.sim.replay_orbit = key;
-                            self.sim.orbit_buf_valid = true;
-                        }
-                    }
-                    let events_total = b
-                        .stats
-                        .merges
-                        .wrapping_add(b.stats.impacts)
-                        .wrapping_add(b.stats.tidal)
-                        .wrapping_add(b.stats.escaped);
-                    let orbits_visible = self.sim.show_orbits || self.sim.show_debris_orbits;
-                    let zoom_ratio = self.sim.zoom / self.sim.last_orbit_zoom.max(1e-6);
-                    let zoom_changed = (zoom_ratio - 1.0).abs() > 0.3;
-                    let span_x = 0.35 * vp[0] as f64 / self.sim.zoom as f64;
-                    let span_y = 0.35 * vp[1] as f64 / self.sim.zoom as f64;
-                    let cam_moved = (self.sim.cam[0] - self.sim.last_orbit_cam[0]).abs() > span_x
-                        || (self.sim.cam[1] - self.sim.last_orbit_cam[1]).abs() > span_y;
-                    let events_changed = events_total != self.sim.last_orbit_events;
-                    let stale = !self.sim.paused
-                        && self.sim.last_orbit_update.elapsed().as_millis() > ORBIT_REFRESH_MS;
-                    if replaying.is_none()
-                        && (!self.sim.orbit_buf_valid
-                        || (orbits_visible
-                            && (zoom_changed || cam_moved || events_changed || stale)))
-                    {
-                        self.sim.orbit_posted += 1;
-                        *lock_ok(&self.shared.orbit_req) = Some((
-                            self.sim.orbit_posted,
-                            OrbitReq {
-                                zoom: self.sim.zoom as f64,
-                                planets: self.sim.show_orbits,
-                                debris: self.sim.show_debris_orbits,
-                                cam: [self.sim.cam[0], self.sim.cam[1], self.sim.cam_z],
-                                viewport: vp,
-                            },
-                        ));
-                        self.sim.last_orbit_update = Instant::now();
-                        self.sim.last_orbit_zoom = self.sim.zoom;
-                        self.sim.last_orbit_cam = self.sim.cam;
-                        self.sim.last_orbit_events = events_total;
-                        self.sim.orbit_buf_valid = true;
-                    }
-
-                    let t_inst0 = Instant::now();
-                    let override_body = self
-                        .sim
-                        .follow_smooth
-                        .and_then(|(id, pos)| b.index_of_id(id).map(|idx| (idx, pos)));
-                    let scene_view = self.sim.view();
-                    gfx.renderer.build_instances(&b, &scene_view, vp, override_body);
-                    self.sim.t_inst_accum += t_inst0.elapsed().as_secs_f64() * 1e6;
-                    let t_comet0 = Instant::now();
-                    comet_tail_verts = nbody_rust::render::build_comet_tails(&b, &scene_view);
-                    self.sim.t_comet_accum += t_comet0.elapsed().as_secs_f64() * 1e6;
-                    flashes_active = !b.flashes.is_empty();
-                    n_bodies = b.len();
-                    if self.timing_log {
-                        self.sim.last_comets =
-                            b.origin.iter().filter(|&&o| o == BodyOrigin::Comet).count();
-                        self.sim.last_comet_verts = comet_tail_verts.len();
-                    }
-                    self.sim.t_held_accum += t_held0.elapsed().as_secs_f64() * 1e6;
-                    if replaying.is_some() {
-                        self.sim.leave_replay(&mut b);
-                    }
-                }
-
-                // ---- Everything below runs WITHOUT the bodies lock. ----
-                // Queued disk work (save write, save read). Inlined instead of
-                // `self.flush_io()` because `gfx` still borrows `self.gfx`.
-                if let Some(io) = self.sim.deferred_io.take() {
-                    io(&mut self.ui);
-                }
-                if let Some(name) = self.sim.pending_load.take() {
-                    self.sim.load_game(&name, &mut self.ui, &self.shared);
-                    self.idle_frames = 0;
-                }
-                if let Some((id, verts)) = orbit_out_taken {
-                    gfx.renderer
-                        .set_orbit_vertices(&gfx.device, &gfx.queue, &verts);
-                    self.sim.orbit_applied = id;
-                }
-                let cam_view = self.sim.view();
-                gfx.renderer.update_camera(&gfx.queue, &cam_view, vp);
-                gfx.renderer.upload_instances(&gfx.device, &gfx.queue);
-                gfx.renderer
-                    .set_comet_tail_vertices(&gfx.device, &gfx.queue, &comet_tail_verts);
-                if replaying.is_some() {
-                    // Trails belong to the live run; hide them while replaying.
-                    if gfx.renderer.trail_count() > 0 {
-                        gfx.renderer
-                            .set_trail_vertices(&gfx.device, &gfx.queue, &[]);
-                    }
-                } else if self.sim.trail.cfg.enabled {
-                    self.sim.trail.update(&trail_snapshot);
-                    let verts = self.sim.trail.build_vertices(cam_view.cam);
-                    gfx.renderer
-                        .set_trail_vertices(&gfx.device, &gfx.queue, &verts);
-                } else if gfx.renderer.trail_count() > 0 {
-                    gfx.renderer
-                        .set_trail_vertices(&gfx.device, &gfx.queue, &[]);
-                }
-
-                let repaint_delay = full_output
-                    .viewport_output
-                    .get(&egui::ViewportId::ROOT)
-                    .map(|v| v.repaint_delay);
-                let repaint_now = repaint_delay.is_some_and(|d| d.is_zero());
-                // A finite, non-zero delay (egui's `request_repaint_after`) must
-                // still wake an idle app. A huge delay means "no request".
-                self.repaint_at = repaint_delay
-                    .filter(|d| !d.is_zero() && *d < Duration::from_secs(3600))
-                    .map(|d| Instant::now() + d);
-
-                gfx.egui_state
-                    .handle_platform_output(&gfx.window, full_output.platform_output);
-                let pixels_per_point = gfx.egui_ctx.pixels_per_point();
-                let clipped = gfx
-                    .egui_ctx
-                    .tessellate(full_output.shapes, pixels_per_point);
-
-                for (id, deltas) in &full_output.textures_delta.set {
-                    for delta in deltas {
-                        gfx.egui_renderer
-                            .update_texture(&gfx.device, &gfx.queue, *id, delta);
-                    }
-                }
-
-                let screen_desc = ScreenDescriptor {
-                    size_in_pixels: [gfx.config.width, gfx.config.height],
-                    pixels_per_point,
-                };
-                let mut encoder = gfx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                gfx.egui_renderer.update_buffers(
-                    &gfx.device,
-                    &gfx.queue,
-                    &mut encoder,
-                    &clipped,
-                    &screen_desc,
-                );
-
-                {
-                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("main-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &gfx.msaa_view,
-                            depth_slice: None,
-                            resolve_target: Some(&view),
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    let mut pass = pass.forget_lifetime();
-                    gfx.renderer.draw(&mut pass);
-                    gfx.egui_renderer.render(&mut pass, &clipped, &screen_desc);
-                }
-
-                gfx.queue.submit([encoder.finish()]);
-                gfx.queue.present(frame);
-
-                for id in &full_output.textures_delta.free {
-                    gfx.egui_renderer.free_texture(id);
-                }
-
-                if self.timing_log {
-                    self.sim.t_frame_accum += t_frame.elapsed().as_secs_f64() * 1e6;
-                    self.sim.t_window_frames += 1;
-                    let secs = self.sim.t_window_start.elapsed().as_secs_f64();
-                    if secs >= 1.0 {
-                        let frames = self.sim.t_window_frames as f64;
-                        let phys_busy = self.shared.phys_ns.swap(0, Ordering::Relaxed) as f64
-                            / (secs * 1e9)
-                            * 100.0;
-                        let ms = |us: f64| us / frames / 1000.0;
-                        let dust_busy = physics::DUST_STAT_NS.swap(0, Ordering::Relaxed) as f64
-                            / (secs * 1e9)
-                            * 100.0;
-                        let dust_grains = physics::DUST_STAT_GRAINS.load(Ordering::Relaxed);
-                        println!(
-                            "[timing] n={} comets={} (tail verts {}) fps={:.0} frame={:.2}ms \
-                             lock_wait={:.2}ms lock_held={:.2}ms (instances={:.2} comet_tails={:.2}) \
-                             physics_busy={:.0}% (dust={:.0}%, {} grains){}",
-                            n_bodies,
-                            self.sim.last_comets,
-                            self.sim.last_comet_verts,
-                            frames / secs,
-                            ms(self.sim.t_frame_accum),
-                            ms(self.sim.t_wait_accum),
-                            ms(self.sim.t_held_accum),
-                            ms(self.sim.t_inst_accum),
-                            ms(self.sim.t_comet_accum),
-                            phys_busy,
-                            dust_busy,
-                            dust_grains,
-                            if self.shared.behind.load(Ordering::Relaxed) {
-                                " (behind)"
-                            } else {
-                                ""
-                            }
-                        );
-                        self.sim.t_window_start = Instant::now();
-                        self.sim.t_window_frames = 0;
-                        self.sim.t_frame_accum = 0.0;
-                        self.sim.t_wait_accum = 0.0;
-                        self.sim.t_held_accum = 0.0;
-                        self.sim.t_inst_accum = 0.0;
-                        self.sim.t_comet_accum = 0.0;
-                    }
-                }
-                if let Some(t) = new_title {
-                    gfx.window.set_title(&t);
-                }
-
-                let busy = !self.sim.paused
-                    || flashes_active
-                    || self.sim.follow
-                    || repaint_now
-                    || self.sim.orbit_posted > self.sim.orbit_applied;
-                self.idle_frames = if busy {
-                    0
-                } else {
-                    self.idle_frames.saturating_add(1)
-                };
-            }
+            WindowEvent::RedrawRequested => self.redraw(vp),
             _ => {}
         }
     }

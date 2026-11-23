@@ -10,19 +10,21 @@ use super::*;
 /// Fewest tracers of one belt population, so even a thin belt is visible.
 pub(in crate::physics) const BELT_MIN_TRACERS: usize = 3;
 /// Upper limit of tracers for one belt part.
-pub(in crate::physics) const BELT_MAX_TRACERS_PER_PART: usize = 500;
+pub(in crate::physics) const BELT_MAX_TRACERS_PER_PART: usize = 1000;
 
 /// Reference belt mass (M⊕) that receives `BELT_TRACER_SCALE` tracers.
 pub(in crate::physics) const BELT_REF_MASS: f64 = 0.01;
 
 /// Tracers per `BELT_REF_MASS` of belt mass. Each tracer therefore stands
-/// for `BELT_REF_MASS / BELT_TRACER_SCALE` ≈ 2×10⁻⁵ M⊕ of real debris —
-/// roughly half the mass of Vesta.
-pub(in crate::physics) const BELT_TRACER_SCALE: f64 = 500.0;
+/// for `BELT_REF_MASS / BELT_TRACER_SCALE` = 5×10⁻⁷ M⊕ of real debris, about a
+/// 100 km asteroid. The Solar System's main belt (≈5×10⁻⁴ M⊕) has roughly
+/// 200 asteroids that large, so a belt of that mass gets about that many.
+pub(in crate::physics) const BELT_TRACER_SCALE: f64 = 20_000.0;
 
-/// Smallest mass (M⊕) a single tracer may carry. Below this the tracer
-/// is sub-Ceres and not worth simulating.
-pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-4;
+/// Smallest mass (M⊕) a single tracer may carry (a ~100 km asteroid). Total
+/// belt mass is conserved, so a light belt has fewer tracers rather than
+/// lighter ones.
+pub(in crate::physics) const BELT_MIN_TRACER_MASS: f64 = 1e-6;
 
 /// Largest mass (M⊕) a single tracer may carry. Prevents a heavy belt
 /// from producing body-scale collisions that dominate the dynamics.

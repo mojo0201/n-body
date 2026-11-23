@@ -269,17 +269,45 @@ fn finite_or(v: f64, fallback: f64) -> f64 {
 /// Reads only. Fails if a body holds a NaN or infinity in a field that JSON
 /// cannot store; the error names the body, so the user can find the cause.
 pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
+    let (bodies, remap) = capture_bodies(b)?;
+    let dust = capture_dust(b, &remap)?;
+    let events = capture_events(b);
+    need_finite(
+        "the simulation",
+        &[b.time, b.metallicity, b.evolution_rate, b.stats.energy0, b.stats.energy_offset],
+    )?;
+    Ok(SaveFile {
+        format: SAVE_FORMAT.to_string(),
+        version: SAVE_VERSION,
+        saved_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        sim: SimSave {
+            time: b.time,
+            next_id: b.next_id,
+            metallicity: b.metallicity,
+            rng_state: b.rng.s,
+            sn_kicks: b.sn_kicks,
+            mass_transfer: b.mass_transfer,
+            evolution_rate: b.evolution_rate,
+            stats: capture_stats(&b.stats),
+            bodies,
+            dust,
+            events,
+        },
+        app,
+    })
+}
+
+/// The live bodies, plus a map from old index to new index (`usize::MAX` for dead bodies).
+fn capture_bodies(b: &Bodies) -> Result<(Vec<BodySave>, Vec<usize>), String> {
     let n = b.len();
-    // old index -> new index (usize::MAX for dead bodies).
     let mut remap = vec![usize::MAX; n];
     let mut bodies: Vec<BodySave> = Vec::with_capacity(n);
-    for i in 0..n {
-        if b.dead[i] {
-            continue;
-        }
-        let what = format!("body #{}", b.id[i]);
+    for i in (0..n).filter(|&i| !b.dead[i]) {
         need_finite(
-            &what,
+            &format!("body #{}", b.id[i]),
             &[
                 b.x[i],
                 b.y[i],
@@ -296,34 +324,42 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
             ],
         )?;
         remap[i] = bodies.len();
-        bodies.push(BodySave {
-            id: b.id[i],
-            name: b.name[i].clone(),
-            kind: kind_to_str(b.kind[i]).to_string(),
-            origin: origin_to_str(b.origin[i]).to_string(),
-            class: class_to_str(b.class[i]).to_string(),
-            x: b.x[i],
-            y: b.y[i],
-            vx: b.vx[i],
-            vy: b.vy[i],
-            z: b.z[i],
-            vz: b.vz[i],
-            m: b.m[i],
-            r: b.r[i],
-            imm: b.imm[i].is_finite().then_some(b.imm[i]),
-            dtl: b.dtl[i].is_finite().then_some(b.dtl[i]),
-            bulk_density: b.bulk_density[i],
-            spin: b.spin[i],
-            age_gyr: b.age_gyr[i],
-            m_init: b.m_init[i],
-            rung: b.rung[i],
-            coalesce_counter: b.coalesce_counter[i],
-            comet_grains: b.comet_grains[i],
-            disrupting: b.disrupting[i],
-            rlof: b.rlof[i],
-        });
+        bodies.push(capture_body(b, i));
     }
+    Ok((bodies, remap))
+}
 
+fn capture_body(b: &Bodies, i: usize) -> BodySave {
+    BodySave {
+        id: b.id[i],
+        name: b.name[i].clone(),
+        kind: kind_to_str(b.kind[i]).to_string(),
+        origin: origin_to_str(b.origin[i]).to_string(),
+        class: class_to_str(b.class[i]).to_string(),
+        x: b.x[i],
+        y: b.y[i],
+        vx: b.vx[i],
+        vy: b.vy[i],
+        z: b.z[i],
+        vz: b.vz[i],
+        m: b.m[i],
+        r: b.r[i],
+        imm: b.imm[i].is_finite().then_some(b.imm[i]),
+        dtl: b.dtl[i].is_finite().then_some(b.dtl[i]),
+        bulk_density: b.bulk_density[i],
+        spin: b.spin[i],
+        age_gyr: b.age_gyr[i],
+        m_init: b.m_init[i],
+        rung: b.rung[i],
+        coalesce_counter: b.coalesce_counter[i],
+        comet_grains: b.comet_grains[i],
+        disrupting: b.disrupting[i],
+        rlof: b.rlof[i],
+    }
+}
+
+/// The dust fields whose primary survived, with the primary index remapped.
+fn capture_dust(b: &Bodies, remap: &[usize]) -> Result<Vec<DustSave>, String> {
     let mut dust = Vec::with_capacity(b.dust_fields.len());
     for f in &b.dust_fields {
         let primary = match remap.get(f.primary) {
@@ -331,26 +367,21 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
             _ => continue, // The primary is gone: the field has no anchor.
         };
         need_finite("a dust field", &[f.extent_gm])?;
-        let mut grains = Vec::with_capacity(f.grains.len());
-        for g in &f.grains {
-            need_finite("a dust grain", &[g.x, g.y, g.vx, g.vy, g.mass, g.size_um])?;
-            let ttl = if g.ttl.is_finite() {
-                g.ttl as f64
-            } else {
-                f64::MAX
-            };
-            grains.push(vec![g.x, g.y, g.vx, g.vy, g.mass, g.size_um, ttl, g.z, g.vz]);
-        }
-        dust.push(DustSave {
-            primary,
-            extent_gm: f.extent_gm,
-            version: f.version,
-            grains,
-        });
+        let grains = f.grains.iter().map(capture_grain).collect::<Result<Vec<_>, _>>()?;
+        dust.push(DustSave { primary, extent_gm: f.extent_gm, version: f.version, grains });
     }
+    Ok(dust)
+}
 
-    let events = b
-        .events
+/// One grain as `x y vx vy mass size ttl z vz`; an infinite lifetime becomes `f64::MAX`.
+fn capture_grain(g: &Grain) -> Result<Vec<f64>, String> {
+    need_finite("a dust grain", &[g.x, g.y, g.vx, g.vy, g.mass, g.size_um])?;
+    let ttl = if g.ttl.is_finite() { g.ttl as f64 } else { f64::MAX };
+    Ok(vec![g.x, g.y, g.vx, g.vy, g.mass, g.size_um, ttl, g.z, g.vz])
+}
+
+fn capture_events(b: &Bodies) -> Vec<EventSave> {
+    b.events
         .iter()
         .map(|e| EventSave {
             time: finite_or(e.time, 0.0),
@@ -359,53 +390,23 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
             x: finite_or(e.x, 0.0),
             y: finite_or(e.y, 0.0),
         })
-        .collect();
+        .collect()
+}
 
-    need_finite(
-        "the simulation",
-        &[
-            b.time,
-            b.metallicity,
-            b.evolution_rate,
-            b.stats.energy0,
-            b.stats.energy_offset,
-        ],
-    )?;
-
-    Ok(SaveFile {
-        format: SAVE_FORMAT.to_string(),
-        version: SAVE_VERSION,
-        saved_unix: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        sim: SimSave {
-            time: b.time,
-            next_id: b.next_id,
-            metallicity: b.metallicity,
-            rng_state: b.rng.s,
-            sn_kicks: b.sn_kicks,
-            mass_transfer: b.mass_transfer,
-            evolution_rate: b.evolution_rate,
-            stats: StatsSave {
-                merges: b.stats.merges,
-                impacts: b.stats.impacts,
-                tidal: b.stats.tidal,
-                escaped: b.stats.escaped,
-                steps: b.stats.steps,
-                last_nsub: b.stats.last_nsub,
-                max_rung: b.stats.max_rung,
-                energy0: b.stats.energy0,
-                energy_offset: b.stats.energy_offset,
-                coalesces: b.stats.coalesces,
-                bounces: b.stats.bounces,
-            },
-            bodies,
-            dust,
-            events,
-        },
-        app,
-    })
+fn capture_stats(s: &Stats) -> StatsSave {
+    StatsSave {
+        merges: s.merges,
+        impacts: s.impacts,
+        tidal: s.tidal,
+        escaped: s.escaped,
+        steps: s.steps,
+        last_nsub: s.last_nsub,
+        max_rung: s.max_rung,
+        energy0: s.energy0,
+        energy_offset: s.energy_offset,
+        coalesces: s.coalesces,
+        bounces: s.bounces,
+    }
 }
 
 /// Replace `b` with the state in `f`.
@@ -415,6 +416,21 @@ pub fn capture_save(b: &Bodies, app: AppSave) -> Result<SaveFile, String> {
 /// accelerations are recomputed once. The energy baseline from the file is
 /// kept, so the drift display continues where it stopped.
 pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
+    check_save_header(f)?;
+    let s = &f.sim;
+    let mut nb = Bodies::with_capacity(s.bodies.len());
+    restore_bodies(&mut nb, s)?;
+    restore_sim_settings(&mut nb, s);
+    restore_events(&mut nb, s)?;
+    restore_dust(&mut nb, s)?;
+    nb.parent_cache_valid = false;
+    compute_accel(&mut nb);
+    *b = nb;
+    Ok(())
+}
+
+/// Reject files that are not saves, are too new, or are empty or too large.
+fn check_save_header(f: &SaveFile) -> Result<(), String> {
     if f.format != SAVE_FORMAT {
         return Err("this file is not an n-body save".to_string());
     }
@@ -433,15 +449,12 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
     }
     need_finite(
         "the simulation",
-        &[
-            s.time,
-            s.metallicity,
-            s.stats.energy0,
-            s.stats.energy_offset,
-        ],
-    )?;
+        &[s.time, s.metallicity, s.stats.energy0, s.stats.energy_offset],
+    )
+}
 
-    let mut nb = Bodies::with_capacity(s.bodies.len());
+/// Rebuild every body, checking values and id uniqueness as it goes.
+fn restore_bodies(nb: &mut Bodies, s: &SimSave) -> Result<(), String> {
     let mut seen: HashSet<u64> = HashSet::with_capacity(s.bodies.len());
     let mut max_id = 0u64;
     for bs in &s.bodies {
@@ -470,34 +483,42 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
             return Err(format!("{what} appears twice"));
         }
         max_id = max_id.max(bs.id);
-        let kind = kind_from_str(&bs.kind)?;
-        let i = nb.push(bs.x, bs.y, bs.vx, bs.vy, bs.m, kind);
-        nb.z[i] = bs.z;
-        nb.vz[i] = bs.vz;
-        nb.id[i] = bs.id;
-        nb.name[i] = bs.name.clone();
-        nb.origin[i] = origin_from_str(&bs.origin)?;
-        nb.class[i] = class_from_str(&bs.class)?;
-        nb.r[i] = bs.r;
-        nb.imm[i] = bs.imm.filter(|v| v.is_finite()).unwrap_or(0.0);
-        nb.dtl[i] = bs.dtl.filter(|v| v.is_finite()).unwrap_or(f64::INFINITY);
-        nb.bulk_density[i] = bs.bulk_density;
-        nb.spin[i] = bs.spin;
-        nb.age_gyr[i] = bs.age_gyr;
-        nb.m_init[i] = bs.m_init;
-        nb.rung[i] = bs.rung.min(MAX_RUNG);
-        nb.coalesce_counter[i] = bs.coalesce_counter;
-        nb.comet_grains[i] = bs.comet_grains;
-        nb.disrupting[i] = bs.disrupting;
-        nb.rlof[i] = bs.rlof;
+        restore_body(nb, bs)?;
     }
-
     nb.next_id = s.next_id.max(max_id.saturating_add(1));
+    Ok(())
+}
+
+/// Push one saved body, defaulting optional fields that are missing or not finite.
+fn restore_body(nb: &mut Bodies, bs: &BodySave) -> Result<(), String> {
+    let kind = kind_from_str(&bs.kind)?;
+    let i = nb.push(bs.x, bs.y, bs.vx, bs.vy, bs.m, kind);
+    nb.z[i] = bs.z;
+    nb.vz[i] = bs.vz;
+    nb.id[i] = bs.id;
+    nb.name[i] = bs.name.clone();
+    nb.origin[i] = origin_from_str(&bs.origin)?;
+    nb.class[i] = class_from_str(&bs.class)?;
+    nb.r[i] = bs.r;
+    nb.imm[i] = bs.imm.filter(|v| v.is_finite()).unwrap_or(0.0);
+    nb.dtl[i] = bs.dtl.filter(|v| v.is_finite()).unwrap_or(f64::INFINITY);
+    nb.bulk_density[i] = bs.bulk_density;
+    nb.spin[i] = bs.spin;
+    nb.age_gyr[i] = bs.age_gyr;
+    nb.m_init[i] = bs.m_init;
+    nb.rung[i] = bs.rung.min(MAX_RUNG);
+    nb.coalesce_counter[i] = bs.coalesce_counter;
+    nb.comet_grains[i] = bs.comet_grains;
+    nb.disrupting[i] = bs.disrupting;
+    nb.rlof[i] = bs.rlof;
+    Ok(())
+}
+
+/// Clock, RNG, stellar-evolution options and the statistics counters.
+fn restore_sim_settings(nb: &mut Bodies, s: &SimSave) {
     nb.time = s.time;
     nb.metallicity = s.metallicity;
-    nb.rng = XorShift {
-        s: s.rng_state.max(1),
-    };
+    nb.rng = XorShift { s: s.rng_state.max(1) };
     nb.sn_kicks = s.sn_kicks;
     nb.mass_transfer = s.mass_transfer;
     nb.evolution_rate = if s.evolution_rate.is_finite() && s.evolution_rate > 0.0 {
@@ -518,7 +539,10 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
         coalesces: s.stats.coalesces,
         bounces: s.stats.bounces,
     };
+}
 
+/// The event log, trimmed to its maximum length.
+fn restore_events(nb: &mut Bodies, s: &SimSave) -> Result<(), String> {
     for e in &s.events {
         nb.events.push_back(Event {
             time: e.time,
@@ -531,54 +555,53 @@ pub fn restore_save(b: &mut Bodies, f: &SaveFile) -> Result<(), String> {
     while nb.events.len() > EVENT_LOG_MAX {
         nb.events.pop_front();
     }
+    Ok(())
+}
 
+/// The dust fields. Each gets a version stamped with the load epoch, which the
+/// renderer compares to find changed fields.
+fn restore_dust(nb: &mut Bodies, s: &SimSave) -> Result<(), String> {
     let epoch = LOAD_EPOCH.fetch_add(1, AtomicOrdering::Relaxed);
     for d in &s.dust {
         if d.primary >= nb.len() {
             return Err("a dust field points to a body that is not in the save".to_string());
         }
         need_finite("a dust field", &[d.extent_gm])?;
-        let mut grains = Vec::with_capacity(d.grains.len());
-        for g in &d.grains {
-            if g.len() != 7 && g.len() != 9 {
-                return Err("a dust grain has the wrong number of values".to_string());
-            }
-            need_finite("a dust grain", &g[..6])?;
-            let (gz, gvz) = if g.len() == 9 { (g[7], g[8]) } else { (0.0, 0.0) };
-            need_finite("a dust grain", &[gz, gvz])?;
-            if !g[6].is_finite() {
-                return Err("a dust grain has a lifetime that is not valid".to_string());
-            }
-            let ttl = if g[6] >= f32::MAX as f64 {
-                f32::INFINITY
-            } else {
-                g[6] as f32
-            };
-            grains.push(Grain {
-                x: g[0],
-                y: g[1],
-                z: gz,
-                vx: g[2],
-                vy: g[3],
-                vz: gvz,
-                mass: g[4],
-                size_um: g[5],
-                ttl,
-            });
-        }
+        let grains = d.grains.iter().map(|g| restore_grain(g)).collect::<Result<Vec<_>, _>>()?;
         nb.dust_fields.push(DustField {
             primary: d.primary,
             extent_gm: d.extent_gm,
             grains,
-            // The renderer compares versions to find changed fields.
             version: (epoch << 32) | (d.version & 0xFFFF_FFFF),
         });
     }
-
-    nb.parent_cache_valid = false;
-    compute_accel(&mut nb);
-    *b = nb;
     Ok(())
+}
+
+/// One grain from its saved values: 7 (planar, older saves) or 9 numbers
+/// `x y vx vy mass size ttl [z vz]`. An infinite lifetime is stored as a huge number.
+fn restore_grain(g: &[f64]) -> Result<Grain, String> {
+    if g.len() != 7 && g.len() != 9 {
+        return Err("a dust grain has the wrong number of values".to_string());
+    }
+    need_finite("a dust grain", &g[..6])?;
+    let (gz, gvz) = if g.len() == 9 { (g[7], g[8]) } else { (0.0, 0.0) };
+    need_finite("a dust grain", &[gz, gvz])?;
+    if !g[6].is_finite() {
+        return Err("a dust grain has a lifetime that is not valid".to_string());
+    }
+    let ttl = if g[6] >= f32::MAX as f64 { f32::INFINITY } else { g[6] as f32 };
+    Ok(Grain {
+        x: g[0],
+        y: g[1],
+        z: gz,
+        vx: g[2],
+        vy: g[3],
+        vz: gvz,
+        mass: g[4],
+        size_um: g[5],
+        ttl,
+    })
 }
 
 // ---------------------------------------------------------------------------

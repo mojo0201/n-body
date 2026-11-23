@@ -46,6 +46,8 @@ const MAX_DUST_POINTS: usize = 2_000_000;
 /// A field whose extent is smaller than this on screen is not drawn.
 const DUST_MIN_PX: f64 = 6.0;
 /// Minimum time between point-buffer rebuilds.
+/// New fields start a million versions apart (see `init_fields`); a step adds one.
+const DUST_NEW_FIELD_VERSION_STEP: u64 = 1_000_000;
 const DUST_UPLOAD_MIN: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
@@ -649,27 +651,300 @@ pub struct Renderer {
     blackhole_scratch: Vec<BlackHoleInstance>,
 }
 
-impl Renderer {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("nbody-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
-        });
+/// MSAA sample count used by every pipeline (must match the render target).
+const MSAA_SAMPLES: u32 = 4;
+const INITIAL_DUST_GRAINS: u64 = 65_536;
+const INITIAL_BODY_INSTANCES: u64 = 1024 * 16;
+const INITIAL_ORBIT_BYTES: u64 = 1024 * 1024;
+const INITIAL_TRAIL_BYTES: u64 = 1024 * 16;
+const INITIAL_COMET_TAIL_BYTES: u64 = 1024 * 16;
+const INITIAL_FLASH_BYTES: u64 = 1024 * 64;
+const INITIAL_GLOW_INSTANCES: u64 = 256;
+const INITIAL_BLACKHOLE_INSTANCES: u64 = 64;
 
-        // ---- Camera bind group layout (group 0, shared by all pipelines) ----
-        let cam_size = std::mem::size_of::<CameraUniform>() as u64;
-        let mk_cam_buf = |label| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: cam_size,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let camera_buf = mk_cam_buf("camera");
-        let orbit_camera_buf = mk_cam_buf("orbit-camera");
-        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("camera-layout"),
+/// What every pipeline constructor needs.
+struct PipelineContext<'a> {
+    device: &'a wgpu::Device,
+    camera_layout: &'a wgpu::BindGroupLayout,
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    msaa: wgpu::MultisampleState,
+    format: wgpu::TextureFormat,
+}
+
+/// Standard alpha blending.
+fn blend_target(format: wgpu::TextureFormat) -> Option<wgpu::ColorTargetState> {
+    Some(wgpu::ColorTargetState {
+        format,
+        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    })
+}
+
+// Additive: colour = src.rgb * src.a + dst, so overlapping grains
+// brighten. Destination alpha is left alone.
+fn additive_blend() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
+/// The two camera uniform buffers and the bind group layout / groups that
+/// every pipeline shares (group 0).
+struct CameraResources {
+    camera_buf: wgpu::Buffer,
+    orbit_camera_buf: wgpu::Buffer,
+    layout: wgpu::BindGroupLayout,
+    camera_bg: wgpu::BindGroup,
+    orbit_camera_bg: wgpu::BindGroup,
+}
+
+fn create_camera_resources(device: &wgpu::Device) -> CameraResources {
+    // ---- Camera bind group layout (group 0, shared by all pipelines) ----
+    let cam_size = std::mem::size_of::<CameraUniform>() as u64;
+    let mk_cam_buf = |label| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: cam_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let camera_buf = mk_cam_buf("camera");
+    let orbit_camera_buf = mk_cam_buf("orbit-camera");
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("camera-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let mk_bg = |label, buf: &wgpu::Buffer| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        })
+    };
+    let camera_bg = mk_bg("camera-bg", &camera_buf);
+    let orbit_camera_bg = mk_bg("orbit-camera-bg", &orbit_camera_buf);
+    CameraResources { camera_buf, orbit_camera_buf, layout, camera_bg, orbit_camera_bg }
+}
+
+/// Instanced body discs.
+fn create_body_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    // ---- Body pipeline ----
+    let body_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<BodyInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 16,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 28,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 32,
+                shader_location: 4,
+            },
+        ],
+    };
+    let body_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("body-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(body_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[blend_target(format)],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    body_pipeline
+}
+
+/// Vertex layout shared by the orbit, trail and comet-tail pipelines.
+fn orbit_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<OrbitVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Unorm8x4,
+                offset: 12,
+                shader_location: 1,
+            },
+        ],
+    }
+}
+
+/// Orbit and trail lines.
+fn create_orbit_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    let orbit_layout = orbit_vertex_layout();
+    let orbit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("orbit-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_orbit"),
+            buffers: &[Some(orbit_layout.clone())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_orbit"),
+            targets: &[blend_target(format)],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    orbit_pipeline
+}
+
+/// Collision flashes.
+fn create_flash_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    // ---- Flash pipeline ----
+    let flash_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<FlashInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 16,
+                shader_location: 2,
+            },
+        ],
+    };
+    let flash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("flash-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_flash"),
+            buffers: &[Some(flash_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_flash"),
+            targets: &[blend_target(format)],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    flash_pipeline
+}
+
+/// Dust grains: the pipeline plus the per-field centre buffer and its bind group.
+fn create_dust_resources(ctx: &PipelineContext) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    let camera_layout = ctx.camera_layout;
+    // ---- Dust pipeline ----
+    // Group 1: the per-field centres, one vec4 per field.
+    let fields_size = (MAX_DUST_FIELDS * std::mem::size_of::<[f32; 4]>()) as u64;
+    let dust_fields_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dust-fields"),
+        size: fields_size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let dust_fields_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dust-fields-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -681,480 +956,310 @@ impl Renderer {
                 count: None,
             }],
         });
-        let mk_bg = |label, buf: &wgpu::Buffer| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &camera_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buf.as_entire_binding(),
-                }],
-            })
-        };
-        let camera_bg = mk_bg("camera-bg", &camera_buf);
-        let orbit_camera_bg = mk_bg("orbit-camera-bg", &orbit_camera_buf);
+    let dust_fields_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dust-fields-bg"),
+        layout: &dust_fields_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: dust_fields_buf.as_entire_binding(),
+        }],
+    });
+    let dust_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("dust-pipeline-layout"),
+        bind_group_layouts: &[Some(&camera_layout), Some(&dust_fields_layout)],
+        immediate_size: 0,
+    });
+    let dust_vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<DustVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 16,
+                shader_location: 2,
+            },
+        ],
+    };
+    let additive = additive_blend();
+    let dust_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("dust-pipeline"),
+        layout: Some(&dust_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_dust"),
+            buffers: &[Some(dust_vertex_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_dust"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(additive),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    (dust_pipeline, dust_fields_buf, dust_fields_bg)
+}
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline-layout"),
-            bind_group_layouts: &[Some(&camera_layout)],
-            immediate_size: 0,
-        });
+/// Comet tails (orbit vertex format, additive triangles).
+fn create_comet_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    let additive = additive_blend();
+    // ---- Comet pipeline: orbit vertex format, triangles, additive ----
+    let comet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("comet-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_orbit"),
+            buffers: &[Some(orbit_vertex_layout())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_orbit"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(additive),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    comet_pipeline
+}
 
-        let msaa_state = wgpu::MultisampleState {
-            count: 4,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
+/// Soft additive halos behind luminous bodies.
+fn create_glow_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    let additive = additive_blend();
+    // ---- Glow pipeline: additive soft quads behind bodies ----
+    let glow_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GlowInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 16,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 20,
+                shader_location: 3,
+            },
+        ],
+    };
+    let glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("glow-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_glow"),
+            buffers: &[Some(glow_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_glow"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(additive),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    glow_pipeline
+}
 
-        let blend_target = |format| {
-            Some(wgpu::ColorTargetState {
+/// Black-hole discs.
+fn create_blackhole_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
+    let device = ctx.device;
+    let shader = &ctx.shader;
+    let pipeline_layout = &ctx.layout;
+    let msaa_state = ctx.msaa;
+    let format = ctx.format;
+    let blackhole_instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<BlackHoleInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 16,
+                shader_location: 2,
+            },
+        ],
+    };
+    let blackhole_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blackhole-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_blackhole"),
+            buffers: &[Some(blackhole_instance_layout)],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_blackhole"),
+            targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
-            })
-        };
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: msaa_state,
+        multiview_mask: None,
+        cache: None,
+    });
+    blackhole_pipeline
+}
 
-        // ---- Body pipeline ----
-        let body_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<BodyInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 12,
-                    shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 16,
-                    shader_location: 2,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 28,
-                    shader_location: 3,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 32,
-                    shader_location: 4,
-                },
-            ],
-        };
-        let body_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("body-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(body_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[blend_target(format)],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
+/// An empty, growable vertex buffer of `size` bytes.
+fn create_vertex_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
 
-        // ---- Orbit/trail pipeline ----
-        let orbit_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<OrbitVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Unorm8x4,
-                    offset: 12,
-                    shader_location: 1,
-                },
-            ],
-        };
-        let orbit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("orbit-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_orbit"),
-                buffers: &[Some(orbit_layout.clone())],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_orbit"),
-                targets: &[blend_target(format)],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
-        // ---- Flash pipeline ----
-        let flash_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<FlashInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 12,
-                    shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 16,
-                    shader_location: 2,
-                },
-            ],
-        };
-        let flash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("flash-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_flash"),
-                buffers: &[Some(flash_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_flash"),
-                targets: &[blend_target(format)],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
+/// Where body `i` is drawn: its position, or `override_body`'s smoothed one.
+fn position_of(b: &Bodies, i: usize, override_body: Option<(usize, [f64; 3])>) -> (f64, f64, f64) {
+    match override_body {
+        Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
+        _ => (b.x[i], b.y[i], b.z[i]),
+    }
+}
 
-        // ---- Dust pipeline ----
-        // Group 1: the per-field centres, one vec4 per field.
-        let fields_size = (MAX_DUST_FIELDS * std::mem::size_of::<[f32; 4]>()) as u64;
-        let dust_fields_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dust-fields"),
-            size: fields_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let dust_fields_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("dust-fields-layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-        let dust_fields_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dust-fields-bg"),
-            layout: &dust_fields_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dust_fields_buf.as_entire_binding(),
-            }],
-        });
-        let dust_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("dust-pipeline-layout"),
-            bind_group_layouts: &[Some(&camera_layout), Some(&dust_fields_layout)],
-            immediate_size: 0,
-        });
-        let dust_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<DustVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 12,
-                    shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Uint32,
-                    offset: 16,
-                    shader_location: 2,
-                },
-            ],
-        };
-        // Additive: colour = src.rgb * src.a + dst, so overlapping grains
-        // brighten. Destination alpha is left alone.
-        let additive = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::Zero,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-        let dust_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dust-pipeline"),
-            layout: Some(&dust_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_dust"),
-                buffers: &[Some(dust_vertex_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_dust"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(additive),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
+impl Renderer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let cameras = create_camera_resources(device);
+        let ctx = PipelineContext {
+            device,
+            camera_layout: &cameras.layout,
+            shader: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("nbody-shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
-        // ---- Comet pipeline: orbit vertex format, triangles, additive ----
-        let comet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("comet-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_orbit"),
-                buffers: &[Some(orbit_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_orbit"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(additive),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
+            layout: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pipeline-layout"),
+                bind_group_layouts: &[Some(&cameras.layout)],
+                immediate_size: 0,
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
+            msaa: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
             },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // ---- Glow pipeline: additive soft quads behind bodies ----
-        let glow_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<GlowInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 12,
-                    shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 16,
-                    shader_location: 2,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 20,
-                    shader_location: 3,
-                },
-            ],
+            format,
         };
-        let glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glow-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_glow"),
-                buffers: &[Some(glow_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_glow"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(additive),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
+        let body_pipeline = create_body_pipeline(&ctx);
+        let orbit_pipeline = create_orbit_pipeline(&ctx);
+        let flash_pipeline = create_flash_pipeline(&ctx);
+        let (dust_pipeline, dust_fields_buf, dust_fields_bg) = create_dust_resources(&ctx);
+        let comet_pipeline = create_comet_pipeline(&ctx);
+        let glow_pipeline = create_glow_pipeline(&ctx);
+        let blackhole_pipeline = create_blackhole_pipeline(&ctx);
+        let CameraResources { camera_buf, orbit_camera_buf, camera_bg, orbit_camera_bg, .. } = cameras;
 
-        let blackhole_instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<BlackHoleInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 0,
-                    shader_location: 0,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 12,
-                    shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 16,
-                    shader_location: 2,
-                },
-            ],
-        };
-        let blackhole_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blackhole-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_blackhole"),
-                buffers: &[Some(blackhole_instance_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_blackhole"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: msaa_state,
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // 64k grains to start (1 MiB), grown on demand.
-        let dust_capacity = 65_536 * std::mem::size_of::<DustVertex>() as u64;
-        let dust_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dust"),
-            size: dust_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // ---- Initial buffers ----
-        let instance_capacity = 1024 * 16;
-        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instance"),
-            size: instance_capacity * std::mem::size_of::<BodyInstance>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let orbit_capacity = 1024 * 1024;
-        let orbit_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orbit"),
-            size: orbit_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let trail_capacity = 1024 * 16;
-        let trail_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("trail"),
-            size: trail_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let comet_tail_capacity = 1024 * 16;
-        let comet_tail_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("comet-tail"),
-            size: comet_tail_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let flash_capacity = 1024 * 64;
-        let flash_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flash"),
-            size: flash_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Initial buffer sizes. Each grows on demand when a frame needs more.
+        let dust_capacity = INITIAL_DUST_GRAINS * std::mem::size_of::<DustVertex>() as u64;
+        let dust_buf = create_vertex_buffer(device, "dust", dust_capacity);
+        let instance_capacity = INITIAL_BODY_INSTANCES;
+        let instance_buf = create_vertex_buffer(
+            device,
+            "instance",
+            instance_capacity * std::mem::size_of::<BodyInstance>() as u64,
+        );
+        let orbit_capacity = INITIAL_ORBIT_BYTES;
+        let orbit_buf = create_vertex_buffer(device, "orbit", orbit_capacity);
+        let trail_capacity = INITIAL_TRAIL_BYTES;
+        let trail_buf = create_vertex_buffer(device, "trail", trail_capacity);
+        let comet_tail_capacity = INITIAL_COMET_TAIL_BYTES;
+        let comet_tail_buf = create_vertex_buffer(device, "comet-tail", comet_tail_capacity);
+        let flash_capacity = INITIAL_FLASH_BYTES;
+        let flash_buf = create_vertex_buffer(device, "flash", flash_capacity);
         // Glow is one instance per luminous body, so a few hundred slots
-        // is plenty at every realistic n. Grown on demand if exceeded.
-        let glow_capacity: u64 = 256 * std::mem::size_of::<GlowInstance>() as u64;
-        let glow_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("glow"),
-            size: glow_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let blackhole_capacity: u64 = 64 * std::mem::size_of::<BlackHoleInstance>() as u64;
-        let blackhole_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blackhole"),
-            size: blackhole_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // is plenty at every realistic n.
+        let glow_capacity: u64 = INITIAL_GLOW_INSTANCES * std::mem::size_of::<GlowInstance>() as u64;
+        let glow_buf = create_vertex_buffer(device, "glow", glow_capacity);
+        let blackhole_capacity: u64 =
+            INITIAL_BLACKHOLE_INSTANCES * std::mem::size_of::<BlackHoleInstance>() as u64;
+        let blackhole_buf = create_vertex_buffer(device, "blackhole", blackhole_capacity);
 
         Self {
             body_pipeline,
@@ -1239,255 +1344,293 @@ impl Renderer {
         override_body: Option<(usize, [f64; 3])>,
     ) {
         let zoom = view.zoom as f32;
+        self.collect_light_sources(b, override_body);
+        self.build_body_instances(b, view, override_body);
+        self.build_flash_instances(b, view, zoom);
+        self.build_glow_instances(b, view, zoom, override_body);
+        self.build_black_hole_instances(b, view, zoom, override_body);
+        self.update_dust(b, view, vp);
+    }
+
+    /// One pass computes each luminous body's luminosity (used for the glow
+    /// strength) and lists the bodies that light planets.
+    fn collect_light_sources(&mut self, b: &Bodies, override_body: Option<(usize, [f64; 3])>) {
+    let n = b.len();
+    self.lum_scratch.clear();
+    self.lum_scratch.resize(n, 0.0);
+    self.light_scratch.clear();
+    self.color_scratch.clear();
+    self.color_scratch.resize(n, [0.0; 3]);
+    for i in 0..n {
+        if !matches!(
+            b.kind[i],
+            BodyKind::Star
+                | BodyKind::BrownDwarf
+                | BodyKind::WhiteDwarf
+                | BodyKind::NeutronStar
+        ) {
+            continue;
+        }
+        let l = physics::luminosity_of(b, i);
+        if !(l.is_finite() && l > 0.0) {
+            continue;
+        }
+        self.lum_scratch[i] = l;
+        let (lx, ly, lz) = position_of(b, i, override_body);
+        self.light_scratch.push((lx, ly, lz, l));
+    }
+    }
+
+    /// Body discs, lit by the brightest star and sorted far to near.
+    fn build_body_instances(
+        &mut self,
+        b: &Bodies,
+        view: &View3,
+        override_body: Option<(usize, [f64; 3])>,
+    ) {
+        let zoom = view.zoom as f32;
         let cam = view.cam;
-        // ---- Luminosity and light sources ----
-        // One pass computes each luminous body's luminosity (used for the
-        // glow strength below) and lists the bodies that light planets.
         let n = b.len();
-        self.lum_scratch.clear();
-        self.lum_scratch.resize(n, 0.0);
-        self.light_scratch.clear();
-        self.color_scratch.clear();
-        self.color_scratch.resize(n, [0.0; 3]);
-        for i in 0..n {
-            if !matches!(
-                b.kind[i],
-                BodyKind::Star
-                    | BodyKind::BrownDwarf
-                    | BodyKind::WhiteDwarf
-                    | BodyKind::NeutronStar
-            ) {
-                continue;
-            }
-            let l = physics::luminosity_of(b, i);
-            if !(l.is_finite() && l > 0.0) {
-                continue;
-            }
-            self.lum_scratch[i] = l;
-            let (lx, ly, lz) = match override_body {
-                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
-                _ => (b.x[i], b.y[i], b.z[i]),
-            };
-            self.light_scratch.push((lx, ly, lz, l));
-        }
-        // Shading a planet costs one loop over the light sources. In a
-        // dense cluster that would be too slow, so planets stay flat there.
-        let shade_planets = self.light_scratch.len() as u64 * n as u64 <= 4_000_000;
+    // Shading a planet costs one loop over the light sources. In a
+    // dense cluster that would be too slow, so planets stay flat there.
+    let shade_planets = self.light_scratch.len() as u64 * n as u64 <= 4_000_000;
 
-        // ---- Bodies ----
-        self.instance_scratch.clear();
-        if self.instance_scratch.capacity() < n {
-            self.instance_scratch
-                .reserve(n - self.instance_scratch.capacity());
+    self.instance_scratch.clear();
+    if self.instance_scratch.capacity() < n {
+        self.instance_scratch
+            .reserve(n - self.instance_scratch.capacity());
+    }
+    // View-space depth of each instance, for far-to-near drawing.
+    let mut depth: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        if b.kind[i] == BodyKind::BlackHole {
+            continue; // Handled by the dedicated pipeline
         }
-        // View-space depth of each instance, for far-to-near drawing.
-        let mut depth: Vec<f64> = Vec::with_capacity(n);
-        for i in 0..n {
-            if b.kind[i] == BodyKind::BlackHole {
-                continue; // Handled by the dedicated pipeline
-            }
-            let (bx, by, bz) = match override_body {
-                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
-                _ => (b.x[i], b.y[i], b.z[i]),
-            };
-            let color = body_color(b, i);
-            self.color_scratch[i] = color;
-            depth.push(view.project([bx, by, bz])[2]);
-            let mut inst = BodyInstance::new(
-                b.kind[i],
-                b.origin[i],
-                color,
-                bx - cam[0],
-                by - cam[1],
-                bz - cam[2],
-                b.r[i],
-                zoom,
-            );
-            // A planet is lit from the side of the star that gives it the
-            // most light (luminosity / distance²).
-            if shade_planets && matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
-                let mut best_flux = 0.0f64;
-                let mut best_dir = [f64::NAN; 3];
-                for &(lx, ly, lz, l) in &self.light_scratch {
-                    let (dx, dy, dz) = (lx - bx, ly - by, lz - bz);
-                    let d2 = dx * dx + dy * dy + dz * dz;
-                    if d2 <= 0.0 {
-                        continue;
-                    }
-                    let flux = l / d2;
-                    if flux > best_flux {
-                        best_flux = flux;
-                        let d = d2.sqrt();
-                        best_dir = [dx / d, dy / d, dz / d];
-                    }
+        let (bx, by, bz) = position_of(b, i, override_body);
+        let color = body_color(b, i);
+        self.color_scratch[i] = color;
+        depth.push(view.project([bx, by, bz])[2]);
+        let mut inst = BodyInstance::new(
+            b.kind[i],
+            b.origin[i],
+            color,
+            bx - cam[0],
+            by - cam[1],
+            bz - cam[2],
+            b.r[i],
+            zoom,
+        );
+        // A planet is lit from the side of the star that gives it the
+        // most light (luminosity / distance²).
+        if shade_planets && matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
+            let mut best_flux = 0.0f64;
+            let mut best_dir = [f64::NAN; 3];
+            for &(lx, ly, lz, l) in &self.light_scratch {
+                let (dx, dy, dz) = (lx - bx, ly - by, lz - bz);
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 <= 0.0 {
+                    continue;
                 }
-                inst = inst.with_light(best_dir);
+                let flux = l / d2;
+                if flux > best_flux {
+                    best_flux = flux;
+                    let d = d2.sqrt();
+                    best_dir = [dx / d, dy / d, dz / d];
+                }
             }
-            self.instance_scratch.push(inst);
+            inst = inst.with_light(best_dir);
         }
-        // Painter's order: far bodies first. A stable sort leaves a top-down
-        // (all depths equal) scene in its old index order.
-        if !view.is_top_down() || depth.iter().any(|&d| d != 0.0) {
-            let mut order: Vec<usize> = (0..self.instance_scratch.len()).collect();
-            order.sort_by(|&a, &c| depth[c].total_cmp(&depth[a]));
-            let sorted: Vec<BodyInstance> = order.iter().map(|&k| self.instance_scratch[k]).collect();
-            self.instance_scratch = sorted;
-        }
-        self.body_count = self.instance_scratch.len() as u32;
+        self.instance_scratch.push(inst);
+    }
+    // Painter's order: far bodies first. A stable sort leaves a top-down
+    // (all depths equal) scene in its old index order.
+    if !view.is_top_down() || depth.iter().any(|&d| d != 0.0) {
+        let mut order: Vec<usize> = (0..self.instance_scratch.len()).collect();
+        order.sort_by(|&a, &c| depth[c].total_cmp(&depth[a]));
+        let sorted: Vec<BodyInstance> = order.iter().map(|&k| self.instance_scratch[k]).collect();
+        self.instance_scratch = sorted;
+    }
+    self.body_count = self.instance_scratch.len() as u32;
+    }
 
-        // ---- Flashes ----
-        let nf = b.flashes.len();
-        self.flash_scratch.clear();
-        self.flash_instance_count = nf as u32;
-        if nf > 0 {
-            if self.flash_scratch.capacity() < nf {
-                self.flash_scratch
-                    .reserve(nf - self.flash_scratch.capacity());
-            }
-            let min_px_world = 8.0 / zoom.max(1e-6) as f64;
-            for f in &b.flashes {
-                let r = f.r0.max(min_px_world);
-                self.flash_scratch.push(FlashInstance {
-                    pos: [(f.x - cam[0]) as f32, (f.y - cam[1]) as f32, (f.z - cam[2]) as f32],
-                    radius: r as f32,
-                    progress: (f.age / f.life) as f32,
-                });
-            }
+    /// Collision flashes, with a minimum on-screen size.
+    fn build_flash_instances(&mut self, b: &Bodies, view: &View3, zoom: f32) {
+        let cam = view.cam;
+    let nf = b.flashes.len();
+    self.flash_scratch.clear();
+    self.flash_instance_count = nf as u32;
+    if nf > 0 {
+        if self.flash_scratch.capacity() < nf {
+            self.flash_scratch
+                .reserve(nf - self.flash_scratch.capacity());
         }
-
-        // ---- Star glow ----
-        // One halo per luminous body. Radius and intensity are per-kind:
-        // stars get a big soft halo, brown dwarfs a modest one, white
-        // dwarfs a tight cool halo, neutron stars a pinprick of intense
-        // blue-white. Black holes are skipped (they would read as a
-        // spurious emission ring).
-        self.glow_scratch.clear();
-        for i in 0..n {
-            // Stars, brown dwarfs and white dwarfs glow in proportion to their
-            // luminosity. A neutron star keeps a fixed pinprick: most of its
-            // light is X-rays.
-            let (halo_mult, base_intensity, uses_lum) = match b.kind[i] {
-                BodyKind::Star => (3.0, 0.55, true),
-                BodyKind::BrownDwarf => (2.5, 0.30, true),
-                BodyKind::WhiteDwarf => (2.0, 0.45, true),
-                BodyKind::NeutronStar => (2.5, 0.90, false),
-                _ => continue,
-            };
-            let lum_factor = if uses_lum {
-                glow_luminosity_factor(self.lum_scratch[i])
-            } else {
-                1.0
-            };
-            let intensity = (base_intensity * lum_factor) as f32;
-            let (bx, by, bz) = match override_body {
-                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
-                _ => (b.x[i], b.y[i], b.z[i]),
-            };
-            // Halo radius in world units. The floor is 6 screen pixels for a
-            // Sun-like body, smaller for a dim one and larger for a bright
-            // one, so a luminous star at wide zoom has a bigger glare.
-            let floor_px = 6.0 * lum_factor.sqrt();
-            let r_world = (b.r[i] * halo_mult).max(floor_px / zoom.max(1e-6) as f64);
-            let color = self.color_scratch[i];
-            self.glow_scratch.push(GlowInstance {
-                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
-                radius: r_world as f32,
-                intensity,
-                color,
-                _pad: 0.0,
+        let min_px_world = 8.0 / zoom.max(1e-6) as f64;
+        for f in &b.flashes {
+            let r = f.r0.max(min_px_world);
+            self.flash_scratch.push(FlashInstance {
+                pos: [(f.x - cam[0]) as f32, (f.y - cam[1]) as f32, (f.z - cam[2]) as f32],
+                radius: r as f32,
+                progress: (f.age / f.life) as f32,
             });
         }
-        self.glow_count = self.glow_scratch.len() as u32;
+    }
+    }
 
-        // ---- Black Holes ----
-        self.blackhole_scratch.clear();
-        for i in 0..n {
-            if b.kind[i] != BodyKind::BlackHole {
-                continue;
-            }
-            let (bx, by, bz) = match override_body {
-                Some((idx, p)) if idx == i => (p[0], p[1], p[2]),
-                _ => (b.x[i], b.y[i], b.z[i]),
-            };
-            // `r` is the event horizon (Schwarzschild radius). The shader draws
-            // the shadow at BH_SHADOW_IN_RS times this, and the disk beyond it.
-            // The floor keeps the shadow at least 4 px in radius, so a hole
-            // does not vanish at wide zoom.
-            let r_world = b.r[i].max(4.0 / (BH_SHADOW_IN_RS * zoom.max(1e-6) as f64));
-            self.blackhole_scratch.push(BlackHoleInstance {
-                pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
-                radius: r_world as f32,
-                accretion: physics::accretion_level(b, i) as f32,
-            });
-        }
-        self.blackhole_count = self.blackhole_scratch.len() as u32;
+    /// One halo per luminous body. Radius and intensity are per-kind: stars
+    /// get a big soft halo, brown dwarfs a modest one, white dwarfs a tight
+    /// cool halo, neutron stars a pinprick of intense blue-white. Black holes
+    /// are skipped (they would read as a spurious emission ring).
+    fn build_glow_instances(
+        &mut self,
+        b: &Bodies,
+        view: &View3,
+        zoom: f32,
+        override_body: Option<(usize, [f64; 3])>,
+    ) {
+        let cam = view.cam;
+        let n = b.len();
+    self.glow_scratch.clear();
+    for i in 0..n {
+        // Stars, brown dwarfs and white dwarfs glow in proportion to their
+        // luminosity. A neutron star keeps a fixed pinprick: most of its
+        // light is X-rays.
+        let (halo_mult, base_intensity, uses_lum) = match b.kind[i] {
+            BodyKind::Star => (3.0, 0.55, true),
+            BodyKind::BrownDwarf => (2.5, 0.30, true),
+            BodyKind::WhiteDwarf => (2.0, 0.45, true),
+            BodyKind::NeutronStar => (2.5, 0.90, false),
+            _ => continue,
+        };
+        let lum_factor = if uses_lum {
+            glow_luminosity_factor(self.lum_scratch[i])
+        } else {
+            1.0
+        };
+        let intensity = (base_intensity * lum_factor) as f32;
+        let (bx, by, bz) = position_of(b, i, override_body);
+        // Halo radius in world units. The floor is 6 screen pixels for a
+        // Sun-like body, smaller for a dim one and larger for a bright
+        // one, so a luminous star at wide zoom has a bigger glare.
+        let floor_px = 6.0 * lum_factor.sqrt();
+        let r_world = (b.r[i] * halo_mult).max(floor_px / zoom.max(1e-6) as f64);
+        let color = self.color_scratch[i];
+        self.glow_scratch.push(GlowInstance {
+            pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
+            radius: r_world as f32,
+            intensity,
+            color,
+            _pad: 0.0,
+        });
+    }
+    self.glow_count = self.glow_scratch.len() as u32;
+    }
 
-        // ---- Dust ----
-        // Visible fields: big enough on screen and overlapping the view.
-        let z = zoom.max(1e-6) as f64;
-        let (hw, hh) = (0.5 * vp[0] as f64 / z, 0.5 * vp[1] as f64 / z);
-        let mut visible: Vec<usize> = Vec::new();
-        for (i, f) in b.dust_fields.iter().enumerate() {
-            if visible.len() >= MAX_DUST_FIELDS {
-                break;
-            }
-            if f.primary >= n || f.grains.is_empty() {
-                continue;
-            }
-            let c = view.project([b.x[f.primary], b.y[f.primary], b.z[f.primary]]);
-            let (dx, dy) = (c[0], c[1]);
-            let ext = f.extent_gm;
-            if ext * z >= DUST_MIN_PX && dx.abs() - ext < hw && dy.abs() - ext < hh {
-                visible.push(i);
-            }
+    fn build_black_hole_instances(
+        &mut self,
+        b: &Bodies,
+        view: &View3,
+        zoom: f32,
+        override_body: Option<(usize, [f64; 3])>,
+    ) {
+        let cam = view.cam;
+        let n = b.len();
+    self.blackhole_scratch.clear();
+    for i in 0..n {
+        if b.kind[i] != BodyKind::BlackHole {
+            continue;
         }
-        let sig: Vec<(usize, u64)> = visible
+        let (bx, by, bz) = position_of(b, i, override_body);
+        // `r` is the event horizon (Schwarzschild radius). The shader draws
+        // the shadow at BH_SHADOW_IN_RS times this, and the disk beyond it.
+        // The floor keeps the shadow at least 4 px in radius, so a hole
+        // does not vanish at wide zoom.
+        let r_world = b.r[i].max(4.0 / (BH_SHADOW_IN_RS * zoom.max(1e-6) as f64));
+        self.blackhole_scratch.push(BlackHoleInstance {
+            pos: [(bx - cam[0]) as f32, (by - cam[1]) as f32, (bz - cam[2]) as f32],
+            radius: r_world as f32,
+            accretion: physics::accretion_level(b, i) as f32,
+        });
+    }
+    self.blackhole_count = self.blackhole_scratch.len() as u32;
+    }
+
+    /// Choose which dust fields are visible, rebuild their point list when the
+    /// set (or, throttled, the grains) changed, and refresh the field centres.
+    fn update_dust(&mut self, b: &Bodies, view: &View3, vp: [f32; 2]) {
+        let zoom = view.zoom as f32;
+        let cam = view.cam;
+        let n = b.len();
+    // Visible fields: big enough on screen and overlapping the view.
+    let z = zoom.max(1e-6) as f64;
+    let (hw, hh) = (0.5 * vp[0] as f64 / z, 0.5 * vp[1] as f64 / z);
+    let mut visible: Vec<usize> = Vec::new();
+    for (i, f) in b.dust_fields.iter().enumerate() {
+        if visible.len() >= MAX_DUST_FIELDS {
+            break;
+        }
+        if f.primary >= n || f.grains.is_empty() {
+            continue;
+        }
+        let c = view.project([b.x[f.primary], b.y[f.primary], b.z[f.primary]]);
+        let (dx, dy) = (c[0], c[1]);
+        let ext = f.extent_gm;
+        if ext * z >= DUST_MIN_PX && dx.abs() - ext < hw && dy.abs() - ext < hh {
+            visible.push(i);
+        }
+    }
+    let sig: Vec<(usize, u64)> = visible
+        .iter()
+        .map(|&i| (i, b.dust_fields[i].version))
+        .collect();
+    // The same set means the same slots with grains that only moved on. A new
+    // system, or a loaded save, gives its fields a version far from the old one,
+    // and must replace the old grains at once, not after the upload throttle.
+    let same_set = sig.len() == self.dust_sig.len()
+        && sig
             .iter()
-            .map(|&i| (i, b.dust_fields[i].version))
-            .collect();
-        let same_set = sig.len() == self.dust_sig.len()
-            && sig.iter().zip(&self.dust_sig).all(|(a, c)| a.0 == c.0)
-            && b.dust_fields.len() == self.dust_prev_field_count;
-        let changed = sig != self.dust_sig || b.dust_fields.len() != self.dust_prev_field_count;
-        // A different set of fields rebuilds at once; plain grain motion is
-        // throttled to DUST_UPLOAD_MIN.
-        if changed && (!same_set || self.dust_last_upload.elapsed() >= DUST_UPLOAD_MIN) {
-            let total: usize = visible.iter().map(|&i| b.dust_fields[i].grains.len()).sum();
-            let stride = total.div_ceil(MAX_DUST_POINTS).max(1);
-            self.dust_scratch.clear();
-            self.dust_scratch.reserve(total / stride + 1);
-            for (slot, &i) in visible.iter().enumerate() {
-                let f = &b.dust_fields[i];
-                let (px, py, pz) = (b.x[f.primary], b.y[f.primary], b.z[f.primary]);
-                self.dust_scratch
-                    .extend(f.grains.iter().step_by(stride).map(|g| DustVertex {
-                        pos: [(g.x - px) as f32, (g.y - py) as f32, (g.z - pz) as f32],
-                        weight: g.mass as f32,
-                        field: slot as u32,
-                    }));
-            }
-            self.dust_slots = visible;
-            self.dust_sig = sig;
-            self.dust_prev_field_count = b.dust_fields.len();
-            self.dust_last_upload = Instant::now();
-            self.dust_upload_pending = true;
+            .zip(&self.dust_sig)
+            .all(|(a, c)| a.0 == c.0 && a.1.wrapping_sub(c.1) < DUST_NEW_FIELD_VERSION_STEP)
+        && b.dust_fields.len() == self.dust_prev_field_count;
+    let changed = sig != self.dust_sig || b.dust_fields.len() != self.dust_prev_field_count;
+    // A different set of fields rebuilds at once; plain grain motion is
+    // throttled to DUST_UPLOAD_MIN.
+    if changed && (!same_set || self.dust_last_upload.elapsed() >= DUST_UPLOAD_MIN) {
+        let total: usize = visible.iter().map(|&i| b.dust_fields[i].grains.len()).sum();
+        let stride = total.div_ceil(MAX_DUST_POINTS).max(1);
+        self.dust_scratch.clear();
+        self.dust_scratch.reserve(total / stride + 1);
+        for (slot, &i) in visible.iter().enumerate() {
+            let f = &b.dust_fields[i];
+            let (px, py, pz) = (b.x[f.primary], b.y[f.primary], b.z[f.primary]);
+            self.dust_scratch
+                .extend(f.grains.iter().step_by(stride).map(|g| DustVertex {
+                    pos: [(g.x - px) as f32, (g.y - py) as f32, (g.z - pz) as f32],
+                    weight: g.mass as f32,
+                    field: slot as u32,
+                }));
         }
-        // Centres follow the primaries every frame (cheap, one small uniform).
-        for c in self.dust_centres.iter_mut() {
-            *c = [1e12, 1e12, 0.0, 0.0];
-        }
-        for (slot, &i) in self.dust_slots.iter().enumerate() {
-            if let Some(f) = b.dust_fields.get(i) {
-                if f.primary < n {
-                    self.dust_centres[slot] = [
-                        (b.x[f.primary] - cam[0]) as f32,
-                        (b.y[f.primary] - cam[1]) as f32,
-                        (b.z[f.primary] - cam[2]) as f32,
-                        0.0,
-                    ];
-                }
+        self.dust_slots = visible;
+        self.dust_sig = sig;
+        self.dust_prev_field_count = b.dust_fields.len();
+        self.dust_last_upload = Instant::now();
+        self.dust_upload_pending = true;
+    }
+    // Centres follow the primaries every frame (cheap, one small uniform).
+    for c in self.dust_centres.iter_mut() {
+        *c = [1e12, 1e12, 0.0, 0.0];
+    }
+    for (slot, &i) in self.dust_slots.iter().enumerate() {
+        if let Some(f) = b.dust_fields.get(i) {
+            if f.primary < n {
+                self.dust_centres[slot] = [
+                    (b.x[f.primary] - cam[0]) as f32,
+                    (b.y[f.primary] - cam[1]) as f32,
+                    (b.z[f.primary] - cam[2]) as f32,
+                    0.0,
+                ];
             }
         }
+    }
     }
 
     /// Upload the scratch buffers to the GPU. Does not read `Bodies`.
