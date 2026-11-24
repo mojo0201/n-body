@@ -1,6 +1,7 @@
 use nbody_rust::physics::*;
 use std::time::Instant;
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     for n_sys in [10usize, 50, 100, 200] {
         let t = Instant::now();
         let mut b = Bodies::with_capacity(20000);

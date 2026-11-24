@@ -4,6 +4,7 @@
 use nbody_rust::physics::*;
 
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     // The baseline pins the planar (coplanar) physics.
     set_inclination_scale(0.0);
     for seed in [1u128, 2, 3, 7, 11, 42, 99, 1234] {

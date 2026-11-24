@@ -1,5 +1,6 @@
 use nbody_rust::physics::*;
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     for seed in [3u128, 5, 7, 8, 33] {
         let mut b = Bodies::with_capacity(1100);
         spawn_random_systems(&mut b, 1000, seed, 1);

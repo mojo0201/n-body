@@ -879,7 +879,8 @@ fn promote_by_mass(b: &mut Bodies, keep: usize, cx: f64, cy: f64) {
 fn climb_stellar_ladder(b: &mut Bodies, keep: usize, cx: f64, cy: f64) {
     if b.kind[keep] == BodyKind::WhiteDwarf && b.m[keep] > WD_M_MAX {
         b.kind[keep] = BodyKind::NeutronStar;
-        b.set_mass(keep, NS_M_MIN * 1.07);
+        // Never more than the merged mass: a collapse does not create matter.
+        b.set_mass(keep, b.m[keep].min(NS_M_MIN * 1.07));
         let text = format!("{} collapsed to neutron star", tag(b, keep));
         b.log(EventKind::Merge, text, cx, cy);
     }

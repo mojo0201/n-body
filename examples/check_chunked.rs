@@ -1,5 +1,6 @@
 use nbody_rust::physics::*;
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     let mk = || { let mut b = Bodies::with_capacity(20000); spawn_random_systems(&mut b, 30, 7, 10); b };
     let (mut a, mut c) = (mk(), mk());
     let mut resumes = 0;

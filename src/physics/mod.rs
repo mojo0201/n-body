@@ -20,6 +20,9 @@ pub mod evolution;
 pub mod forces;
 pub mod integrator;
 pub mod naming;
+pub mod early;
+pub mod names;
+pub mod transit;
 pub mod orbit_lines;
 pub mod orbits;
 pub mod presets;
@@ -53,6 +56,9 @@ pub use evolution::*;
 pub use forces::*;
 pub use integrator::*;
 pub use naming::*;
+pub use early::*;
+pub use names::*;
+pub use transit::*;
 pub use orbit_lines::*;
 pub use orbits::*;
 pub use presets::*;
@@ -281,12 +287,19 @@ pub const SN_KICK_SIGMA_KMS: f64 = 265.0;
 /// SECONDS_PER_GYR`, times `aging_mult` (default 1.0).
 pub const EVO_RATE_DEMO: f64 = 1.0;
 
-// White dwarf cooling: Mestel law, L ∝ M t^(-7/6) with t = cooling age.
+// White dwarf cooling, L ∝ M · t^(-α) with t the cooling age, in two regimes.
+// Young white dwarfs follow the Mestel law (α = 7/5). Past about 1 Gyr cooling
+// slows (Debye cooling, crystallisation): detailed models of a 0.6 M☉ DA dwarf
+// (Bédard et al. 2020) give Teff ≈ 15 000 K at 0.1 Gyr, 6 500 K at 1 Gyr,
+// 5 100 K at 3 Gyr and 4 000 K at 10 Gyr, a slope of about 0.85 after 1 Gyr.
 
 /// Luminosity in L☉ of a 0.6 M☉ white dwarf at a cooling age of 1 Gyr.
 pub const WD_COOL_L_REF: f64 = 2e-4;
 
-pub const WD_COOL_EXP: f64 = 7.0 / 6.0;
+/// Slope before 1 Gyr (Mestel).
+pub const WD_COOL_EXP_EARLY: f64 = 7.0 / 5.0;
+/// Slope after 1 Gyr.
+pub const WD_COOL_EXP_LATE: f64 = 0.85;
 
 /// Offset that keeps a new white dwarf's luminosity finite (10 000 yr).
 pub const WD_COOL_T0_GYR: f64 = 1e-5;

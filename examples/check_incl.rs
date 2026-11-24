@@ -2,6 +2,7 @@
 use nbody_rust::physics::*;
 
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     println!("scale = {}", inclination_scale());
     let mut by_origin: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
     for seed in [1u128, 2, 3, 7, 11, 42, 99, 1234, 5, 8, 13, 21] {

@@ -79,6 +79,12 @@ struct Shared {
     /// True while a physics step is paused mid-way (velocities of a rung
     /// block are staggered then, so energy must not be sampled).
     mid_step: AtomicBool,
+    /// The physics thread panicked and is waiting for a new system.
+    failed: AtomicBool,
+    /// The physics step paused mid-way, if any. Lives here, not in the pacer,
+    /// so the render thread can finish it before it edits the bodies. Lock
+    /// order is `bodies`, then `job`.
+    job: Mutex<Option<physics::AdvanceJob>>,
     phys_ns: AtomicU64,
     orbit_req: Mutex<Option<(u64, OrbitReq)>>,
     orbit_out: Mutex<Option<(u64, Vec<OrbitVertex>)>>,
@@ -98,6 +104,8 @@ impl Shared {
             clear_accum: AtomicBool::new(false),
             behind: AtomicBool::new(false),
             mid_step: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            job: Mutex::new(None),
             phys_ns: AtomicU64::new(0),
             orbit_req: Mutex::new(None),
             orbit_out: Mutex::new(None),
@@ -111,6 +119,18 @@ impl Shared {
             guard: lock_ok(&self.bodies),
             wants: &self.render_wants,
         }
+    }
+
+    /// Run the paused physics step to its end. Call with the bodies lock held,
+    /// before anything that edits, deletes, saves or single-steps the bodies:
+    /// a step in flight keeps indices, a tree and a momentum baseline that an
+    /// edit would make wrong.
+    fn settle_step(&self, b: &mut Bodies) {
+        let mut slot = lock_ok(&self.job);
+        if let Some(mut job) = slot.take() {
+            while !physics::advance_run(&mut job, b, || true) {}
+        }
+        self.mid_step.store(false, Ordering::Release);
     }
 
     fn yield_to_render(&self) {
@@ -164,19 +184,17 @@ struct PhysicsPacer {
     /// Simulated time owed to the world, in time units.
     owed: f64,
     behind_until: Option<Instant>,
-    /// A physics step paused mid-way to let the render thread in.
-    job: Option<physics::AdvanceJob>,
 }
 
 impl PhysicsPacer {
     fn new() -> Self {
-        Self { last_tick: Instant::now(), owed: 0.0, behind_until: None, job: None }
+        Self { last_tick: Instant::now(), owed: 0.0, behind_until: None }
     }
 
     /// Forget owed time and any step in flight (reset / load / spawn).
     fn discard_pending_work(&mut self, sh: &Shared) {
         self.owed = 0.0;
-        self.job = None;
+        *lock_ok(&sh.job) = None;
         sh.mid_step.store(false, Ordering::Release);
     }
 
@@ -190,8 +208,8 @@ impl PhysicsPacer {
         }
     }
 
-    fn step_is_due(&self) -> bool {
-        self.job.is_some() || self.owed >= physics::DT
+    fn step_is_due(&self, sh: &Shared) -> bool {
+        lock_ok(&sh.job).is_some() || self.owed >= physics::DT
     }
 
     /// Advance the simulation while time is owed, holding the bodies lock
@@ -206,6 +224,7 @@ impl PhysicsPacer {
             self.discard_pending_work(sh);
             return;
         }
+        let mut job = lock_ok(&sh.job);
         let started = Instant::now();
         let must_pause = || {
             sh.render_wants.load(Ordering::Acquire) || started.elapsed() >= PHYS_SLICE
@@ -213,29 +232,29 @@ impl PhysicsPacer {
         // A step can span several lock holds: it pauses after a sub-tick when
         // `must_pause` and resumes on the next slice.
         loop {
-            if self.job.is_none() {
+            if job.is_none() {
                 if self.owed < physics::DT {
                     break;
                 }
                 self.owed -= physics::DT;
-                self.job = physics::advance_begin(&mut b, physics::DT);
-                if self.job.is_none() {
+                *job = physics::advance_begin(&mut b, physics::DT);
+                if job.is_none() {
                     continue;
                 }
             }
-            let finished = self
-                .job
+            let finished = job
                 .as_mut()
-                .is_none_or(|job| physics::advance_run(job, &mut b, || !must_pause()));
+                .is_none_or(|j| physics::advance_run(j, &mut b, || !must_pause()));
             if finished {
-                self.job = None;
+                *job = None;
             }
             if must_pause() {
                 break;
             }
         }
         lock_ok(&sh.history).maybe_record(&b);
-        sh.mid_step.store(self.job.is_some(), Ordering::Release);
+        sh.mid_step.store(job.is_some(), Ordering::Release);
+        drop(job);
         drop(b);
         sh.phys_ns
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -286,6 +305,28 @@ fn serve_orbit_request(sh: &Shared) -> bool {
     true
 }
 
+/// Run `physics_loop`, and survive a panic in it. The error stays in the
+/// terminal, the title bar says the physics stopped, and the thread resumes
+/// as soon as the system is replaced (Generate, Load, a preset), because the
+/// bodies are then known to be whole again.
+fn physics_supervisor(sh: Arc<Shared>) {
+    while !sh.quit.load(Ordering::Relaxed) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| physics_loop(sh.clone())));
+        if run.is_ok() {
+            break;
+        }
+        eprintln!("physics thread stopped after a panic; generate or load a system to continue");
+        *lock_ok(&sh.job) = None;
+        sh.mid_step.store(false, Ordering::Release);
+        sh.failed.store(true, Ordering::Release);
+        // `clear_accum` is raised under the bodies lock when the world is replaced.
+        while !sh.quit.load(Ordering::Relaxed) && !sh.clear_accum.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        sh.failed.store(false, Ordering::Release);
+    }
+}
+
 fn physics_loop(sh: Arc<Shared>) {
     let mut pacer = PhysicsPacer::new();
     while !sh.quit.load(Ordering::Relaxed) {
@@ -298,7 +339,7 @@ fn physics_loop(sh: Arc<Shared>) {
 
         seed_timeline(&sh);
         let mut worked = serve_orbit_request(&sh);
-        if !paused && pacer.step_is_due() {
+        if !paused && pacer.step_is_due(&sh) {
             pacer.run_slice(&sh);
             worked = true;
         }
@@ -657,12 +698,16 @@ struct SimState {
     replay: Option<Replay>,
     /// The snapshot being shown, as an owned `Bodies` swapped in while rendering.
     replay_cache: Option<(u64, Bodies)>,
+    /// True while the live bodies sit in `replay_cache` (between `enter_replay`
+    /// and `leave_replay`); the cache must not be dropped then.
+    replay_swapped: bool,
     /// Frame id and zoom the replay orbit lines were last built for.
     replay_orbit: (u64, f32),
     last_orbit_update: Instant,
     last_orbit_zoom: f32,
     last_orbit_cam: [f64; 2],
     last_orbit_events: u64,
+    last_hz: bool,
     orbit_posted: u64,
     orbit_applied: u64,
     selected: Option<u64>,
@@ -736,7 +781,7 @@ impl SimState {
         let replaying = self.enter_replay(shared, &mut b, frame_dt);
         self.t_wait_accum += t_wait0.elapsed().as_secs_f64() * 1e6;
 
-        let new_title = self.update_fps_title(&b);
+        let new_title = self.update_fps_title(&b, shared.failed.load(Ordering::Acquire));
 
         let selected_idx = self.selected.and_then(|id| b.index_of_id(id));
         self.update_follow(&b, selected_idx, frame_dt);
@@ -760,6 +805,9 @@ impl SimState {
         // camera, selection and display options stay.
         if replaying.is_some() {
             actions = actions.view_only();
+        }
+        if actions.changes_bodies() {
+            shared.settle_step(&mut b);
         }
         self.apply_actions(actions, ui_state, vp, &mut b, shared);
         let trail_snapshot = self.trail.snapshot(&b, self.follow_smooth);
@@ -861,11 +909,13 @@ impl SimState {
             orbit_buf_valid: false,
             replay: None,
             replay_cache: None,
+            replay_swapped: false,
             replay_orbit: (u64::MAX, 0.0),
             last_orbit_update: Instant::now(),
             last_orbit_zoom: 0.7,
             last_orbit_cam: [0.0; 2],
             last_orbit_events: 0,
+            last_hz: false,
             orbit_posted: 0,
             orbit_applied: 0,
             selected: None,
@@ -906,7 +956,7 @@ impl SimState {
     /// `Random` uses it as the RNG seed, `Solar` as the planet-phase seed.
     /// Count a frame and, twice a second, refresh fps / steps-per-second.
     /// Returns the new window title when the numbers were refreshed.
-    fn update_fps_title(&mut self, b: &Bodies) -> Option<String> {
+    fn update_fps_title(&mut self, b: &Bodies, physics_failed: bool) -> Option<String> {
         let mut new_title = None;
         self.fps_frames += 1;
         let win = self.fps_timer.elapsed().as_secs_f32();
@@ -918,11 +968,17 @@ impl SimState {
             self.steps_at_fps = steps;
             self.fps_frames = 0;
             self.fps_timer = Instant::now();
+            let stopped = if physics_failed {
+                " — PHYSICS STOPPED: generate or load a system"
+            } else {
+                ""
+            };
             new_title = Some(format!(
-                "N-Body Rust — {} — {:.0} fps — {:.2}×",
+                "N-Body Rust — {} — {:.0} fps — {:.2}×{}",
                 primary_label(b),
                 self.fps,
-                self.speed
+                self.speed,
+                stopped
             ));
         }
 
@@ -1071,7 +1127,10 @@ impl SimState {
             .wrapping_add(b.stats.impacts)
             .wrapping_add(b.stats.tidal)
             .wrapping_add(b.stats.escaped);
-        let orbits_visible = self.show_orbits || self.show_debris_orbits;
+        let hz_now = physics::hz_rings();
+        let hz_changed = hz_now != self.last_hz;
+        self.last_hz = hz_now;
+        let orbits_visible = self.show_orbits || self.show_debris_orbits || hz_now;
         let zoom_ratio = self.zoom / self.last_orbit_zoom.max(1e-6);
         let zoom_changed = (zoom_ratio - 1.0).abs() > 0.3;
         let span_x = 0.35 * vp[0] as f64 / self.zoom as f64;
@@ -1083,6 +1142,7 @@ impl SimState {
             && self.last_orbit_update.elapsed().as_millis() > ORBIT_REFRESH_MS;
         if replaying.is_none()
             && (!self.orbit_buf_valid
+            || hz_changed
             || (orbits_visible
                 && (zoom_changed || cam_moved || events_changed || stale)))
         {
@@ -1255,7 +1315,11 @@ impl SimState {
     /// Leave replay and return to the live simulation.
     fn exit_replay(&mut self) {
         if self.replay.take().is_some() {
-            self.replay_cache = None;
+            // The live bodies may be inside the cache this frame; `leave_replay`
+            // swaps them back and drops the cache.
+            if !self.replay_swapped {
+                self.replay_cache = None;
+            }
             self.orbit_buf_valid = false;
             self.trail.clear();
         }
@@ -1290,12 +1354,18 @@ impl SimState {
         }
         let cache = self.replay_cache.as_mut()?;
         std::mem::swap(b, &mut cache.1);
+        self.replay_swapped = true;
         Some(id)
     }
 
     fn leave_replay(&mut self, b: &mut Bodies) {
         if let Some(cache) = self.replay_cache.as_mut() {
             std::mem::swap(b, &mut cache.1);
+        }
+        self.replay_swapped = false;
+        // The replay may have been ended while it was shown (the Live button).
+        if self.replay.is_none() {
+            self.replay_cache = None;
         }
     }
 
@@ -1377,6 +1447,9 @@ impl SimState {
         if let Some(slug) = self.last_loaded_preset.clone() {
             if let Some(preset) = physics::load_preset_by_slug(&slug) {
                 self.seed = self.seed.wrapping_add(1);
+                lock_ok(&shared.history).clear();
+                self.replay = None;
+                self.replay_cache = None;
                 physics::spawn_preset_with_seed(b, &preset, self.seed);
                 physics::set_evolution_rate(b, self.evolution_rate);
                 b.sn_kicks = self.sn_kicks;
@@ -1447,9 +1520,6 @@ impl SimState {
     /// The file is read and parsed *before* the bodies lock is taken, so a slow
     /// disk never stalls the physics thread. The caller must NOT hold the lock.
     fn load_game(&mut self, name: &str, ui_state: &mut UiState, shared: &Shared) {
-        lock_ok(&shared.history).clear();
-        self.replay = None;
-        self.replay_cache = None;
         // Only a plain save name may reach the file system.
         if physics::sanitize_save_name(name).as_deref() != Some(name) {
             ui_state.set_save_msg("Load failed: invalid save name.", false);
@@ -1468,6 +1538,11 @@ impl SimState {
             ui_state.set_save_msg(format!("Load failed: {e}"), false);
             return;
         }
+        // The load worked, so the old timeline is over. Cleared under the bodies
+        // lock, so the physics thread cannot record the old world after it.
+        lock_ok(&shared.history).clear();
+        self.replay = None;
+        self.replay_cache = None;
         let a = &file.app;
         self.cam = a.cam;
         self.cam_z = a.cam_z;
@@ -2205,7 +2280,8 @@ impl App {
             NamedKey::Delete | NamedKey::Backspace => self.delete_selected(),
             NamedKey::F5 => {
                 {
-                    let b = self.shared.lock_for_render();
+                    let mut b = self.shared.lock_for_render();
+                    self.shared.settle_step(&mut b);
                     self.sim.save_game(&b, "quicksave", &mut self.ui);
                 }
                 self.flush_io();
@@ -2260,6 +2336,8 @@ impl App {
             "n" | "p" => self.cycle_selection_key(if c == "n" { 1 } else { -1 }),
             "." if self.sim.replay.is_none() => {
                 let mut b = self.shared.lock_for_render();
+                // Finish the paused step first, so this one starts on a whole state.
+                self.shared.settle_step(&mut b);
                 physics::advance(&mut b, physics::DT);
             }
             _ => self.toggle_window_key(c),
@@ -2279,6 +2357,9 @@ impl App {
             "h" | "?" | "/" => self.ui.show_help = !self.ui.show_help,
             "g" => self.ui.diag.visible = !self.ui.diag.visible,
             "j" => self.ui.show_timeline = !self.ui.show_timeline,
+            "x" => self.ui.elem.visible = !self.ui.elem.visible,
+            "z" => physics::set_hz_rings(!physics::hz_rings()),
+            "i" => self.ui.light.visible = !self.ui.light.visible,
             _ => {}
         }
     }
@@ -2297,7 +2378,12 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
+        // A replay is view-only, and its selection ids belong to the snapshot.
+        if self.sim.replay.is_some() {
+            return;
+        }
         let mut b = self.shared.lock_for_render();
+        self.shared.settle_step(&mut b);
         if let Some(i) = self.sim.selected.and_then(|id| b.index_of_id(id)) {
             physics::delete_body(&mut b, i);
             self.sim.selected = None;
@@ -2520,7 +2606,7 @@ impl ApplicationHandler for App {
             let sh = self.shared.clone();
             self.phys = std::thread::Builder::new()
                 .name("physics".into())
-                .spawn(move || physics_loop(sh))
+                .spawn(move || physics_supervisor(sh))
                 .ok();
         }
     }

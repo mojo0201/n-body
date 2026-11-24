@@ -356,15 +356,16 @@ pub fn default_age_gyr(kind: BodyKind) -> f64 {
     }
 }
 
-/// White dwarf luminosity in L☉ under the Mestel cooling law.
+/// White dwarf luminosity in L☉.
 ///
-/// A degenerate core with no nuclear source radiates its stored
-/// thermal energy, giving L ∝ M · (t + t₀)^(-α), with α ≈ 1.4 for
-/// the classic Mestel solution (see `WD_COOL_EXP`). `t₀` smooths the
+/// A degenerate core with no nuclear source radiates its stored thermal energy,
+/// giving L ∝ M · t^(-α). The slope is the Mestel 7/5 before 1 Gyr and 0.85
+/// after it (see `WD_COOL_EXP_LATE`); the two meet at 1 Gyr. `t₀` smooths the
 /// initial hot, non-degenerate phase.
 pub fn wd_luminosity(m: f64, cooling_age_gyr: f64) -> f64 {
     let t = cooling_age_gyr.max(0.0) + WD_COOL_T0_GYR;
-    WD_COOL_L_REF * (m / (0.6 * M_SUN_ME)) * t.powf(-WD_COOL_EXP)
+    let alpha = if t < 1.0 { WD_COOL_EXP_EARLY } else { WD_COOL_EXP_LATE };
+    WD_COOL_L_REF * (m / (0.6 * M_SUN_ME)) * t.powf(-alpha)
 }
 
 /// White dwarf effective temperature in K, from L and the (fixed) WD

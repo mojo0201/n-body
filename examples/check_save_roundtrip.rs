@@ -10,6 +10,7 @@ fn hash(b: &Bodies) -> u64 {
     h ^ (b.events.len() as u64) ^ ((b.dust_fields.len() as u64) << 32)
 }
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     let mut b = Bodies::with_capacity(5000);
     spawn_random_systems(&mut b, 80, 9, 3);
     for _ in 0..300 { advance(&mut b, DT); }

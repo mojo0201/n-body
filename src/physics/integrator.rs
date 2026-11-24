@@ -394,19 +394,10 @@ impl BlockJob {
             b.z[i] += b.vz[i] * dtf;
         }
 
-        // Active set for this sub-tick: bodies whose rung r has
-        // `trailing_zeros(tick) >= kmax - r`, i.e. the union of the cached
-        // buckets for rungs r >= r_min.
-        let tz = tick.trailing_zeros() as usize;
-        let r_min = (kmax as usize).saturating_sub(tz);
-        active.clear();
-        for list in by_rung.iter().take(kmax as usize + 1).skip(r_min) {
-            active.extend_from_slice(list);
-        }
-
-        // A previous sub-tick's `collision_pass` may have compacted `b`,
-        // which remaps every index. Rebuild the tree and rung lists so
-        // they match the new indexing.
+        // The body count changes when a previous sub-tick's `collision_pass`
+        // compacted `b`, or when the user edited the system while this step was
+        // paused. Either remaps every index, so rebuild the tree and the rung
+        // lists before the active set is taken from them.
         if b.len() != tree_len {
             tree = if b.len() >= BH_THRESHOLD {
                 Some(Tree::build(&*b))
@@ -415,6 +406,16 @@ impl BlockJob {
             };
             tree_len = b.len();
             rebuild_rung_lists(&*b, kmax, &mut by_rung, &mut bucket_pos, &mut hot);
+        }
+
+        // Active set for this sub-tick: bodies whose rung r has
+        // `trailing_zeros(tick) >= kmax - r`, i.e. the union of the cached
+        // buckets for rungs r >= r_min.
+        let tz = tick.trailing_zeros() as usize;
+        let r_min = (kmax as usize).saturating_sub(tz);
+        active.clear();
+        for list in by_rung.iter().take(kmax as usize + 1).skip(r_min) {
+            active.extend_from_slice(list);
         }
 
         // Force evaluation for the active subset only. Cold bodies are

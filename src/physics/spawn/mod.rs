@@ -1072,9 +1072,15 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> 
     }
 
     recenter_com(b);
+    if early_evolution() {
+        evolve_early(b);
+        recenter_com(b);
+    }
     compute_accel(b);
     rebase_energy(b);
     dust::init_fields(b, None);
+    // Names come last and draw from their own stream, so nothing else changes.
+    names::name_system(b, seed);
     SystemInfo { binary }
 }
 

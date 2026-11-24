@@ -5,6 +5,7 @@ use nbody_rust::history::History;
 use nbody_rust::physics::*;
 
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     let mut b = Bodies::with_capacity(400);
     spawn_system(&mut b, 400, 7);
     let mut h = History::new(8); // tiny cap to exercise eviction

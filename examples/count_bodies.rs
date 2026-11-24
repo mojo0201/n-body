@@ -1,6 +1,7 @@
 //! Body counts of random systems at a given slider value.
 use nbody_rust::physics::*;
 fn main() {
+    nbody_rust::physics::set_early_evolution(false);
     let slider: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let mut ns = Vec::new();
     for seed in 1u128..=60 {

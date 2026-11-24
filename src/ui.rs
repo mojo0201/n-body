@@ -467,6 +467,17 @@ fn count_habitable(b: &Bodies) -> usize {
 /// One point in the diagnostics history. Sampled once per wall-clock second.
 /// Percent values are `None` when they have no meaning (for example the
 /// energy drift above `ENERGY_MAX_N` bodies).
+/// A sample with a simulation time, for the time-series plots.
+pub trait Timed {
+    fn time(&self) -> f64;
+}
+
+impl Timed for DiagSample {
+    fn time(&self) -> f64 {
+        self.t
+    }
+}
+
 pub struct DiagSample {
     pub t: f64,
     pub n: usize,
@@ -478,6 +489,177 @@ pub struct DiagSample {
     pub l_drift: Option<f64>,
     /// Fine time steps used in the last step (close encounters raise this).
     pub nsub: u32,
+}
+
+/// One point of a star's light curve.
+pub struct FluxSample {
+    pub t: f64,
+    pub flux: f64,
+}
+
+impl Timed for FluxSample {
+    fn time(&self) -> f64 {
+        self.t
+    }
+}
+
+const LIGHT_MAX_SAMPLES: usize = 3000;
+
+/// Light curve of the selected star as seen from a chosen direction: one sample
+/// per frame in which simulation time has moved. At high speed the samples are
+/// far apart in time and short transits fall between them.
+pub struct LightCurve {
+    pub visible: bool,
+    pub samples: std::collections::VecDeque<FluxSample>,
+    pub azimuth_deg: f64,
+    pub elevation_deg: f64,
+    star: Option<u64>,
+}
+
+impl LightCurve {
+    pub fn new() -> Self {
+        Self { visible: false, samples: std::collections::VecDeque::new(), azimuth_deg: 0.0, elevation_deg: 0.0, star: None }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.star = None;
+    }
+
+    pub fn track(&mut self, b: &Bodies, selected: Option<u64>, replaying: bool) {
+        if replaying || !self.visible {
+            return;
+        }
+        let star = selected.and_then(|id| b.index_of_id(id)).filter(|&i| b.kind[i] == BodyKind::Star);
+        let star_id = star.map(|i| b.id[i]);
+        if star_id != self.star {
+            self.samples.clear();
+            self.star = star_id;
+        }
+        let Some(s) = star else { return };
+        if self.samples.back().is_some_and(|p| b.time < p.t) {
+            self.samples.clear();
+        }
+        if self.samples.back().is_some_and(|p| p.t == b.time) {
+            return; // paused
+        }
+        let obs = ph::observer_dir(self.azimuth_deg, self.elevation_deg);
+        self.samples.push_back(FluxSample { t: b.time, flux: ph::visible_fraction(b, s, obs) });
+        while self.samples.len() > LIGHT_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+}
+
+/// One point in the orbit-elements history of the selected body.
+pub struct ElemSample {
+    pub t: f64,
+    /// Semi-major axis in AU; `None` while the orbit is unbound.
+    pub a_au: Option<f64>,
+    pub ecc: f64,
+    /// Inclination to the reference plane, degrees.
+    pub inc_deg: f64,
+    /// Periapsis distance in AU; `None` while unbound.
+    pub peri_au: Option<f64>,
+}
+
+impl Timed for ElemSample {
+    fn time(&self) -> f64 {
+        self.t
+    }
+}
+
+/// How the selected body's osculating orbit about its parent changes with
+/// time. Sampled in the UI from the live bodies, so it costs nothing in the
+/// physics step. Starts over when the selection or the parent changes.
+pub struct ElemHistory {
+    pub visible: bool,
+    pub samples: std::collections::VecDeque<ElemSample>,
+    body: Option<u64>,
+    parent: Option<u64>,
+    last_sample: Instant,
+}
+
+const ELEM_MAX_SAMPLES: usize = 600;
+const ELEM_SAMPLE_EVERY: Duration = Duration::from_millis(250);
+
+impl ElemHistory {
+    pub fn new() -> Self {
+        Self {
+            visible: false,
+            samples: std::collections::VecDeque::new(),
+            body: None,
+            parent: None,
+            last_sample: Instant::now(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+        self.body = None;
+        self.parent = None;
+    }
+
+    /// Take a sample of `selected` if the window is open and time has moved on.
+    /// Does nothing while a timeline replay is shown, since `b` is then a
+    /// recorded snapshot.
+    pub fn track(&mut self, b: &Bodies, selected: Option<u64>, replaying: bool) {
+        if replaying {
+            return;
+        }
+        if selected != self.body {
+            self.clear();
+            self.body = selected;
+        }
+        let Some(i) = selected.and_then(|id| b.index_of_id(id)) else {
+            return;
+        };
+        if !self.visible || self.last_sample.elapsed() < ELEM_SAMPLE_EVERY {
+            return;
+        }
+        self.last_sample = Instant::now();
+        let Some(par) = parent_of(b, i) else {
+            self.samples.clear();
+            self.parent = None;
+            return;
+        };
+        let parent_id = Some(b.id[par]);
+        if self.parent != parent_id || self.samples.back().is_some_and(|s| b.time < s.t) {
+            // Captured by another body, or time went backwards (a new system).
+            self.samples.clear();
+            self.parent = parent_id;
+        }
+        if self.samples.back().is_some_and(|s| s.t == b.time) {
+            return; // paused
+        }
+        let au = ph::au_in_gm();
+        let o = ph::orbit_info(b, i, par);
+        self.samples.push_back(ElemSample {
+            t: b.time,
+            a_au: o.bound.then(|| o.semi_major / au),
+            ecc: o.ecc,
+            inc_deg: o.inc.to_degrees(),
+            peri_au: o.bound.then(|| o.peri / au),
+        });
+        while self.samples.len() > ELEM_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    fn to_csv(&self) -> String {
+        let mut out = String::from("time,a_au,ecc,inc_deg,peri_au\n");
+        for s in &self.samples {
+            out += &format!(
+                "{},{},{},{},{}\n",
+                s.t,
+                s.a_au.map_or(String::new(), |v| v.to_string()),
+                s.ecc,
+                s.inc_deg,
+                s.peri_au.map_or(String::new(), |v| v.to_string())
+            );
+        }
+        out
+    }
 }
 
 pub struct DiagHistory {
@@ -678,6 +860,8 @@ pub struct UiState {
     preset_names: Vec<(String, String)>,
     preset_names_time: Instant,
     pub diag: DiagHistory,
+    pub elem: ElemHistory,
+    pub light: LightCurve,
     pub pending_count: usize,
     /// Seed text in base62 (6 chars max). Parse with `commit_seed_text`.
     pub pending_seed_text: String,
@@ -799,6 +983,8 @@ impl UiState {
         let visible = self.diag.visible;
         self.diag = DiagHistory::new();
         self.diag.visible = visible;
+        self.elem.clear();
+        self.light.clear();
     }
 
     pub fn new(body_count: usize, seed: u128) -> Self {
@@ -834,6 +1020,8 @@ impl UiState {
             preset_names: Vec::new(),
             preset_names_time: Instant::now() - Duration::from_secs(60),
             diag: DiagHistory::new(),
+            elem: ElemHistory::new(),
+            light: LightCurve::new(),
             pending_count: body_count,
             pending_seed_text: ph::seed_to_base62(seed),
             seed_text_invalid: false,
@@ -1015,6 +1203,12 @@ pub struct Actions {
 }
 
 impl Actions {
+    /// Whether applying these actions edits, steps or saves the bodies, so the
+    /// physics step in flight must be finished first.
+    pub fn changes_bodies(&self) -> bool {
+        self.edit.is_some() || self.multi_edit.is_some() || self.step_once || self.save.is_some()
+    }
+
     /// Only the actions that change how the scene is viewed, not the
     /// simulation. Used while a timeline replay is showing.
     pub fn view_only(self) -> Self {
@@ -1404,6 +1598,15 @@ pub fn draw(root: &mut egui::Ui, ui_state: &mut UiState, view: &ViewInfo, b: &Bo
     }
     if ui_state.diag.visible {
         diag_window(ctx, ui_state, view, b, &mut act);
+    }
+    let replaying = view.timeline.as_ref().is_some_and(|t| t.t_now.is_some());
+    ui_state.elem.track(b, view.selected, replaying);
+    if ui_state.elem.visible {
+        elements_window(ctx, ui_state, view, b);
+    }
+    ui_state.light.track(b, view.selected, replaying);
+    if ui_state.light.visible {
+        light_curve_window(ctx, ui_state, view, b);
     }
     // Selection window only shows if the selected body still exists. This
     // is the "the selection body merged away last frame" case: `view.selected`
@@ -2111,6 +2314,16 @@ fn section_view(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &mut 
             st.diag.visible = diag_vis;
             act.diag_visible = Some(diag_vis);
         }
+        ui.checkbox(&mut st.elem.visible, "orbit elements (X)");
+        ui.checkbox(&mut st.light.visible, "light curve (I)");
+        let mut hz = ph::hz_rings();
+        if ui
+            .checkbox(&mut hz, "habitable zone (Z)")
+            .on_hover_text("draws each star's habitable zone as a green band; the limits follow its luminosity and colour")
+            .changed()
+        {
+            ph::set_hz_rings(hz);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.toggle_value(&mut st.show_list, "Body list (B)");
             ui.toggle_value(&mut st.show_systems, "System list (Y)");
@@ -2214,6 +2427,14 @@ fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
             .changed()
         {
             ph::set_gas_disk(disk);
+        }
+        let mut early = ph::early_evolution();
+        if ui
+            .checkbox(&mut early, "early evolution on generate")
+            .on_hover_text("new systems first run a time-compressed version of their youth: planets migrate in a fading gas disk, then some packed giant pairs scatter once the gas is gone, and crowded inner planets can merge. Costs up to ~2 s per generate; belts and dust are not part of it.")
+            .changed()
+        {
+            ph::set_early_evolution(early);
         }
         let mut accel = !ph::physical_mode();
         if ui
@@ -4463,6 +4684,9 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                     ("K", "saves window"),
                     ("F5 / F9", "quick save / quick load"),
                     ("G", "diagnostics"),
+                    ("X", "orbit elements of the selected body"),
+                    ("I", "light curve of the selected star (transits, eclipses)"),
+                    ("Z", "habitable zone bands"),
                     ("V", "vsync"),
                     ("`", "show / hide the control panel"),
                     ("Delete", "delete the selected body"),
@@ -4544,23 +4768,22 @@ struct PlotSpec<'a> {
 
 /// Draw one line plot of `get` over the sample history. Hover shows the
 /// time and value of the nearest sample.
-fn plot_series(
+fn plot_series<S: Timed>(
     ui: &mut egui::Ui,
-    diag: &DiagHistory,
+    samples: &std::collections::VecDeque<S>,
     si: bool,
     spec: &PlotSpec,
-    get: impl Fn(&DiagSample) -> Option<f64>,
+    get: impl Fn(&S) -> Option<f64>,
 ) {
     let (rect, painter, resp) = plot_rect(ui, 80.0);
     draw_axes(rect, &painter);
 
-    let vals: Vec<Option<f64>> = diag
-        .samples
+    let vals: Vec<Option<f64>> = samples
         .iter()
         .map(|s| get(s).filter(|v| v.is_finite()))
         .collect();
     let Some((lo, hi)) = finite_range(&vals) else {
-        let msg = if diag.samples.is_empty() { "collecting…" } else { spec.empty };
+        let msg = if samples.is_empty() { "collecting…" } else { spec.empty };
         painter.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::monospace(10.0), theme().colors.dim());
         return;
     };
@@ -4571,8 +4794,8 @@ fn plot_series(
     } else {
         padded_range(lo, hi)
     };
-    let t0 = diag.samples.front().map(|s| s.t).unwrap_or(0.0);
-    let t1 = diag.samples.back().map(|s| s.t).unwrap_or(0.0);
+    let t0 = samples.front().map(|s| s.time()).unwrap_or(0.0);
+    let t1 = samples.back().map(|s| s.time()).unwrap_or(0.0);
     let frame = PlotFrame { rect, t0, t_span: (t1 - t0).max(1e-9), y0, y1 };
 
     if spec.symmetric {
@@ -4585,10 +4808,10 @@ fn plot_series(
 
     let current = vals.iter().rev().flatten().next().copied().unwrap_or(0.0);
     let line_col = if current.abs() > spec.warn_at { theme().colors.warn() } else { spec.color };
-    draw_series_line(&painter, &frame, diag, &vals, line_col);
+    draw_series_line(&painter, &frame, samples, &vals, line_col);
     draw_series_labels(&painter, &frame, spec, si, current, t1);
     if let Some(pos) = resp.hover_pos() {
-        draw_series_hover(&painter, &frame, diag, &vals, spec, si, pos);
+        draw_series_hover(&painter, &frame, samples, &vals, spec, si, pos);
     }
 }
 
@@ -4624,18 +4847,18 @@ fn finite_range(vals: &[Option<f64>]) -> Option<(f64, f64)> {
 }
 
 /// The line through the samples. A gap (value not available) breaks it.
-fn draw_series_line(
+fn draw_series_line<S: Timed>(
     painter: &egui::Painter,
     frame: &PlotFrame,
-    diag: &DiagHistory,
+    samples: &std::collections::VecDeque<S>,
     vals: &[Option<f64>],
     color: Color32,
 ) {
     let mut prev: Option<egui::Pos2> = None;
-    for (s, v) in diag.samples.iter().zip(vals.iter()) {
+    for (s, v) in samples.iter().zip(vals.iter()) {
         match v {
             Some(v) => {
-                let p = frame.map(s.t, *v);
+                let p = frame.map(s.time(), *v);
                 if let Some(q) = prev {
                     painter.line_segment([q, p], Stroke::new(1.0_f32, color));
                 }
@@ -4683,10 +4906,10 @@ fn draw_series_labels(
 }
 
 /// Cursor line, marker and readout for the sample nearest the pointer.
-fn draw_series_hover(
+fn draw_series_hover<S: Timed>(
     painter: &egui::Painter,
     frame: &PlotFrame,
-    diag: &DiagHistory,
+    samples: &std::collections::VecDeque<S>,
     vals: &[Option<f64>],
     spec: &PlotSpec,
     si: bool,
@@ -4695,15 +4918,15 @@ fn draw_series_hover(
     let rect = frame.rect;
     let fx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
     let th = frame.t0 + fx * frame.t_span;
-    let nearest = diag.samples.iter().enumerate().min_by(|p, q| {
-        (p.1.t - th)
+    let nearest = samples.iter().enumerate().min_by(|p, q| {
+        (p.1.time() - th)
             .abs()
-            .partial_cmp(&(q.1.t - th).abs())
+            .partial_cmp(&(q.1.time() - th).abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let Some((k, s)) = nearest else { return };
     let Some(v) = vals[k] else { return };
-    let p = frame.map(s.t, v);
+    let p = frame.map(s.time(), v);
     painter.line_segment(
         [egui::pos2(p.x, rect.top()), egui::pos2(p.x, rect.bottom())],
         Stroke::new(1.0_f32, Color32::from_gray(90)),
@@ -4712,7 +4935,7 @@ fn draw_series_hover(
     painter.text(
         rect.right_top() + egui::vec2(-4.0, 2.0),
         Align2::RIGHT_TOP,
-        format!("{}  {}", fmt_time(s.t, si), (spec.fmt)(v)),
+        format!("{}  {}", fmt_time(s.time(), si), (spec.fmt)(v)),
         FontId::monospace(10.0),
         Color32::WHITE,
     );
@@ -4789,6 +5012,135 @@ fn plot_ecc(ui: &mut egui::Ui, diag: &DiagHistory) {
             FontId::monospace(10.0),
             Color32::WHITE,
         );
+    }
+}
+
+/// Orbit elements of the selected body about its parent, over time.
+fn light_curve_window(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
+    let si = st.units_si;
+    let mut open = st.light.visible;
+    let star = view.selected.and_then(|id| b.index_of_id(id)).filter(|&i| b.kind[i] == BodyKind::Star);
+    egui::Window::new("Light curve")
+        .open(&mut open)
+        .default_pos([640.0, 520.0])
+        .default_width(340.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            let Some(s) = star else {
+                ui.label(RichText::new("Select a star (click it, or N / P).").color(theme().colors.dim()));
+                return;
+            };
+            ui.label(RichText::new(format!("{} as seen from far away", ph::tag(b, s))).strong());
+            ui.add(egui::Slider::new(&mut st.light.azimuth_deg, 0.0..=360.0).text("azimuth °"));
+            ui.add(egui::Slider::new(&mut st.light.elevation_deg, -90.0..=90.0).text("elevation °"))
+                .on_hover_text("0° looks along the reference plane, where orbits are edge-on and planets transit; 90° looks down on it and nothing transits");
+            let dip = st.light.samples.iter().map(|p| 1.0 - p.flux).fold(0.0, f64::max);
+            ui.label(format!("deepest dip so far: {:.4} %", dip * 100.0));
+            ui.horizontal(|ui| {
+                if ui.button("clear").clicked() {
+                    st.light.samples.clear();
+                }
+            });
+            ui.label(RichText::new("One sample per frame; at high speed short transits fall between samples.").small().color(theme().colors.dim()));
+            let spec = PlotSpec {
+                title: "relative brightness",
+                empty: "no data",
+                color: theme().colors.accent(),
+                warn_at: f64::INFINITY,
+                symmetric: false,
+                fmt: |v| format!("{v:.5}"),
+            };
+            plot_series(ui, &st.light.samples, si, &spec, |p| Some(p.flux));
+        });
+    st.light.visible = open;
+}
+
+fn elements_window(ctx: &egui::Context, st: &mut UiState, view: &ViewInfo, b: &Bodies) {
+    let si = st.units_si;
+    let mut open = st.elem.visible;
+    let selected = view.selected.and_then(|id| b.index_of_id(id));
+    egui::Window::new("Orbit elements")
+        .open(&mut open)
+        .default_pos([640.0, 320.0])
+        .default_width(340.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            let Some(i) = selected else {
+                ui.label(RichText::new("Select a body (click it, or N / P).").color(theme().colors.dim()));
+                return;
+            };
+            let Some(par) = parent_of(b, i) else {
+                ui.label(format!("{} has no parent body to orbit.", ph::tag(b, i)));
+                return;
+            };
+            ui.label(RichText::new(format!("{}  around  {}", ph::tag(b, i), ph::tag(b, par))).strong());
+            elements_summary(ui, &st.elem);
+            ui.horizontal(|ui| {
+                if ui.button("clear").clicked() {
+                    st.elem.samples.clear();
+                }
+                if ui.button("copy CSV").on_hover_text("copy the history to the clipboard").clicked() {
+                    ui.ctx().copy_text(st.elem.to_csv());
+                }
+            });
+            ui.separator();
+            elements_plots(ui, &st.elem, si);
+        });
+    st.elem.visible = open;
+}
+
+/// Latest elements as text, with the range seen so far.
+fn elements_summary(ui: &mut egui::Ui, elem: &ElemHistory) {
+    let Some(last) = elem.samples.back() else {
+        ui.label(RichText::new("collecting… (the simulation must be running)").color(theme().colors.dim()));
+        return;
+    };
+    let range = |f: fn(&ElemSample) -> f64| -> (f64, f64) {
+        elem.samples.iter().map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)))
+    };
+    let (e_lo, e_hi) = range(|s| s.ecc);
+    let (i_lo, i_hi) = range(|s| s.inc_deg);
+    egui::Grid::new("elem_summary").num_columns(2).spacing([14.0, 2.0]).show(ui, |ui| {
+        ui.label("semi-major axis");
+        ui.label(RichText::new(last.a_au.map_or("unbound".to_string(), fmt_au)).monospace());
+        ui.end_row();
+        ui.label("periapsis");
+        ui.label(RichText::new(last.peri_au.map_or("-".to_string(), fmt_au)).monospace());
+        ui.end_row();
+        ui.label("eccentricity");
+        ui.label(RichText::new(format!("{:.3}   (seen {:.3} to {:.3})", last.ecc, e_lo, e_hi)).monospace());
+        ui.end_row();
+        ui.label("inclination");
+        ui.label(RichText::new(format!("{:.2}°   (seen {:.2}° to {:.2}°)", last.inc_deg, i_lo, i_hi)).monospace());
+        ui.end_row();
+    });
+}
+
+fn fmt_au(v: f64) -> String {
+    if v >= 0.05 {
+        format!("{v:.3} AU")
+    } else {
+        format!("{:.2} Gm", v * ph::au_in_gm())
+    }
+}
+
+fn elements_plots(ui: &mut egui::Ui, elem: &ElemHistory, si: bool) {
+    let accent = theme().colors.accent();
+    let plots: [(&str, fn(f64) -> String, bool, fn(&ElemSample) -> Option<f64>); 3] = [
+        ("semi-major axis", fmt_au, false, |s| s.a_au),
+        ("eccentricity", |v| format!("{v:.3}"), false, |s| Some(s.ecc)),
+        ("inclination", |v| format!("{v:.2}°"), false, |s| Some(s.inc_deg)),
+    ];
+    for (title, fmt, symmetric, get) in plots {
+        let spec = PlotSpec {
+            title,
+            empty: "unbound",
+            color: accent,
+            warn_at: f64::INFINITY,
+            symmetric,
+            fmt,
+        };
+        plot_series(ui, &elem.samples, si, &spec, get);
     }
 }
 
@@ -4936,7 +5288,7 @@ fn diag_plots(ui: &mut egui::Ui, d: &DiagHistory, si: bool) {
         ),
     ];
     for (spec, pick) in &plots {
-        plot_series(ui, d, si, spec, pick);
+        plot_series(ui, &d.samples, si, spec, pick);
         ui.add_space(4.0);
     }
     plot_ecc(ui, d);

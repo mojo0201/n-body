@@ -195,6 +195,65 @@ pub fn compute_orbit_segments(
     show_planets: bool,
     show_debris: bool,
 ) -> Vec<([f32; 3], [f32; 3], [u8; 4])> {
+    let mut segs = compute_orbit_segments_inner(b, zoom, show_planets, show_debris);
+    if hz_rings() {
+        habitable_zone_segments(b, zoom, &mut segs);
+    }
+    segs
+}
+
+static HZ_RINGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw each star's habitable zone as a green band (on/off).
+pub fn set_hz_rings(on: bool) {
+    HZ_RINGS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn hz_rings() -> bool {
+    HZ_RINGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Band of circles between the inner and outer habitable-zone radius of every
+/// star (the limits come from `habitable_zone_of`: luminosity and colour).
+fn habitable_zone_segments(b: &Bodies, zoom: f64, segs: &mut Vec<([f32; 3], [f32; 3], [u8; 4])>) {
+    const RINGS: usize = 7;
+    const SEGS: usize = 120;
+    let au = au_in_gm();
+    for i in 0..b.len() {
+        if b.dead[i] || b.kind[i] != BodyKind::Star {
+            continue;
+        }
+        let (r0, r1) = habitable_zone_of(b, i);
+        if !(r0.is_finite() && r1.is_finite()) || r1 <= r0 {
+            continue;
+        }
+        let (r0, r1) = (r0 * au, r1 * au);
+        if r1 * zoom < 3.0 {
+            continue; // smaller than a few pixels
+        }
+        for k in 0..RINGS {
+            let f = k as f64 / (RINGS - 1) as f64;
+            let r = r0 + (r1 - r0) * f;
+            let edge = k == 0 || k == RINGS - 1;
+            let col = [60u8, 210, 90, if edge { 150 } else { 45 }];
+            let pt = |a: f64| {
+                [(b.x[i] + r * a.cos()) as f32, (b.y[i] + r * a.sin()) as f32, b.z[i] as f32]
+            };
+            let mut prev = pt(0.0);
+            for s in 1..=SEGS {
+                let cur = pt(std::f64::consts::TAU * s as f64 / SEGS as f64);
+                segs.push((prev, cur, col));
+                prev = cur;
+            }
+        }
+    }
+}
+
+fn compute_orbit_segments_inner(
+    b: &Bodies,
+    zoom: f64,
+    show_planets: bool,
+    show_debris: bool,
+) -> Vec<([f32; 3], [f32; 3], [u8; 4])> {
     if !show_planets && !show_debris {
         return Vec::new();
     }
