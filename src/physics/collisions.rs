@@ -944,6 +944,24 @@ pub(super) fn merge(b: &mut Bodies, i: usize, j: usize) -> usize {
 /// 5. Anything faster than the merge threshold falls through to the
 ///    Q*_RD-based disruption model, spawning fragments plus (optionally)
 ///    a circumplanetary disk.
+/// Both bodies orbit the same planet-class parent inside their Roche limit,
+/// where tides tear apart anything that sticks: collisions there bounce rather
+/// than accrete, which is what lets a ring persist.
+/// Relative speed, in pair escape speeds, below which Roche-zone rubble bounces.
+const ROCHE_BOUNCE_VRATIO: f64 = 200.0;
+
+pub(super) fn inside_common_roche(b: &Bodies, i: usize, j: usize) -> bool {
+    let (Some(Some(p)), Some(Some(q))) = (b.parent_cache.get(i).copied(), b.parent_cache.get(j).copied()) else {
+        return false;
+    };
+    if p != q || p >= b.len() || is_host_kind(b.kind[p]) {
+        return false;
+    }
+    let (dx, dy, dz) = (b.x[i] - b.x[p], b.y[i] - b.y[p], b.z[i] - b.z[p]);
+    let d = (dx * dx + dy * dy + dz * dz).sqrt();
+    d < roche_limit(b, i, p).max(roche_limit(b, j, p))
+}
+
 pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn>) {
     if b.kind[i] != BodyKind::Planet || b.kind[j] != BodyKind::Planet {
         merge(b, i, j);
@@ -958,11 +976,18 @@ pub(super) fn collide(b: &mut Bodies, i: usize, j: usize, spawns: &mut Vec<Spawn
     let (big, small) = if b.m[i] >= b.m[j] { (i, j) } else { (j, i) };
 
     if b.origin[i].is_rubble() && b.origin[j].is_rubble() {
+        // Inside a planet's Roche limit nothing sticks, and the tiny escape
+        // speeds of ring-sized bodies would make even the gentle shear of a
+        // ring look like a catastrophic impact: bounce instead.
+        if ratio < ROCHE_BOUNCE_VRATIO && inside_common_roche(b, i, j) {
+            rubble_bounce(b, i, j, rr);
+            return;
+        }
         if ratio < RUBBLE_COALESCE_VRATIO {
             merge(b, i, j);
             b.stats.coalesces += 1;
             return;
-        } else if ratio < RUBBLE_BOUNCE_VRATIO {
+        } else if ratio < RUBBLE_BOUNCE_VRATIO.max(RUBBLE_COALESCE_VRATIO) {
             rubble_bounce(b, i, j, rr);
             return;
         }

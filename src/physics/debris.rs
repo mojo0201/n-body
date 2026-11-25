@@ -34,7 +34,8 @@ pub(super) fn coalesce_debris(b: &mut Bodies) {
     // doesn't resume a stale capture streak when it re-enters.
     reset_rubble_counters(b, |i| cands.position(i).is_none());
 
-    let (pairs, in_capture) = find_capture_pairs(b, &hosts, &cands);
+    let (mut pairs, in_capture) = find_capture_pairs(b, &hosts, &cands);
+    pairs.retain(|&(i, j)| !inside_common_roche(b, i, j));
     advance_capture_streaks(b, &cands.eligible, &in_capture);
     if pairs.is_empty() {
         return;
@@ -380,22 +381,111 @@ pub(super) fn disrupt(b: &mut Bodies, i: usize, p: usize) -> bool {
     let l_before = l_orb(b, i) + b.spin[i];
     let text = format!("{} torn apart by {}", tag(b, i), tag(b, p));
 
+    // A planet-class primary also keeps part of the debris as a ring (below).
+    let ring_frac = if is_host_kind(b.kind[p]) { 0.0 } else { RING_MASS_FRAC };
+    let n_ring = if ring_frac > 0.0 { RING_PARTICLES.min(room(b, n)) } else { 0 };
+    let ring_frac = if n_ring > 0 { ring_frac } else { 0.0 };
+
     let axes = tidal_axes(b, i, p);
     // Draw fragment mass weights first so the geometry (fragment
     // spacing, radii) can be sized to the largest fragment.
-    let (ms, rmax) = fragment_masses(b, mi, n);
+    let (ms, rmax) = fragment_masses(b, mi * (1.0 - ring_frac), n);
     let origin = (b.x[i], b.y[i], b.z[i]);
     let bvel = (b.vx[i], b.vy[i], b.vz[i]);
     let prim_r = b.contact_r(p);
 
     let pieces = build_fragments(b, i, p, &axes, &ms, rmax);
+    let ring = if n_ring > 0 { Some(plan_ring(b, i, p, mi * ring_frac, n_ring)) } else { None };
+    let l_ring: f64 = ring.as_ref().map_or(0.0, |r| r.iter().map(|s| s.m * (s.x * s.vy - s.y * s.vx)).sum());
     b.dead[i] = true;
-    spawn_fragments(b, pieces, bvel, l_before);
+    spawn_fragments(b, pieces, bvel, l_before - l_ring);
+    if let Some(ring) = ring {
+        add_ring_particles(b, p, ring, bvel);
+        let t = format!("ring formed around {}", tag(b, p));
+        b.log(EventKind::Tidal, t, origin.0, origin.1);
+    }
 
     flash_at(b, origin.0, origin.1, origin.2, (prim_r * 0.5).max(0.05));
     b.stats.tidal += 1;
     b.log(EventKind::Tidal, text, origin.0, origin.1);
     true
+}
+
+/// Share of a body's mass that a planet's tide spreads into a ring, and the
+/// number of ring particles that carry it.
+const RING_MASS_FRAC: f64 = 0.6;
+const RING_PARTICLES: usize = 24;
+
+/// Ring particles for a body `i` disrupted by planet `p`: on circular orbits
+/// about `p`, in the plane of the body's orbit about `p`, at 70–100 % of the
+/// distance at which it broke up (about the Roche limit). Draws 3 numbers per
+/// particle.
+fn plan_ring(b: &mut Bodies, i: usize, p: usize, m_ring: f64, n: usize) -> Vec<Spawn> {
+    let rel = [b.x[i] - b.x[p], b.y[i] - b.y[p], b.z[i] - b.z[p]];
+    let v = [b.vx[i] - b.vx[p], b.vy[i] - b.vy[p], b.vz[i] - b.vz[p]];
+    let d = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt();
+    let mut nrm = [rel[1] * v[2] - rel[2] * v[1], rel[2] * v[0] - rel[0] * v[2], rel[0] * v[1] - rel[1] * v[0]];
+    let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+    if nl > 1e-12 {
+        nrm = [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl];
+    } else {
+        nrm = [0.0, 0.0, 1.0];
+    }
+    let r_min = 1.05 * b.contact_r(p);
+    let class = b.class[i];
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let a = (d * (0.7 + 0.3 * b.rng.next_f64())).max(r_min);
+        let phi = b.rng.next_f64() * std::f64::consts::TAU;
+        let jitter = 0.5 + b.rng.next_f64();
+        let vc = (G * b.m[p] / a).sqrt();
+        let (o, w) = circular_state(nrm, (0.0, 0.0), a, vc, phi);
+        out.push(Spawn {
+            x: b.x[p] + o[0],
+            y: b.y[p] + o[1],
+            z: b.z[p] + o[2],
+            vx: b.vx[p] + w[0],
+            vy: b.vy[p] + w[1],
+            vz: b.vz[p] + w[2],
+            m: m_ring / n as f64 * jitter,
+            kind: BodyKind::Planet,
+            origin: BodyOrigin::TidalDebris,
+            class,
+        });
+    }
+    // Normalise the jittered masses back to the ring total.
+    let tot: f64 = out.iter().map(|s| s.m).sum();
+    for s in out.iter_mut() {
+        s.m *= m_ring / tot;
+    }
+    out
+}
+
+/// Add ring particles, and give the planet the opposite momentum so the
+/// disruption conserves it (the fragments already move with the parent, `bvel`).
+fn add_ring_particles(b: &mut Bodies, p: usize, ring: Vec<Spawn>, bvel: (f64, f64, f64)) {
+    let t_imm = b.time + IMMUNITY_TIME;
+    let (mut dpx, mut dpy, mut dpz) = (0.0, 0.0, 0.0);
+    for s in ring {
+        dpx += s.m * (s.vx - bvel.0);
+        dpy += s.m * (s.vy - bvel.1);
+        dpz += s.m * (s.vz - bvel.2);
+        let k = b.push(s.x, s.y, s.vx, s.vy, s.m, s.kind);
+        b.z[k] = s.z;
+        b.vz[k] = s.vz;
+        b._pz[k] = s.z;
+        b.imm[k] = t_imm;
+        b.origin[k] = BodyOrigin::TidalDebris;
+        b.class[k] = s.class;
+        let rho = draw_density(&mut b.rng, s.class);
+        b.bulk_density[k] = rho;
+        b.r[k] = b.radius_now(k);
+    }
+    b.vx[p] -= dpx / b.m[p];
+    b.vy[p] -= dpy / b.m[p];
+    b.vz[p] -= dpz / b.m[p];
+    // Collisions look the parent up in the cache; new particles need it now.
+    b.refresh_parent_cache();
 }
 
 /// Unit vector from primary to body, and a unit tangent to it.
@@ -557,7 +647,7 @@ fn spawn_fragments(b: &mut Bodies, pieces: Vec<Spawn>, bvel: (f64, f64, f64), l_
 /// positions is unaffected.
 pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     // Fast path — most steps have no comets at all.
-    if !b.origin.iter().any(|&o| o == BodyOrigin::Comet) {
+    if !b.origin.contains(&BodyOrigin::Comet) {
         return;
     }
     let n = b.len();
@@ -579,6 +669,8 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     let mut mass_updates: Vec<(usize, f64)> = Vec::new();
     let mut to_deposit: Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
     let mut to_kill: Vec<usize> = Vec::new();
+    let mut to_split: Vec<usize> = Vec::new();
+    let split_p_unit = COMET_SPLIT_RATE_PER_YR * time_unit_s() / SECONDS_PER_YEAR;
 
     for i in 0..n {
         if b.dead[i] || b.origin[i] != BodyOrigin::Comet {
@@ -635,6 +727,12 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
             to_kill.push(i);
         } else {
             mass_updates.push((i, new_m));
+            // Strong heating cracks nuclei apart now and then (hash of id and
+            // step, so no RNG stream is consumed).
+            let p = split_p_unit * flux.sqrt() * dt;
+            if new_m > 8.0 * COMET_DEAD_MASS && unit_hash(b.id[i], b.stats.steps) < p {
+                to_split.push(i);
+            }
         }
     }
 
@@ -652,6 +750,12 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
         b.comet_grains[i] = b.comet_grains[i].saturating_add(added as u32);
     }
 
+    for i in to_split {
+        if !b.dead[i] && room(b, 0) > 0 {
+            split_comet(b, i);
+        }
+    }
+
     let any_killed = !to_kill.is_empty();
     for i in to_kill {
         let text = format!("{} exhausted its volatiles", tag(b, i));
@@ -662,6 +766,65 @@ pub(super) fn comet_sublimate(b: &mut Bodies, dt: f64) {
     if any_killed {
         b.compact();
     }
+}
+
+/// Splitting rate of an active comet at 1 S⊕, per year (grows as √flux). A
+/// Halley-type comet, active for ~2 yr per orbit, then splits in a few percent of
+/// its returns, in line with the observed few percent per perihelion.
+pub const COMET_SPLIT_RATE_PER_YR: f64 = 0.01;
+const SECONDS_PER_YEAR: f64 = 3.15576e7;
+
+/// Deterministic pseudo-random number in [0, 1) from two integers (splitmix64).
+fn unit_hash(a: u64, b: u64) -> f64 {
+    let mut z = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_add(0xD1B5_4A32_D192_ED03);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Split comet `i` into two nuclei of 20–50 % / the rest of its mass, drifting
+/// apart at a few times the nucleus escape speed. Momentum is conserved. The
+/// fragment inherits composition, and its name gains a letter suffix.
+fn split_comet(b: &mut Bodies, i: usize) {
+    let m = b.m[i];
+    let u1 = unit_hash(b.id[i], b.stats.steps ^ 0xA1);
+    let u2 = unit_hash(b.id[i], b.stats.steps ^ 0xB2);
+    let u3 = unit_hash(b.id[i], b.stats.steps ^ 0xC3);
+    let f = 0.2 + 0.3 * u1;
+    let (mc, mp) = (m * f, m * (1.0 - f));
+    // Random direction on the sphere.
+    let (cz, ph) = (2.0 * u2 - 1.0, std::f64::consts::TAU * u3);
+    let sz = (1.0 - cz * cz).sqrt();
+    let dir = (sz * ph.cos(), sz * ph.sin(), cz);
+    let v_esc = (2.0 * G * m / b.r[i].max(1e-12)).sqrt();
+    let kick = 3.0 * v_esc;
+    mark_energy(b);
+    let sep = 2.0 * b.r[i];
+    let parent_name = b.name[i].clone();
+    let (x, y, z) = (b.x[i], b.y[i], b.z[i]);
+    let (vx, vy, vz) = (b.vx[i], b.vy[i], b.vz[i]);
+    let class = b.class[i];
+    let rho = b.bulk_density[i];
+    b.set_mass(i, mp);
+    b.vx[i] -= dir.0 * kick * mc / m;
+    b.vy[i] -= dir.1 * kick * mc / m;
+    b.vz[i] -= dir.2 * kick * mc / m;
+    let k = b.push(x + dir.0 * sep, y + dir.1 * sep, vx + dir.0 * kick * mp / m, vy + dir.1 * kick * mp / m, mc, BodyKind::Planet);
+    b.z[k] = z + dir.2 * sep;
+    b._pz[k] = b.z[k];
+    b.vz[k] = vz + dir.2 * kick * mp / m;
+    b.origin[k] = BodyOrigin::Comet;
+    b.class[k] = class;
+    b.bulk_density[k] = rho;
+    b.r[k] = b.radius_now(k);
+    b.imm[k] = b.time + IMMUNITY_TIME;
+    b.imm[i] = b.time + IMMUNITY_TIME;
+    b.name[k] = parent_name.map(|n| format!("{}-B", n.trim_end_matches("-A")));
+    b.parent_cache_valid = false;
+    let text = format!("{} split in two ({} and {})", tag(b, i), mass_str(mp), mass_str(mc));
+    let (ex, ey) = (b.x[i], b.y[i]);
+    b.log(EventKind::Comet, text, ex, ey);
 }
 
 /// Remove bodies that have escaped the system, promoting heavy ejectees

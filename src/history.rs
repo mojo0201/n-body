@@ -114,11 +114,12 @@ impl History {
             return None;
         }
         let i = self.frames.partition_point(|f| f.time < t);
+        // Before the first frame, after the last, or whichever neighbour is closer.
+        let prev_is_closer =
+            i == self.frames.len() || (i > 0 && t - self.frames[i - 1].time <= self.frames[i].time - t);
         Some(if i == 0 {
             0
-        } else if i == self.frames.len() {
-            i - 1
-        } else if t - self.frames[i - 1].time <= self.frames[i].time - t {
+        } else if prev_is_closer {
             i - 1
         } else {
             i

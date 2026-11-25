@@ -123,11 +123,11 @@ fn collision_signature(b: &Bodies) -> (usize, [u64; 5]) {
     (
         b.len(),
         [
-            b.stats.merges as u64,
-            b.stats.impacts as u64,
-            b.stats.tidal as u64,
-            b.stats.coalesces as u64,
-            b.stats.bounces as u64,
+            b.stats.merges,
+            b.stats.impacts,
+            b.stats.tidal,
+            b.stats.coalesces,
+            b.stats.bounces,
         ],
     )
 }

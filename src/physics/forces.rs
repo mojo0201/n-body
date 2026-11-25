@@ -550,7 +550,7 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
         }
         m
     });
-    let on = |k: usize| mask.as_ref().map_or(true, |m| m[k]);
+    let on = |k: usize| mask.as_ref().is_none_or(|m| m[k]);
 
     // Every pair that gets PN terms contains a host body. The outer loop
     // visits hosts only. The `j` loop below skips a host `j` with `j < i`,

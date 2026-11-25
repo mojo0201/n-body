@@ -106,7 +106,7 @@ pub(super) fn yarkovsky(b: &mut Bodies, dt: f64) {
         let force = f * std::f64::consts::PI * r_m * r_m * s_flux / C_SI;
         let a_si = force / (b.m[j] * MASS_KG);
         // SI → simulation units, with the sign of the (hidden) spin.
-        let a_sim = spin_sign(b.id[j] as u64) * a_si * boost * tu * tu / len_m;
+        let a_sim = spin_sign(b.id[j]) * a_si * boost * tu * tu / len_m;
         let dv = a_sim * dt;
         let ke0 = 0.5 * b.m[j] * (b.vx[j] * b.vx[j] + b.vy[j] * b.vy[j] + b.vz[j] * b.vz[j]);
         b.vx[j] += dv * dvx / v;

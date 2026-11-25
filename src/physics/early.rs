@@ -129,7 +129,7 @@ pub fn evolve_early(b: &mut Bodies) -> EarlyReport {
     let mut steps = 0u64;
     let mut dt = DT;
     while t < t_end && steps < EARLY_MAX_STEPS {
-        if steps % 200 == 0 {
+        if steps.is_multiple_of(200) {
             dt = choose_dt(&mut sb);
             // Disk strength follows exp(−t/efold) through the host age; none once dispersed.
             let age = if t < t_disk { t / efold * 0.002 } else { 1.0 };

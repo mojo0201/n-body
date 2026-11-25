@@ -102,10 +102,10 @@ fn scale_mass_raw(b: &mut Bodies, i: usize, factor: f64) -> bool {
 fn set_kind_raw(b: &mut Bodies, i: usize, kind: BodyKind) {
     let m = b.m[i];
     let new_m = match kind {
-        BodyKind::Star if m < STAR_M_MIN || m > 100.0 * M_SUN_ME => M_SUN_ME,
-        BodyKind::BrownDwarf if m < BD_M_MIN || m > BD_M_MAX => m.clamp(BD_M_MIN, BD_M_MAX),
-        BodyKind::WhiteDwarf if m < WD_M_MIN || m > WD_M_MAX => m.clamp(WD_M_MIN, WD_M_MAX),
-        BodyKind::NeutronStar if m < NS_M_MIN || m > NS_M_MAX => m.clamp(NS_M_MIN, NS_M_MAX),
+        BodyKind::Star if !(STAR_M_MIN..=100.0 * M_SUN_ME).contains(&m) => M_SUN_ME,
+        BodyKind::BrownDwarf if !(BD_M_MIN..=BD_M_MAX).contains(&m) => m.clamp(BD_M_MIN, BD_M_MAX),
+        BodyKind::WhiteDwarf if !(WD_M_MIN..=WD_M_MAX).contains(&m) => m.clamp(WD_M_MIN, WD_M_MAX),
+        BodyKind::NeutronStar if !(NS_M_MIN..=NS_M_MAX).contains(&m) => m.clamp(NS_M_MIN, NS_M_MAX),
         BodyKind::BlackHole if m < BH_M_MIN => 10.0 * M_SUN_ME,
         BodyKind::DwarfPlanet if m > DWARF_M_MAX => DWARF_M_MAX,
         BodyKind::Planet if m >= 1000.0 => JUPITER_MASS,

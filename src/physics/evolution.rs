@@ -166,8 +166,8 @@ pub fn star_state(m_init: f64, m: f64, age_gyr: f64) -> StarState {
     // current mass. Factored out because the giant branch also needs
     // the endpoint (f = 1) as its starting point.
     let ms = |mass: f64, f: f64| -> (f64, f64, f64) {
-        let r = physical_radius(BodyKind::Star, mass) * (1.0 + EVO_MS_RADIUS_GROWTH * f);
-        let l = star_luminosity(BodyKind::Star, mass) * (1.0 + EVO_MS_LUM_GROWTH * f);
+        let r = physical_radius(BodyKind::Star, mass) * ms_radius_factor(f);
+        let l = star_luminosity(BodyKind::Star, mass) * ms_lum_factor(f);
         let rr = r / R_SUN_GM;
         let t = 5772.0 * (l / (rr * rr)).sqrt().sqrt();
         (r, l, t)
@@ -895,7 +895,7 @@ pub(super) fn evolve_stars(b: &mut Bodies, dt: f64) {
             // place. Luminosity and T are recomputed lazily by
             // `luminosity_of` / `temperature_of` when needed.
             let f = (age / t_ms).clamp(0.0, 1.0);
-            b.r[i] = physical_radius(BodyKind::Star, b.m[i]) * (1.0 + EVO_MS_RADIUS_GROWTH * f);
+            b.r[i] = physical_radius(BodyKind::Star, b.m[i]) * ms_radius_factor(f);
         } else {
             // Post-MS: mass loss.
             let target = star_mass_at_pre(m0, t_ms, age);

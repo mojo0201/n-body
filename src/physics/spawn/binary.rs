@@ -284,14 +284,7 @@ pub(in crate::physics) fn place_outer_star(
     let (rx, ry, rz, rvx, rvy, rvz) =
         kepler_state_incl(G * mt, s.a_au * au, s.ecc, nu, omega, inc, node);
     let (f_in, f_out) = (s.m / mt, m_in / mt);
-    let (dx, dy, dz, dvx, dvy, dvz) = (
-        f_in * rx,
-        f_in * ry,
-        f_in * rz,
-        f_in * rvx,
-        f_in * rvy,
-        f_in * rvz,
-    );
+    let (dx, dy, dz, dvx, dvy, dvz) = (f_in * rx, f_in * ry, f_in * rz, f_in * rvx, f_in * rvy, f_in * rvz);
 
     // Single fused pass: accumulate the pre-shift COM and translate every
     // inner body by the same barycentric offset. Reading the pre-shift
@@ -322,16 +315,8 @@ pub(in crate::physics) fn place_outer_star(
     // barycentric offset.
     let star = push3(
         b,
-        [
-            cx / m_in + f_out * rx,
-            cy / m_in + f_out * ry,
-            cz / m_in + f_out * rz,
-        ],
-        [
-            cvx / m_in + f_out * rvx,
-            cvy / m_in + f_out * rvy,
-            cvz / m_in + f_out * rvz,
-        ],
+        [cx / m_in + f_out * rx, cy / m_in + f_out * ry, cz / m_in + f_out * rz],
+        [cvx / m_in + f_out * rvx, cvy / m_in + f_out * rvy, cvz / m_in + f_out * rvz],
         s.m,
         BodyKind::Star,
     );

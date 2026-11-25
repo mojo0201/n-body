@@ -1137,8 +1137,9 @@ pub fn load_preset_by_slug(slug: &str) -> Option<SystemPreset> {
         .map(|(_, p)| p.clone())
 }
 
-/// Belt bodies of a preset system. About 200 reads as a populated belt.
-pub(super) const PRESET_BELT_BUDGET: usize = 200;
+/// Belt bodies of a preset system without its own `belt_budget`. The frame rate
+/// no longer limits this; the Solar System preset already uses 1000.
+pub(super) const PRESET_BELT_BUDGET: usize = 600;
 
 /// Seed of the planet phases of the single-system Solar System preset.
 /// Kept distinct from the runtime RNG seed so a "Reload" with the default
@@ -1217,7 +1218,7 @@ fn reset_for_preset(b: &mut Bodies, preset: &SystemPreset, phase_seed: u128) {
     let n_stars = 1 + preset.companions.len();
     let n_moons: usize = preset.planets.iter().map(|p| p.moons.len()).sum();
     // Reserve enough capacity for the belt spawn too. Belt budgets are
-    // ~200 bodies per preset system; without this the inner `push` loop
+    // several hundred bodies per preset system; without this the inner `push` loop
     // triggers a reallocation cascade across every SoA column for every
     // belt body, which dominates spawn time for cluster spawns.
     let belt_capacity = preset

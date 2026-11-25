@@ -12,7 +12,7 @@ fn main() {
         if s % 400 == 0 { let d = ((b.x[m]-b.x[e]).powi(2)+(b.y[m]-b.y[e]).powi(2)+(b.z[m]-b.z[e]).powi(2)).sqrt();
             println!("step {s}: sep {:.4} Gm rel v {:.4} rung {}", d, ((b.vx[m]-b.vx[e]).powi(2)+(b.vy[m]-b.vy[e]).powi(2)).sqrt(), b.rung[m]); }
         let a = (b.y[m]-b.y[e]).atan2(b.x[m]-b.x[e]);
-        let mut d = a - ang_prev; while d > 3.14159 { d -= 6.28318 } while d < -3.14159 { d += 6.28318 }
+        let mut d = a - ang_prev; while d > std::f64::consts::PI { d -= std::f64::consts::TAU } while d < -std::f64::consts::PI { d += std::f64::consts::TAU }
         if s > 0 { turns += d; } ang_prev = a;
         if let Some(mut job) = advance_begin(&mut b, DT) {
             loop {
@@ -21,5 +21,5 @@ fn main() {
             }
         }
     }
-    println!("moon revolutions about Earth: {:.2} (expect ~{:.2})", turns / 6.28318, 4000.0 * DT / 7.3 * 13.4);
+    println!("moon revolutions about Earth: {:.2} (expect ~{:.2})", turns / std::f64::consts::TAU, 4000.0 * DT / 7.3 * 13.4);
 }

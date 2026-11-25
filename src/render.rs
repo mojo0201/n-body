@@ -424,7 +424,7 @@ pub fn build_comet_tails(b: &Bodies, view: &View3) -> Vec<OrbitVertex> {
         if !(d > 0.0) {
             continue;
         }
-        let t = (((4.0 - d / au) / 2.5).clamp(0.0, 1.0)) as f64;
+        let t = ((4.0 - d / au) / 2.5).clamp(0.0, 1.0);
         let act = t * t * (3.0 - 2.0 * t);
         if act < 0.02 {
             continue;
@@ -788,17 +788,18 @@ fn create_body_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
             },
         ],
     };
-    let body_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("body-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             buffers: &[Some(body_instance_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             targets: &[blend_target(format)],
             compilation_options: Default::default(),
@@ -811,8 +812,7 @@ fn create_body_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    body_pipeline
+    })
 }
 
 /// Vertex layout shared by the orbit, trail and comet-tail pipelines.
@@ -843,17 +843,18 @@ fn create_orbit_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
     let msaa_state = ctx.msaa;
     let format = ctx.format;
     let orbit_layout = orbit_vertex_layout();
-    let orbit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("orbit-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_orbit"),
             buffers: &[Some(orbit_layout.clone())],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_orbit"),
             targets: &[blend_target(format)],
             compilation_options: Default::default(),
@@ -866,8 +867,7 @@ fn create_orbit_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    orbit_pipeline
+    })
 }
 
 /// Collision flashes.
@@ -899,17 +899,18 @@ fn create_flash_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
             },
         ],
     };
-    let flash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("flash-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_flash"),
             buffers: &[Some(flash_instance_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_flash"),
             targets: &[blend_target(format)],
             compilation_options: Default::default(),
@@ -922,8 +923,7 @@ fn create_flash_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    flash_pipeline
+    })
 }
 
 /// Dust grains: the pipeline plus the per-field centre buffer and its bind group.
@@ -966,7 +966,7 @@ fn create_dust_resources(ctx: &PipelineContext) -> (wgpu::RenderPipeline, wgpu::
     });
     let dust_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("dust-pipeline-layout"),
-        bind_group_layouts: &[Some(&camera_layout), Some(&dust_fields_layout)],
+        bind_group_layouts: &[Some(camera_layout), Some(&dust_fields_layout)],
         immediate_size: 0,
     });
     let dust_vertex_layout = wgpu::VertexBufferLayout {
@@ -995,13 +995,13 @@ fn create_dust_resources(ctx: &PipelineContext) -> (wgpu::RenderPipeline, wgpu::
         label: Some("dust-pipeline"),
         layout: Some(&dust_pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_dust"),
             buffers: &[Some(dust_vertex_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_dust"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
@@ -1031,17 +1031,18 @@ fn create_comet_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
     let format = ctx.format;
     let additive = additive_blend();
     // ---- Comet pipeline: orbit vertex format, triangles, additive ----
-    let comet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("comet-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_orbit"),
             buffers: &[Some(orbit_vertex_layout())],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_orbit"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
@@ -1058,8 +1059,7 @@ fn create_comet_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    comet_pipeline
+    })
 }
 
 /// Soft additive halos behind luminous bodies.
@@ -1097,17 +1097,18 @@ fn create_glow_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
             },
         ],
     };
-    let glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("glow-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_glow"),
             buffers: &[Some(glow_instance_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_glow"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
@@ -1124,8 +1125,7 @@ fn create_glow_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    glow_pipeline
+    })
 }
 
 /// Black-hole discs.
@@ -1156,17 +1156,18 @@ fn create_blackhole_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
             },
         ],
     };
-    let blackhole_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("blackhole-pipeline"),
-        layout: Some(&pipeline_layout),
+        layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_blackhole"),
             buffers: &[Some(blackhole_instance_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_blackhole"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
@@ -1183,8 +1184,7 @@ fn create_blackhole_pipeline(ctx: &PipelineContext) -> wgpu::RenderPipeline {
         multisample: msaa_state,
         multiview_mask: None,
         cache: None,
-    });
-    blackhole_pipeline
+    })
 }
 
 /// An empty, growable vertex buffer of `size` bytes.

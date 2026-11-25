@@ -417,7 +417,7 @@ fn splitmix(mut z: u64) -> u64 {
 /// Hash a few already-drawn values into a key for the private tilt RNG.
 pub(super) fn tilt_key(vals: &[f64]) -> u64 {
     vals.iter()
-        .fold(0x1C1_1AB1_E5, |h, v| splitmix(h ^ v.to_bits()))
+        .fold(0x1_C11A_B1E5, |h, v| splitmix(h ^ v.to_bits()))
 }
 
 fn tilt_rng(key: u64) -> XorShift {

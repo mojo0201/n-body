@@ -280,7 +280,7 @@ fn name_planets_and_moons(
     }
     // Moons: a Roman numeral per planet by distance; the larger ones also get
     // a proper name, in place of the numeral.
-    let planets: Vec<usize> = (0..b.len()).filter(|&p| parents.iter().any(|&q| q == Some(p))).collect();
+    let planets: Vec<usize> = (0..b.len()).filter(|&p| parents.contains(&Some(p))).collect();
     for p in planets {
         let mut moons: Vec<usize> = (0..b.len()).filter(|&i| parents[i] == Some(p) && b.name[i].is_none()).collect();
         moons.sort_by(|&x, &y| host_dist(b, x, p).total_cmp(&host_dist(b, y, p)));
@@ -337,7 +337,7 @@ fn name_small_bodies(b: &mut Bodies, chain: &NameChain, rng: &mut XorShift, used
 
 /// Short-period comets get `P/`; this uses the speed to decide whether the orbit is tight.
 fn orbit_period_hint(b: &Bodies, i: usize) -> bool {
-    primary_index(b).map_or(false, |p| {
+    primary_index(b).is_some_and(|p| {
         let o = orbit_info(b, i, p);
         o.bound && o.period * time_unit_s() / 3.15576e7 < 200.0
     })

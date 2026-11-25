@@ -20,6 +20,7 @@ pub mod evolution;
 pub mod forces;
 pub mod integrator;
 pub mod naming;
+pub mod climate;
 pub mod early;
 pub mod names;
 pub mod transit;
@@ -56,6 +57,7 @@ pub use evolution::*;
 pub use forces::*;
 pub use integrator::*;
 pub use naming::*;
+pub use climate::*;
 pub use early::*;
 pub use names::*;
 pub use transit::*;
@@ -243,11 +245,28 @@ pub const BH_MIN_CAPTURE: f64 = 1e-3;
 // of its life it becomes a white dwarf, neutron star or black hole
 // (`remnant_of`).
 
-/// Radius growth over the main sequence (age 0 = the preset's present state).
+/// Radius growth over the main sequence.
 pub const EVO_MS_RADIUS_GROWTH: f64 = 0.4;
 
-/// Luminosity growth over the main sequence.
-pub const EVO_MS_LUM_GROWTH: f64 = 0.5;
+/// Luminosity growth over the main sequence (the Sun goes from ~0.7 to ~1.35 L☉).
+pub const EVO_MS_LUM_GROWTH: f64 = 0.9;
+
+/// The mass–radius and mass–luminosity relations describe a star about halfway
+/// through its main sequence (the Sun, 4.6 of ~10 Gyr: 1 R☉, 1 L☉). The growth
+/// factors below are normalised to be exactly 1 there.
+pub const EVO_MS_REF_FRAC: f64 = 0.46;
+
+/// Radius multiplier at fraction `f` of the main sequence.
+#[inline]
+pub fn ms_radius_factor(f: f64) -> f64 {
+    (1.0 + EVO_MS_RADIUS_GROWTH * f) / (1.0 + EVO_MS_RADIUS_GROWTH * EVO_MS_REF_FRAC)
+}
+
+/// Luminosity multiplier at fraction `f` of the main sequence.
+#[inline]
+pub fn ms_lum_factor(f: f64) -> f64 {
+    (1.0 + EVO_MS_LUM_GROWTH * f) / (1.0 + EVO_MS_LUM_GROWTH * EVO_MS_REF_FRAC)
+}
 
 /// Length of the giant phase as a fraction of the main-sequence lifetime.
 pub const EVO_POST_MS_FRAC: f64 = 0.15;

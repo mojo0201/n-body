@@ -1,8 +1,0 @@
-seed     1  n    4  hash 2508c8461b331de3
-seed     2  n    2  hash d47ce84b3d3fc48d
-seed     3  n   46  hash 259145524449dfad
-seed     7  n  270  hash 82e9fb5b508bd08e
-seed    11  n    5  hash 194f41928d794ce0
-seed    42  n   13  hash 564b1fd39a3e57ac
-seed    99  n    2  hash 8f3b5bc35e825f67
-seed  1234  n    5  hash 991e30d5595246f2

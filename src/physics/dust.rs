@@ -594,7 +594,7 @@ pub fn evolve_begin(b: &Bodies, dt: f64) -> Option<DustPass> {
     // systems) update it less often, in proportion to the grain count.
     let total: usize = b.dust_fields.iter().map(|f| f.grains.len()).sum();
     let stride = (total / DUST_LOD_GRAINS).clamp(1, DUST_LOD_MAX_STRIDE) as u64;
-    let interval = DUST_STEP_INTERVAL as u64 * stride;
+    let interval = DUST_STEP_INTERVAL * stride;
     if !b.stats.steps.is_multiple_of(interval) {
         return None;
     }
