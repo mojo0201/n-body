@@ -507,6 +507,8 @@ pub struct ViewInfo {
     /// Current live body count across all systems (`b.len()`). Differs from
     /// `body_count * systems` after merges/escapes.
     pub total_bodies: usize,
+    /// A random population is being generated in the background.
+    pub generating: bool,
     pub show_orbits: bool,
     pub show_debris_orbits: bool,
     pub follow: bool,
@@ -728,7 +730,9 @@ pub fn setup_style(ctx: &egui::Context) {
     // Hover tooltips (the "i" explanations) appear after a one second pause.
     style.interaction.tooltip_delay = 1.0;
     // Thin scroll bars that float over the content instead of taking a column.
+    // Reserve a gutter for the bar so it never covers the numbers beside it.
     style.spacing.scroll = egui::style::ScrollStyle::floating();
+    style.spacing.scroll.floating_allocated_width = style.spacing.scroll.bar_width + 4.0;
     ctx.set_global_style(style);
 }
 fn panel_frame() -> egui::Frame {
@@ -1779,6 +1783,14 @@ fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
         if ui.checkbox(&mut debris, "debris orbits (;)").changed() {
             act.debris_orbits = Some(debris);
         }
+        let mut comets = ph::comet_orbits();
+        if ui
+            .checkbox(&mut comets, "comet orbits (')")
+            .on_hover_text("comets have their own orbit toggle, separate from planets and debris; off by default")
+            .changed()
+        {
+            ph::set_comet_orbits(comets);
+        }
         let mut vsync = view.vsync;
         if ui
             .checkbox(&mut vsync, "vsync (V)")
@@ -1865,7 +1877,7 @@ fn section_advanced(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, act: &
         let mut early = ph::early_evolution();
         if ui
             .checkbox(&mut early, "early evolution on generate")
-            .on_hover_text("new systems first run a time-compressed version of their youth: planets migrate in a fading gas disk, then some packed giant pairs scatter once the gas is gone, and crowded inner planets can merge. Costs up to ~2 s per generate; belts and dust are not part of it.")
+            .on_hover_text("young systems (host under 0.5 Gyr, about 5% of generated ones) first run a time-compressed version of their youth: planets migrate in a fading gas disk, then some packed giant pairs scatter once the gas is gone, and crowded inner planets can merge. Older systems are taken as already settled. Costs up to ~2 s per generate; belts and dust are not part of it.")
             .changed()
         {
             ph::set_early_evolution(early);
@@ -2001,6 +2013,12 @@ fn random_system_controls(ui: &mut egui::Ui, st: &mut UiState, view: &ViewInfo, 
     body_cap_warning(ui, st.pending_systems, st.pending_count);
     seed_row(ui, st, view);
     population_status_line(ui, view);
+    if view.generating {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("generating… (the current scene keeps running)").small().color(theme().colors.dim()));
+        });
+    }
     if ui.button("Generate").clicked() {
         act.body_count = Some(st.pending_count);
         act.seed = Some(commit_seed_text(&st.pending_seed_text, view.seed));

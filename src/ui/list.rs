@@ -233,6 +233,7 @@ pub(super) fn help_window(ctx: &egui::Context, st: &mut UiState) {
                     ("C", "follow the selected body"),
                     ("F, 0", "fit the whole system"),
                     ("O", "orbit lines"),
+                    ("'", "comet orbits (off by default)"),
                     ("L", "labels"),
                     ("U", "physical / simulation units"),
                     ("B", "body list"),

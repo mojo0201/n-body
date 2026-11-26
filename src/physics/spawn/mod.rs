@@ -994,6 +994,17 @@ pub fn spawn_system(b: &mut Bodies, body_count: usize, seed: u128) {
 /// Like `spawn_system`, but also reports what was generated (binary
 /// parameters and architecture).
 pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> SystemInfo {
+    spawn_system_opts(b, body_count, seed, if early_evolution() { 1.0 } else { 0.0 })
+}
+
+/// `spawn_system_with_info` with the early-evolution relaxation scaled by
+/// `relax_frac` (`0` skips the step; multi-system spawns shorten it).
+pub(in crate::physics) fn spawn_system_opts(
+    b: &mut Bodies,
+    body_count: usize,
+    seed: u128,
+    relax_frac: f64,
+) -> SystemInfo {
     *b = Bodies::with_capacity(body_count);
     b.rng = XorShift::new(seed ^ 0xA5A5_5A5A);
     let mut rng = XorShift::new(seed);
@@ -1072,8 +1083,8 @@ pub fn spawn_system_with_info(b: &mut Bodies, body_count: usize, seed: u128) -> 
     }
 
     recenter_com(b);
-    if early_evolution() {
-        evolve_early(b);
+    if relax_frac > 0.0 && is_early_system(b) {
+        evolve_early_scaled(b, relax_frac);
         recenter_com(b);
     }
     compute_accel(b);

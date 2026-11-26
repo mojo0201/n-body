@@ -112,7 +112,12 @@ impl SimState {
             Preset::Random => {
                 self.body_count = count.max(1);
                 let n = self.systems.clamp(1, physics::MAX_SOLAR_SYSTEMS);
-                physics::spawn_random_systems(b, self.body_count, seed, n);
+                match self.prebuilt.take() {
+                    Some(world) => *b = world,
+                    None => {
+                        physics::spawn_random_systems(b, self.body_count, seed, n);
+                    }
+                }
             }
             Preset::SolarSystem => {
                 // Solar System is a preset: always single-system now.

@@ -339,6 +339,9 @@ pub(super) fn find_collisions_hot(
 /// Hot bodies against cold ones. `find_collisions_hot` only pairs hot with
 /// hot, but every body drifts each sub-tick, so hot-vs-cold hits must be
 /// tested too.
+/// Largest hot × cold product for which `hot_vs_cold` scans every pair.
+const HOT_SCAN_MAX: usize = 40_000;
+
 fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
     let t_now = b.time;
     let n = b.len();
@@ -373,6 +376,39 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
     }
     let cell = ((2.0 * max_cr + 2.0 * max_disp_sq.sqrt()) * 1.0001).max(1e-4);
     let inv = 1.0 / cell;
+
+    // Few hot bodies: a plain scan with the same reach test as the grid (a pair
+    // farther apart than `cell` in x or y cannot hit) is cheaper than building a
+    // hash table over every cold body each sub-tick. `pair_hit_rr` decides, so
+    // the pairs found are the same.
+    if live_hot.len() * cold.len() <= HOT_SCAN_MAX {
+        // Cold bodies sorted by x: each hot body probes only the x-window
+        // `[xi - cell, xi + cell]`. Output order differs from a plain scan, but
+        // the caller sorts and dedups the pairs. Non-finite x can never hit.
+        let mut sorted: Vec<(f64, usize)> = cold
+            .iter()
+            .map(|&j| (b.x[j], j))
+            .filter(|&(x, _)| x.is_finite())
+            .collect();
+        sorted.sort_unstable_by(|a, c| a.0.total_cmp(&c.0));
+        let mut out = Vec::new();
+        for &i in &live_hot {
+            let (xi, yi, ri) = (b.x[i], b.y[i], b.contact_r(i));
+            let lo = sorted.partition_point(|&(x, _)| x < xi - cell);
+            for &(x, j) in &sorted[lo..] {
+                if x - xi > cell {
+                    break;
+                }
+                if (b.y[j] - yi).abs() > cell {
+                    continue;
+                }
+                if pair_hit_rr(b, i, j, ri + b.contact_r(j), true) {
+                    out.push((i.min(j), i.max(j)));
+                }
+            }
+        }
+        return out;
+    }
 
     let nc = cold.len();
     let table = (2 * nc).next_power_of_two().max(16);

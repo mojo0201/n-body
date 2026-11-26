@@ -216,6 +216,7 @@ impl SimState {
             body_count: self.body_count,
             systems: effective_systems,
             total_bodies,
+            generating: self.spawn_job.is_some(),
             show_orbits: self.show_orbits,
             show_debris_orbits: self.show_debris_orbits,
             follow: self.follow,
@@ -303,9 +304,11 @@ impl SimState {
             .wrapping_add(b.stats.tidal)
             .wrapping_add(b.stats.escaped);
         let hz_now = physics::hz_rings();
-        let hz_changed = hz_now != self.last_hz;
+        let comets_now = physics::orbit_lines::comet_orbits();
+        let hz_changed = hz_now != self.last_hz || comets_now != self.last_comet_orbits;
         self.last_hz = hz_now;
-        let orbits_visible = self.show_orbits || self.show_debris_orbits || hz_now;
+        self.last_comet_orbits = comets_now;
+        let orbits_visible = self.show_orbits || self.show_debris_orbits || hz_now || comets_now;
         let zoom_ratio = self.zoom / self.last_orbit_zoom.max(1e-6);
         let zoom_changed = (zoom_ratio - 1.0).abs() > 0.3;
         let span_x = 0.35 * vp[0] as f64 / self.zoom as f64;

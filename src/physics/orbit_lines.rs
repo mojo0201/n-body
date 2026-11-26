@@ -204,6 +204,17 @@ pub fn compute_orbit_segments(
 
 static HZ_RINGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+static COMET_ORBITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw comet orbits (on/off). Comets have their own toggle, separate from
+/// the planet and debris orbits, and it starts off.
+pub fn set_comet_orbits(on: bool) {
+    COMET_ORBITS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn comet_orbits() -> bool {
+    COMET_ORBITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Draw each star's habitable zone as a green band (on/off).
 pub fn set_hz_rings(on: bool) {
     HZ_RINGS.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -254,7 +265,8 @@ fn compute_orbit_segments_inner(
     show_planets: bool,
     show_debris: bool,
 ) -> Vec<([f32; 3], [f32; 3], [u8; 4])> {
-    if !show_planets && !show_debris {
+    let show_comets = comet_orbits();
+    if !show_planets && !show_debris && !show_comets {
         return Vec::new();
     }
     let n = b.len();
@@ -280,6 +292,9 @@ fn compute_orbit_segments_inner(
     let mut n_debris = 0usize;
     for i in 0..n {
         if i == si {
+            continue;
+        }
+        if b.origin[i] == BodyOrigin::Comet {
             continue;
         }
         if b.origin[i].is_belt() || b.origin[i].is_rubble() {
@@ -310,9 +325,16 @@ fn compute_orbit_segments_inner(
             continue;
         }
 
+        // Comets draw only with their own toggle, and are never decimated.
+        let is_comet = b.origin[i] == BodyOrigin::Comet;
+        if is_comet && !show_comets {
+            continue;
+        }
         // Stride-based decimation for planets and debris, respectively.
         let is_debris = b.origin[i].is_belt() || b.origin[i].is_rubble();
-        if is_debris {
+        if is_comet {
+            // fall through: drawn undecimated
+        } else if is_debris {
             if !show_debris {
                 continue;
             }
@@ -347,7 +369,9 @@ fn compute_orbit_segments_inner(
 
         // Debris is flat gray; planet hue shifts toward white with distance
         // from the primary (log-ish ramp over 0–800 units).
-        let color = if is_debris {
+        let color = if is_comet {
+            [150u8, 200u8, 230u8, 110u8]
+        } else if is_debris {
             debris_color
         } else {
             let d = host_distance(b, i) as f32;

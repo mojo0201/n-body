@@ -171,6 +171,7 @@ struct SimState {
     last_orbit_cam: [f64; 2],
     last_orbit_events: u64,
     last_hz: bool,
+    last_comet_orbits: bool,
     orbit_posted: u64,
     orbit_applied: u64,
     selected: Option<u64>,
@@ -204,6 +205,20 @@ struct SimState {
     deferred_io: Option<DeferredIo>,
     /// Name of a save to load once the bodies lock is released.
     pending_load: Option<String>,
+    /// A random system being generated on a worker thread (see `begin_spawn`).
+    spawn_job: Option<SpawnJob>,
+    /// A finished world waiting to be installed by `reset_with`.
+    prebuilt: Option<Bodies>,
+    /// Newest spawn request made while a worker was still running: `(count, seed, systems)`.
+    queued_spawn: Option<(usize, u128, usize)>,
+}
+
+/// Background generation of a random population, so the window stays responsive.
+struct SpawnJob {
+    handle: std::thread::JoinHandle<Bodies>,
+    count: usize,
+    seed: u128,
+    systems: usize,
 }
 
 /// What the locked part of a redraw hands to the unlocked part.
@@ -260,6 +275,7 @@ impl SimState {
             last_orbit_cam: [0.0; 2],
             last_orbit_events: 0,
             last_hz: false,
+            last_comet_orbits: false,
             orbit_posted: 0,
             orbit_applied: 0,
             selected: None,
@@ -289,6 +305,9 @@ impl SimState {
             last_loaded_preset: None,
             deferred_io: None,
             pending_load: None,
+            spawn_job: None,
+            prebuilt: None,
+            queued_spawn: None,
         }
     }
 
@@ -602,6 +621,7 @@ impl App {
             "j" => self.ui.show_timeline = !self.ui.show_timeline,
             "x" => self.ui.elem.visible = !self.ui.elem.visible,
             "z" => physics::set_hz_rings(!physics::hz_rings()),
+            "'" => physics::orbit_lines::set_comet_orbits(!physics::orbit_lines::comet_orbits()),
             "i" => self.ui.light.visible = !self.ui.light.visible,
             _ => {}
         }
@@ -723,6 +743,7 @@ impl App {
         }
 
         let busy = !self.sim.paused
+            || self.sim.spawn_job.is_some()
             || flashes_active
             || self.sim.follow
             || repaint_now

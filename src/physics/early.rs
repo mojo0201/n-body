@@ -50,6 +50,34 @@ pub const EARLY_DISK_EFOLD: f64 = 150.0;
 const DISK_EFOLDS: f64 = 5.0;
 /// Disk-free relaxation, time units (~550 yr).
 pub const EARLY_RELAX_UNITS: f64 = 4000.0;
+/// Only systems whose host is younger than this (Gyr) are still in their
+/// early, unsettled phase and get the early evolution; older ones are taken
+/// as already relaxed. About 5 % of generated systems qualify.
+pub const EARLY_MAX_AGE_GYR: f64 = 0.5;
+
+/// Whether the system in `b` (its most massive host) is young enough to be
+/// an "early" system.
+pub fn is_early_system(b: &Bodies) -> bool {
+    (0..b.len())
+        .filter(|&i| !b.dead[i] && is_host_kind(b.kind[i]))
+        .max_by(|&i, &j| b.m[i].total_cmp(&b.m[j]))
+        .is_some_and(|p| b.age_gyr[p] < EARLY_MAX_AGE_GYR)
+}
+
+/// Multi-system spawns shrink the relaxation phase so the total cost stays
+/// bounded: `EARLY_BUDGET_SYSTEMS` full-length evolutions' worth in all.
+pub const EARLY_BUDGET_SYSTEMS: f64 = 2.0;
+/// Below this share of the full relaxation (more than `1 / MIN` systems) the
+/// early phase is skipped altogether.
+pub const EARLY_MIN_RELAX_FRAC: f64 = 1.0 / 8.0;
+
+/// Relaxation length multiplier when `n_systems` early systems are evolved
+/// together; `0` means skip.
+pub fn early_relax_frac(n_systems: usize) -> f64 {
+    let f = (EARLY_BUDGET_SYSTEMS / n_systems.max(1) as f64).min(1.0);
+    if f < EARLY_MIN_RELAX_FRAC { 0.0 } else { f }
+}
+
 /// Hard cap on integrator steps (bounds generation time).
 const EARLY_MAX_STEPS: u64 = 3_000_000;
 
@@ -75,6 +103,11 @@ fn is_primary_planet(b: &Bodies, i: usize) -> bool {
 
 /// Run the time-compressed early evolution on `b` (a freshly spawned system).
 pub fn evolve_early(b: &mut Bodies) -> EarlyReport {
+    evolve_early_scaled(b, 1.0)
+}
+
+/// `evolve_early` with the disk-free relaxation scaled by `relax_frac`.
+pub fn evolve_early_scaled(b: &mut Bodies, relax_frac: f64) -> EarlyReport {
     let n = b.len();
     let planets: Vec<usize> = (0..n).filter(|&i| is_primary_planet(b, i)).collect();
     let mut rep = EarlyReport { planets_before: planets.len(), planets_after: planets.len(), ..Default::default() };
@@ -125,7 +158,7 @@ pub fn evolve_early(b: &mut Bodies) -> EarlyReport {
     let mut packed = false;
     let mut t = 0.0;
     let t_disk = DISK_EFOLDS * efold;
-    let t_end = t_disk + EARLY_RELAX_UNITS;
+    let t_end = t_disk + EARLY_RELAX_UNITS * relax_frac;
     let mut steps = 0u64;
     let mut dt = DT;
     while t < t_end && steps < EARLY_MAX_STEPS {

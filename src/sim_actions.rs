@@ -33,14 +33,13 @@ impl SimState {
         // Systems slider: respawn immediately. Works for both presets, so
         // the user can go from 1 random system to N random systems in one
         // click without touching the preset selector.
+        self.poll_spawn(b, shared, vp, ui_state);
         if let Some(n) = act.systems {
             // Only applies when Random is active (no library preset).
             if self.preset == Preset::Random && self.last_loaded_preset.is_none() {
                 self.systems = n.clamp(1, physics::MAX_SOLAR_SYSTEMS);
-                let count = self.body_count;
-                let seed = self.seed;
-                self.reset_with(b, shared, count, seed);
-                self.fit(b, vp);
+                let (count, seed) = (self.body_count, self.seed);
+                self.begin_spawn(count, seed);
             }
         }
 
@@ -70,21 +69,20 @@ impl SimState {
             self.last_loaded_preset = None;
             ui_state.loaded_preset_slug = None;
             match p {
-                Preset::Random => self.reset_with(
-                    b,
-                    shared,
-                    ui_state.pending_count,
-                    ui_state.pending_seed(self.seed),
-                ),
+                Preset::Random => {
+                    let (count, seed) = (ui_state.pending_count, ui_state.pending_seed(self.seed));
+                    self.begin_spawn(count, seed);
+                }
                 Preset::SolarSystem => {
+                    self.spawn_job = None;
+                    self.queued_spawn = None;
                     let seed = self.seed;
                     self.reset_with(b, shared, 9, seed);
+                    self.fit(b, vp);
                 }
             }
-            self.fit(b, vp);
         } else if let (Some(n), Some(seed)) = (act.body_count, act.seed) {
-            self.reset_with(b, shared, n, seed);
-            self.fit(b, vp);
+            self.begin_spawn(n, seed);
         }
         if act.reset {
             self.reset(b, shared);
@@ -292,5 +290,58 @@ impl SimState {
         if let Some(p) = act.pause_on_event {
             self.pause_on_event = p;
         }
+    }
+}
+
+impl SimState {
+    /// Generate a random population on a worker thread and install it from
+    /// `poll_spawn` when it is ready. Generating many systems takes seconds
+    /// (each one runs its early evolution), which would otherwise freeze the
+    /// window while the bodies lock is held. Only one worker runs at a time:
+    /// a request made meanwhile is queued, and a newer one replaces it, so
+    /// dragging sliders cannot pile up heavy jobs.
+    pub(super) fn begin_spawn(&mut self, count: usize, seed: u128) {
+        let systems = self.systems.clamp(1, physics::MAX_SOLAR_SYSTEMS);
+        if self.spawn_job.is_some() {
+            self.queued_spawn = Some((count, seed, systems));
+        } else {
+            self.start_spawn(count, seed, systems);
+        }
+    }
+
+    fn start_spawn(&mut self, count: usize, seed: u128, systems: usize) {
+        let body_count = count.max(1);
+        let handle = std::thread::spawn(move || {
+            let mut world = Bodies::with_capacity(16);
+            physics::spawn_random_systems(&mut world, body_count, seed, systems);
+            world
+        });
+        self.spawn_job = Some(SpawnJob { handle, count, seed, systems });
+    }
+
+    /// Install a finished background spawn, if there is one.
+    pub(super) fn poll_spawn(&mut self, b: &mut Bodies, shared: &Shared, vp: [f32; 2], _ui_state: &mut UiState) {
+        if !self.spawn_job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+            return;
+        }
+        let Some(job) = self.spawn_job.take() else { return };
+        let Ok(world) = job.handle.join() else {
+            self.queued_spawn = None;
+            return;
+        };
+        // A newer request supersedes this result: start it instead.
+        if let Some((count, seed, systems)) = self.queued_spawn.take() {
+            if self.preset == Preset::Random && self.last_loaded_preset.is_none() {
+                self.start_spawn(count, seed, systems);
+            }
+            return;
+        }
+        if self.preset != Preset::Random || self.last_loaded_preset.is_some() {
+            return;
+        }
+        self.systems = job.systems;
+        self.prebuilt = Some(world);
+        self.reset_with(b, shared, job.count, job.seed);
+        self.fit(b, vp);
     }
 }

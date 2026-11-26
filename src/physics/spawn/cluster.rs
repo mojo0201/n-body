@@ -301,9 +301,9 @@ pub fn spawn_random_systems(
 /// assumption of the whole module: `spawn_system_with_info` must not
 /// consult any thread-local or global RNG state, only `seed`.
 #[inline]
-fn spawn_one(body_count: usize, seed: u128) -> (Bodies, SystemInfo) {
+fn spawn_one(body_count: usize, seed: u128, relax_frac: f64) -> (Bodies, SystemInfo) {
     let mut temp = Bodies::with_capacity(body_count);
-    let info = spawn_system_with_info(&mut temp, body_count, seed);
+    let info = spawn_system_opts(&mut temp, body_count, seed, relax_frac);
     (temp, info)
 }
 
@@ -348,26 +348,44 @@ pub(in crate::physics) fn spawn_random_systems_impl(
     // master seed.
     let sys_seed = |k: usize| seed.wrapping_add((k as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     use rayon::prelude::*;
+    // Early evolution is the expensive part of a spawn and applies only to
+    // young ("early") systems. It runs once per such system, at the final body
+    // count, with a relaxation phase shortened as their number grows
+    // (`early_relax_frac`). Counts and ages come from a cheap first pass.
     let mut temps: Vec<(Bodies, SystemInfo)> = (0..n)
         .into_par_iter()
-        .map(|k| spawn_one(body_count, sys_seed(k)))
+        .map(|k| spawn_one(body_count, sys_seed(k), 0.0))
         .collect();
 
     // ---- Phase 2: mass-scale body counts in parallel ------------------
     // Heavier systems get more bodies: the count scales with the system's
     // mass relative to the mean, clamped to 0.5x-2x. Systems whose rounded
-    // count is unchanged are not respawned.
-    if n > 1 {
+    // count is unchanged are not respawned (unless they still need their
+    // early evolution).
+    let young: Vec<bool> = temps.iter().map(|t| is_early_system(&t.0)).collect();
+    let relax = if early_evolution() {
+        early_relax_frac(young.iter().filter(|&&y| y).count())
+    } else {
+        0.0
+    };
+    let counts: Vec<usize> = if n > 1 {
         let masses: Vec<f64> = temps.iter().map(|t| t.0.m.iter().sum::<f64>()).collect();
         let avg = masses.iter().sum::<f64>() / n as f64;
-        temps.par_iter_mut().enumerate().for_each(|(k, slot)| {
-            let scale = (masses[k] / avg).clamp(0.5, 2.0);
-            let count = ((body_count as f64 * scale).round() as usize).max(1);
-            if count != body_count {
-                *slot = spawn_one(count, sys_seed(k));
-            }
-        });
-    }
+        masses
+            .iter()
+            .map(|&m| {
+                let scale = (m / avg).clamp(0.5, 2.0);
+                ((body_count as f64 * scale).round() as usize).max(1)
+            })
+            .collect()
+    } else {
+        vec![body_count]
+    };
+    temps.par_iter_mut().enumerate().for_each(|(k, slot)| {
+        if counts[k] != body_count || (relax > 0.0 && young[k]) {
+            *slot = spawn_one(counts[k], sys_seed(k), relax);
+        }
+    });
 
     // ---- Phase 3: layout and assembly ---------------------------------
     // Reuse the mass sums we already computed for the M5 rescale. The
