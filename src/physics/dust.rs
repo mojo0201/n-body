@@ -19,6 +19,13 @@
 
 use super::*;
 
+/// Euclidean length of a 3-vector. Cheaper than chained `hypot` (a libm call per
+/// term), and the values here never come near overflow.
+#[inline(always)]
+fn norm3(x: f64, y: f64, z: f64) -> f64 {
+    (x * x + y * y + z * z).sqrt()
+}
+
 /// Tracers released per belt/rubble body at start-up (capped by the budget).
 pub const DUST_GRAINS_PER_BODY: usize = 60;
 /// Hard cap per field.
@@ -150,7 +157,7 @@ fn collect_perturbers(b: &Bodies, pri: usize, reach: f64) -> Vec<Pert> {
                     && !b.origin[i].is_rubble()
                     && b.m[i] >= PERT_MIN_M)
         })
-        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]) < reach)
+        .filter(|&i| norm3(b.x[i] - b.x[pri], b.y[i] - b.y[pri], b.z[i] - b.z[pri]) < reach)
         .map(|i| Pert {
             x: b.x[i],
             y: b.y[i],
@@ -204,10 +211,10 @@ fn step_grain(g: &mut Grain, st: &Star, pert: &[Pert], dt: f64, c: f64, cull2: f
         return false;
     }
     let beta = beta_of(st.l_over_m, g.size_um);
-    let r = (g.x - st.x).hypot(g.y - st.y).hypot(g.z - st.z).max(1e-6);
+    let r = norm3(g.x - st.x, g.y - st.y, g.z - st.z).max(1e-6);
     let mut t_dyn = (r.powi(3) / st.gm).sqrt();
     for p in pert {
-        let d = (g.x - p.x).hypot(g.y - p.y).hypot(g.z - p.z).max(p.rc);
+        let d = norm3(g.x - p.x, g.y - p.y, g.z - p.z).max(p.rc);
         t_dyn = t_dyn.min((d.powi(3) / p.gm).sqrt());
     }
     let n = ((dt * SUB_PER_ORBIT / (std::f64::consts::TAU * t_dyn)).ceil() as u32)
@@ -333,7 +340,7 @@ impl DustField {
             let weight = weights[k];
             let (dvx, dvy, dvz) = if let Some((ux, uy, uz)) = dir {
                 // 1. Unit vector along the comet's current velocity.
-                let speed = p.3.hypot(p.4).hypot(p.5).max(1e-9);
+                let speed = norm3(p.3, p.4, p.5).max(1e-9);
                 let (vx_hat, vy_hat, vz_hat) = (p.3 / speed, p.4 / speed, p.5 / speed);
 
                 // 2. Blend the anti-sunward direction with the backward
@@ -342,7 +349,7 @@ impl DustField {
                 let base_x = ux - vx_hat * sweep;
                 let base_y = uy - vy_hat * sweep;
                 let base_z = uz - vz_hat * sweep;
-                let base_len = base_x.hypot(base_y).hypot(base_z).max(1e-9);
+                let base_len = norm3(base_x, base_y, base_z).max(1e-9);
                 let (bx, by, bz) = (base_x / base_len, base_y / base_len, base_z / base_len);
 
                 // 3. Random cone spread makes the tail fan out. The fan
@@ -434,7 +441,7 @@ pub fn deposit(
         if p >= b.len() {
             continue;
         }
-        let r = (x - b.x[p]).hypot(y - b.y[p]).hypot(z - b.z[p]);
+        let r = norm3(x - b.x[p], y - b.y[p], z - b.z[p]);
         if r < f.extent_gm {
             let vc = (G * b.m[p] / r.max(1e-6)).sqrt();
             let kick = DUST_EJECT_FRAC * vc * kick_scale;
@@ -453,7 +460,7 @@ pub fn deposit(
 fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64, f64, f64)> {
     let (dx, dy, dz) = (b.x[i] - b.x[p], b.y[i] - b.y[p], b.z[i] - b.z[p]);
     let (dvx, dvy, dvz) = (b.vx[i] - b.vx[p], b.vy[i] - b.vy[p], b.vz[i] - b.vz[p]);
-    let r = dx.hypot(dy).hypot(dz).max(1e-12);
+    let r = norm3(dx, dy, dz).max(1e-12);
     let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (b.m[p] + b.m[i]);
     let rv = dx * dvx + dy * dvy + dz * dvz;
@@ -464,7 +471,7 @@ fn elements(b: &Bodies, i: usize, p: usize) -> Option<(f64, f64, f64, f64, f64)>
     if !(inv > 1e-12) {
         return None;
     }
-    let ecc = ex.hypot(ey).hypot(ez).min(0.95);
+    let ecc = norm3(ex, ey, ez).min(0.95);
     let (hx, hy, hz) = (dy * dvz - dz * dvy, dz * dvx - dx * dvz, dx * dvy - dy * dvx);
     let hn = (hx * hx + hy * hy + hz * hz).sqrt();
     // Planar orbits (h along ±z) keep the original 2D periapsis angle.
@@ -489,7 +496,7 @@ fn semi_major_axis(b: &Bodies, i: usize, p: usize) -> Option<f64> {
     let dvx = b.vx[i] - b.vx[p];
     let dvy = b.vy[i] - b.vy[p];
     let dvz = b.vz[i] - b.vz[p];
-    let r = dx.hypot(dy).hypot(dz).max(1e-12);
+    let r = norm3(dx, dy, dz).max(1e-12);
     let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
     let mu = G * (b.m[p] + b.m[i]);
     let inv = 2.0 / r - v2 / mu;
@@ -517,7 +524,7 @@ pub fn init_fields(b: &mut Bodies, ranges: Option<&[(usize, usize)]>) {
             if i == pri {
                 continue;
             }
-            let d = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]);
+            let d = norm3(b.x[i] - b.x[pri], b.y[i] - b.y[pri], b.z[i] - b.z[pri]);
             let apo = orbit_info(b, i, pri).apo;
             extent = extent.max(if apo.is_finite() { apo.min(d * 3.0) } else { d });
         }
@@ -650,7 +657,7 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
     let mu = G * b.m[pri];
     let members: Vec<(usize, f64)> = (0..b.len())
         .filter(|&i| i != pri && !b.dead[i] && b.origin[i].is_belt())
-        .filter(|&i| (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]) < f.extent_gm)
+        .filter(|&i| norm3(b.x[i] - b.x[pri], b.y[i] - b.y[pri], b.z[i] - b.z[pri]) < f.extent_gm)
         .filter_map(|i| semi_major_axis(b, i, pri).map(|a| (i, a)))
         .collect();
     let belt_mass: f64 = members.iter().map(|&(i, _)| b.m[i]).sum();
@@ -666,7 +673,7 @@ pub fn grind_belts(b: &mut Bodies, f: &mut DustField, dt: f64, rng: &mut XorShif
             continue;
         }
         let dm = BELT_GRIND_CHUNK * m;
-        let r = (b.x[i] - b.x[pri]).hypot(b.y[i] - b.y[pri]).hypot(b.z[i] - b.z[pri]).max(1e-6);
+        let r = norm3(b.x[i] - b.x[pri], b.y[i] - b.y[pri], b.z[i] - b.z[pri]).max(1e-6);
         let vc = (mu / r).sqrt();
         mark_energy(b);
         b.set_mass(i, m - dm);

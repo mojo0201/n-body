@@ -170,6 +170,12 @@ pub(super) fn force_direct_on_parallel(b: &Bodies, i: usize) -> (f64, f64, f64, 
 ///     `i`, so `dt_limit` is called in place and the separate `dtl`
 ///     pass is skipped.
 pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
+    compute_accel_direct_sym_impl::<true>(b);
+}
+
+/// `LIMITER = false` skips the per-pair step-size limiter (`dtl` is left as it
+/// was); the accelerations are bit-identical either way.
+pub(super) fn compute_accel_direct_sym_impl<const LIMITER: bool>(b: &mut Bodies) {
     let Bodies {
         x,
         y,
@@ -192,8 +198,8 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
 
     // Per-body running maxima; index j is updated by every i < j and
     // finalised once the outer loop reaches j.
-    let mut s_max = vec![0.0f64; n];
-    let mut w_max = vec![0.0f64; n];
+    let mut s_max = vec![0.0f64; if LIMITER { n } else { 0 }];
+    let mut w_max = vec![0.0f64; if LIMITER { n } else { 0 }];
 
     let xs = &x[..n];
     let ys = &y[..n];
@@ -225,10 +231,10 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
         let (ax_hi, ax_rest) = axs.split_at_mut(i + 1);
         let (ay_hi, ay_rest) = ays.split_at_mut(i + 1);
         let (az_hi, az_rest) = azs.split_at_mut(i + 1);
-        let (sm_hi, sm_rest) = s_max.split_at_mut(i + 1);
-        let (wm_hi, wm_rest) = w_max.split_at_mut(i + 1);
-        let mut si = sm_hi[i];
-        let mut wi = wm_hi[i];
+        let (sm_hi, sm_rest) = s_max.split_at_mut(if LIMITER { i + 1 } else { 0 });
+        let (wm_hi, wm_rest) = w_max.split_at_mut(if LIMITER { i + 1 } else { 0 });
+        let mut si = if LIMITER { sm_hi[i] } else { 0.0 };
+        let mut wi = if LIMITER { wm_hi[i] } else { 0.0 };
 
         for k in 0..(n - i - 1) {
             let j = k + i + 1;
@@ -252,31 +258,37 @@ pub(super) fn compute_accel_direct_sym(b: &mut Bodies) {
             ay_rest[k] -= fj * dy;
             az_rest[k] -= fj * dz;
 
-            let s = (mi + mj) * inv;
-            let dvx = vxs[j] - vxi;
-            let dvy = vys[j] - vyi;
-            let dvz = vzs[j] - vzi;
-            let w = (dvx * dvx + dvy * dvy + dvz * dvz) * inv * d;
+            if LIMITER {
+                let s = (mi + mj) * inv;
+                let dvx = vxs[j] - vxi;
+                let dvy = vys[j] - vyi;
+                let dvz = vzs[j] - vzi;
+                let w = (dvx * dvx + dvy * dvy + dvz * dvz) * inv * d;
 
-            // `f64::max` == `if a > b` for non-NaN operands; d2 >= SOFT2
-            // guarantees both s and w here are finite, so the branchless
-            // form is safe and avoids a cmov / branch per element.
-            si = si.max(s);
-            sm_rest[k] = sm_rest[k].max(s);
-            wi = wi.max(w);
-            wm_rest[k] = wm_rest[k].max(w);
+                // `f64::max` == `if a > b` for non-NaN operands; d2 >= SOFT2
+                // guarantees both s and w here are finite, so the branchless
+                // form is safe and avoids a cmov / branch per element.
+                si = si.max(s);
+                sm_rest[k] = sm_rest[k].max(s);
+                wi = wi.max(w);
+                wm_rest[k] = wm_rest[k].max(w);
+            }
         }
 
         ax_hi[i] += axi;
         ay_hi[i] += ayi;
         az_hi[i] += azi;
-        sm_hi[i] = si;
-        wm_hi[i] = wi;
+        if LIMITER {
+            sm_hi[i] = si;
+            wm_hi[i] = wi;
+        }
         // s_max[i], w_max[i] are final for body i: nothing will ever
         // update them again (all j > i pairs have already been folded
         // into sm_rest/wm_rest above). Emit dtl[i] now and skip the
         // post-loop pass.
-        dtls[i] = dt_limit(si, wi);
+        if LIMITER {
+            dtls[i] = dt_limit(si, wi);
+        }
     }
 }
 
@@ -367,12 +379,23 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
 /// configurations. Only the linear term is corrected; angular and
 /// tidal components are left in the field.
 pub fn compute_accel(b: &mut Bodies) {
+    compute_accel_opt(b, true);
+}
+
+/// `compute_accel`, optionally without refreshing the step-size limiter `dtl`
+/// (small systems only; larger ones always refresh it). Accelerations are
+/// bit-identical either way.
+pub(super) fn compute_accel_opt(b: &mut Bodies, limiter: bool) {
     let n = b.len();
     if n == 0 {
         return;
     }
     if n < PAR_DIRECT_MIN {
-        compute_accel_direct_sym(b);
+        if limiter {
+            compute_accel_direct_sym_impl::<true>(b);
+        } else {
+            compute_accel_direct_sym_impl::<false>(b);
+        }
     } else {
         let all: Vec<u32> = (0..n as u32).collect();
         eval_forces(b, &all);
@@ -532,6 +555,89 @@ pub(super) fn account_gw_loss(b: &mut Bodies, dt: f64) {
 /// 100 AU from a Sun-mass star; Mercury's coupling is ~2.5e-8, Neptune's ~3e-10.
 const PN_COUPLING_MIN: f64 = 1.0e-10;
 
+/// Post-Newtonian terms for the pair (host `i`, body `j`), applied to whichever
+/// of the two is in `on_i` / `on_j`. Far pairs, and pairs whose relative speed is
+/// far below `c`, add nothing.
+fn pn_pair(b: &mut Bodies, i: usize, j: usize, on_i: bool, on_j: bool, inv_c2: f64, inv_c5: f64) {
+    let (mi, xi, yi, zi) = (b.m[i], b.x[i], b.y[i], b.z[i]);
+    let (vxi, vyi, vzi) = (b.vx[i], b.vy[i], b.vz[i]);
+    let vi_sq = vxi * vxi + vyi * vyi + vzi * vzi;
+    let mj = b.m[j];
+    let dx = xi - b.x[j];
+    let dy = yi - b.y[j];
+    let dz = zi - b.z[j];
+    let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
+    // Far pairs: the PN terms scale as G(mi+mj)/(c² r) relative to the
+    // Newtonian force, so beyond a cutoff they sit below integrator
+    // error. This also drops every cross-system pair in a cluster.
+    let cut = G * (mi + mj) * inv_c2 * (1.0 / PN_COUPLING_MIN);
+    if r2 > cut * cut {
+        return;
+    }
+    let r = r2.sqrt();
+    let r_inv = 1.0 / r;
+    let nxi = dx * r_inv;
+    let nyi = dy * r_inv;
+    let nzi = dz * r_inv;
+
+    let vxj = b.vx[j];
+    let vyj = b.vy[j];
+    let vzj = b.vz[j];
+    let vj_sq = vxj * vxj + vyj * vyj + vzj * vzj;
+    let v_dot = vxi * vxj + vyi * vyj + vzi * vzj;
+    let n_dot_vi = nxi * vxi + nyi * vyi + nzi * vzi;
+    let n_dot_vj = nxi * vxj + nyi * vyj + nzi * vzj;
+
+    // ---- 1PN (EIH), evaluated separately for each body ----
+    // n points from j to i. For body j the roles swap and n -> -n.
+    let coeff_i = G * mj * inv_c2 * r_inv * r_inv;
+    let bracket_i = -(vi_sq + 2.0 * vj_sq - 4.0 * v_dot - 1.5 * n_dot_vj * n_dot_vj)
+        + 5.0 * G * mi * r_inv
+        + 4.0 * G * mj * r_inv;
+    let vcoef_i = 4.0 * n_dot_vi - 3.0 * n_dot_vj;
+    if on_i {
+        b.ax[i] += coeff_i * (bracket_i * nxi + vcoef_i * (vxi - vxj));
+        b.ay[i] += coeff_i * (bracket_i * nyi + vcoef_i * (vyi - vyj));
+        b.az[i] += coeff_i * (bracket_i * nzi + vcoef_i * (vzi - vzj));
+    }
+
+    let coeff_j = G * mi * inv_c2 * r_inv * r_inv;
+    let bracket_j = -(vj_sq + 2.0 * vi_sq - 4.0 * v_dot - 1.5 * n_dot_vi * n_dot_vi)
+        + 5.0 * G * mj * r_inv
+        + 4.0 * G * mi * r_inv;
+    let vcoef_j = -4.0 * n_dot_vj + 3.0 * n_dot_vi;
+    if on_j {
+        b.ax[j] += coeff_j * (bracket_j * (-nxi) + vcoef_j * (vxj - vxi));
+        b.ay[j] += coeff_j * (bracket_j * (-nyi) + vcoef_j * (vyj - vyi));
+        b.az[j] += coeff_j * (bracket_j * (-nzi) + vcoef_j * (vzj - vzi));
+    }
+
+    // ---- 2.5PN (Peters drag) ----
+    // Skips the arithmetic for pairs where v_rel << c. The
+    // threshold is (v_rel/c)² > GW_REL_V2_MIN (1e-6), that is
+    // v_rel above about 300 km/s. Below that the drag is
+    // far smaller than the integrator error.
+    let rvx = vxi - vxj;
+    let rvy = vyi - vyj;
+    let rvz = vzi - vzj;
+    let rel_v_sq = rvx * rvx + rvy * rvy + rvz * rvz;
+    if rel_v_sq * inv_c2 > GW_REL_V2_MIN {
+        let r4 = r2 * r2;
+        let coeff_i = -(32.0 / 5.0) * G * G * G * mi * mj * mj * inv_c5 / r4;
+        let coeff_j = (32.0 / 5.0) * G * G * G * mi * mi * mj * inv_c5 / r4;
+        if on_i {
+            b.ax[i] += coeff_i * rvx;
+            b.ay[i] += coeff_i * rvy;
+            b.az[i] += coeff_i * rvz;
+        }
+        if on_j {
+            b.ax[j] += coeff_j * rvx;
+            b.ay[j] += coeff_j * rvy;
+            b.az[j] += coeff_j * rvz;
+        }
+    }
+}
+
 pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let n = b.len();
     if n < 2 {
@@ -559,104 +665,43 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let hosts: Vec<usize> = (0..n)
         .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
         .collect();
-    // Bodies sorted by x, so each host only scans the slab within its
+    // A host that is not active this tick only needs its pairs with active
+    // bodies; those are the common case in a block step (a few fast bodies).
+    // Each body still receives its terms from the hosts in the same order, so
+    // the result is identical to visiting every pair.
+    let any_active_host = hosts.iter().any(|&h| on(h));
+    // Bodies sorted by x, so each active host only scans the slab within its
     // coupling cutoff instead of the whole population (matters with many
     // systems, where almost every pair is far beyond the cutoff).
-    let mut order: Vec<u32> = (0..n as u32).filter(|&k| !b.dead[k as usize]).collect();
-    order.sort_unstable_by(|&p, &q| b.x[p as usize].total_cmp(&b.x[q as usize]));
-    let xs: Vec<f64> = order.iter().map(|&k| b.x[k as usize]).collect();
-    let m_max = order.iter().map(|&k| b.m[k as usize]).fold(0.0, f64::max);
+    let mut order: Vec<u32> = Vec::new();
+    let mut xs: Vec<f64> = Vec::new();
+    let mut m_max = 0.0f64;
+    if any_active_host {
+        order = (0..n as u32).filter(|&k| !b.dead[k as usize]).collect();
+        order.sort_unstable_by(|&p, &q| b.x[p as usize].total_cmp(&b.x[q as usize]));
+        xs = order.iter().map(|&k| b.x[k as usize]).collect();
+        m_max = order.iter().map(|&k| b.m[k as usize]).fold(0.0, f64::max);
+    }
     for &i in &hosts {
-        let mi = b.m[i];
-        let xi = b.x[i];
-        let yi = b.y[i];
-        let zi = b.z[i];
-        let vxi = b.vx[i];
-        let vyi = b.vy[i];
-        let vzi = b.vz[i];
-        let vi_sq = vxi * vxi + vyi * vyi + vzi * vzi;
-
-        let cut_max = G * (mi + m_max) * inv_c2 * (1.0 / PN_COUPLING_MIN);
-        let lo = xs.partition_point(|&x| x < xi - cut_max);
-        let hi = xs.partition_point(|&x| x <= xi + cut_max);
-        for &ju in &order[lo..hi] {
-            let j = ju as usize;
-            if j == i || (is_host_kind(b.kind[j]) && j < i) {
-                continue;
-            }
-            let mj = b.m[j];
-            let dx = xi - b.x[j];
-            let dy = yi - b.y[j];
-            let dz = zi - b.z[j];
-            let r2 = dx * dx + dy * dy + dz * dz + SOFT2;
-            // Far pairs: the PN terms scale as G(mi+mj)/(c² r) relative to the
-            // Newtonian force, so beyond a cutoff they sit below integrator
-            // error. This also drops every cross-system pair in a cluster.
-            let cut = G * (mi + mj) * inv_c2 * (1.0 / PN_COUPLING_MIN);
-            if r2 > cut * cut {
-                continue;
-            }
-            let r = r2.sqrt();
-            let r_inv = 1.0 / r;
-            let nxi = dx * r_inv;
-            let nyi = dy * r_inv;
-            let nzi = dz * r_inv;
-
-            let vxj = b.vx[j];
-            let vyj = b.vy[j];
-            let vzj = b.vz[j];
-            let vj_sq = vxj * vxj + vyj * vyj + vzj * vzj;
-            let v_dot = vxi * vxj + vyi * vyj + vzi * vzj;
-            let n_dot_vi = nxi * vxi + nyi * vyi + nzi * vzi;
-            let n_dot_vj = nxi * vxj + nyi * vyj + nzi * vzj;
-
-            // ---- 1PN (EIH), evaluated separately for each body ----
-            // n points from j to i. For body j the roles swap and n -> -n.
-            let coeff_i = G * mj * inv_c2 * r_inv * r_inv;
-            let bracket_i = -(vi_sq + 2.0 * vj_sq - 4.0 * v_dot - 1.5 * n_dot_vj * n_dot_vj)
-                + 5.0 * G * mi * r_inv
-                + 4.0 * G * mj * r_inv;
-            let vcoef_i = 4.0 * n_dot_vi - 3.0 * n_dot_vj;
-            if on(i) {
-                b.ax[i] += coeff_i * (bracket_i * nxi + vcoef_i * (vxi - vxj));
-                b.ay[i] += coeff_i * (bracket_i * nyi + vcoef_i * (vyi - vyj));
-                b.az[i] += coeff_i * (bracket_i * nzi + vcoef_i * (vzi - vzj));
-            }
-
-            let coeff_j = G * mi * inv_c2 * r_inv * r_inv;
-            let bracket_j = -(vj_sq + 2.0 * vi_sq - 4.0 * v_dot - 1.5 * n_dot_vi * n_dot_vi)
-                + 5.0 * G * mj * r_inv
-                + 4.0 * G * mi * r_inv;
-            let vcoef_j = -4.0 * n_dot_vj + 3.0 * n_dot_vi;
-            if on(j) {
-                b.ax[j] += coeff_j * (bracket_j * (-nxi) + vcoef_j * (vxj - vxi));
-                b.ay[j] += coeff_j * (bracket_j * (-nyi) + vcoef_j * (vyj - vyi));
-                b.az[j] += coeff_j * (bracket_j * (-nzi) + vcoef_j * (vzj - vzi));
-            }
-
-            // ---- 2.5PN (Peters drag) ----
-            // Skips the arithmetic for pairs where v_rel << c. The
-            // threshold is (v_rel/c)² > GW_REL_V2_MIN (1e-6), that is
-            // v_rel above about 300 km/s. Below that the drag is
-            // far smaller than the integrator error.
-            let rvx = vxi - vxj;
-            let rvy = vyi - vyj;
-            let rvz = vzi - vzj;
-            let rel_v_sq = rvx * rvx + rvy * rvy + rvz * rvz;
-            if rel_v_sq * inv_c2 > GW_REL_V2_MIN {
-                let r4 = r2 * r2;
-                let coeff_i = -(32.0 / 5.0) * G * G * G * mi * mj * mj * inv_c5 / r4;
-                let coeff_j = (32.0 / 5.0) * G * G * G * mi * mi * mj * inv_c5 / r4;
-                if on(i) {
-                    b.ax[i] += coeff_i * rvx;
-                    b.ay[i] += coeff_i * rvy;
-                    b.az[i] += coeff_i * rvz;
+        if on(i) {
+            let xi = b.x[i];
+            let cut_max = G * (b.m[i] + m_max) * inv_c2 * (1.0 / PN_COUPLING_MIN);
+            let lo = xs.partition_point(|&x| x < xi - cut_max);
+            let hi = xs.partition_point(|&x| x <= xi + cut_max);
+            for &ju in &order[lo..hi] {
+                let j = ju as usize;
+                if j == i || (is_host_kind(b.kind[j]) && j < i) {
+                    continue;
                 }
-                if on(j) {
-                    b.ax[j] += coeff_j * rvx;
-                    b.ay[j] += coeff_j * rvy;
-                    b.az[j] += coeff_j * rvz;
+                pn_pair(b, i, j, true, on(j), inv_c2, inv_c5);
+            }
+        } else if let Some(act) = active {
+            for &ju in act {
+                let j = ju as usize;
+                if b.dead[j] || j == i || (is_host_kind(b.kind[j]) && j < i) {
+                    continue;
                 }
+                pn_pair(b, i, j, false, true, inv_c2, inv_c5);
             }
         }
     }

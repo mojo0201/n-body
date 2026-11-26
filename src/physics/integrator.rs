@@ -26,7 +26,7 @@ use super::*;
 /// and time-reversible. `compute_accel` is the expensive part; the three
 /// velocity/position loops are memory-bandwidth bound on their own.
 #[inline]
-pub(super) fn leapfrog_step(b: &mut Bodies, dt: f64) {
+pub(super) fn leapfrog_step(b: &mut Bodies, dt: f64, limiter: bool) {
     let n = b.len();
     for i in 0..n {
         b.vx[i] += 0.5 * b.ax[i] * dt;
@@ -36,7 +36,7 @@ pub(super) fn leapfrog_step(b: &mut Bodies, dt: f64) {
         b.y[i] += b.vy[i] * dt;
         b.z[i] += b.vz[i] * dt;
     }
-    compute_accel(b);
+    compute_accel_opt(b, limiter);
     for i in 0..n {
         b.vx[i] += 0.5 * b.ax[i] * dt;
         b.vy[i] += 0.5 * b.ay[i] * dt;
@@ -142,11 +142,15 @@ fn collision_signature(b: &Bodies) -> (usize, [u64; 5]) {
 ///
 /// `age_flashes` runs *after* `b.time` has been advanced so its absolute-time
 /// retention is exact.
-pub(super) fn yoshida_step(b: &mut Bodies, dt: f64) {
+///
+/// `last` marks the final sub-step of an `advance`: only the force evaluation
+/// that ends it needs to refresh the step-size limiter, since the next
+/// `advance` reads `dtl` from there and every earlier evaluation is overwritten.
+pub(super) fn yoshida_step(b: &mut Bodies, dt: f64, last: bool) {
     snapshot_positions(b);
-    leapfrog_step(b, Y_W1 * dt);
-    leapfrog_step(b, Y_W0 * dt);
-    leapfrog_step(b, Y_W1 * dt);
+    leapfrog_step(b, Y_W1 * dt, false);
+    leapfrog_step(b, Y_W0 * dt, false);
+    leapfrog_step(b, Y_W1 * dt, last);
     let sig = collision_signature(b);
     collision_pass(b, dt, None);
     // A collision changes the body set (merged bodies, fragments, compacted
@@ -590,7 +594,7 @@ pub fn advance_run(job: &mut AdvanceJob, b: &mut Bodies, mut keep_going: impl Fn
     let dt = job.dt;
     if !job.integrated {
         while job.yoshida_left > 0 {
-            yoshida_step(b, job.yh);
+            yoshida_step(b, job.yh, job.yoshida_left == 1);
             job.yoshida_left -= 1;
             if job.yoshida_left > 0 && !keep_going() {
                 return false;

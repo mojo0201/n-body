@@ -143,9 +143,11 @@ pub const ETA_VEL: f64 = 0.03;
 /// block leapfrog (whose per-body sub-steps have lower order).
 pub const YOSHIDA_MAX_N: usize = 1500;
 
-/// Largest work for the Yoshida path in one `advance`, in pair evaluations:
+/// Largest work for the Yoshida path in one `advance`, in pair evaluations
+/// (0.5 M is about 2.5 ms on one core; above it the block stepper is 5–10x
+/// cheaper at ~25x the energy error, still ~0.004 % over a year):
 /// `n² · 3 · 2^kmax`. Above this, `advance` uses the block stepper.
-pub const YOSHIDA_WORK_MAX: usize = 20_000_000;
+pub const YOSHIDA_WORK_MAX: usize = 500_000;
 
 // ---- Unit conversion -------------------------------------------------------
 
