@@ -218,6 +218,152 @@ fn ab_hot_grid_matches_full_path() {
 }
 
 // ===========================================================================
+// ab (extension) — hot-vs-cold complement
+// ===========================================================================
+/// A fast belt impactor must be caught even when the hot set is small and
+/// the total body count is high. `collision_pass` used to gate hot-vs-cold
+/// on `h·n ≤ 2 000 000` and skip the sweep entirely above that, so these
+/// projectiles tunnelled straight through the cold belt: their *only* pair
+/// was hot-vs-cold, and the gate dropped it. The belt below is sized so
+/// `1e2 · 3.7e4 > 2e6` (which trips the old gate) while h² = 1e4 stays
+/// below `HOT_FULL_SCAN_MIN`, so the dense-population full sweep does not
+/// rescue the case. Every projectile must merge with the belt body on its
+/// own column.
+#[test]
+fn ab_hot_vs_cold_resolves_belt_impactors_at_high_n() {
+    let mut b = Bodies::with_capacity(40_000);
+    // Cold belt: a 220 x 170 sheet of touching bodies at z = 0. Spacing 2.0
+    // with contact radius 0.99 leaves neighbours 2e-2 apart — close, but
+    // never overlapping, so the only possible pairs are the ones we place.
+    for k in 0..220usize {
+        for l in 0..170usize {
+            let i = b.push(
+                k as f64 * 2.0,
+                l as f64 * 2.0,
+                0.0,
+                0.0,
+                1e-4,
+                BodyKind::Planet,
+            );
+            b.r[i] = 0.99;
+        }
+    }
+    // A hundred projectiles, each parked 0.9 units above its own belt column.
+    let mut hot = Vec::new();
+    for k in 0..100usize {
+        let i = b.push(k as f64 * 4.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+        b.z[i] = 0.9;
+        b.r[i] = 0.5;
+        hot.push(i);
+    }
+    let n = b.len();
+    assert!(
+        hot.len().saturating_mul(n) > 2_000_000,
+        "must trip the old h·n gate"
+    );
+    assert!(
+        hot.len().saturating_mul(hot.len()) <= HOT_FULL_SCAN_MIN,
+        "must not be the dense-population fallback"
+    );
+
+    collision_pass(&mut b, DT, Some(&hot));
+
+    assert_eq!(
+        b.stats.merges, 100,
+        "every projectile must merge with its belt body"
+    );
+    assert_eq!(b.stats.impacts, 0, "parked impactors merge, they don't hit-and-run");
+    assert_eq!(b.len(), n - 100, "one belt body per projectile is compacted away");
+}
+
+/// The swept narrow phase must catch a fast projectile whose whole crossing
+/// happens inside one sub-tick — neither endpoint is near the belt body, so
+/// only the segment test sees the hit. This pins the anti-tunnelling reach
+/// of the hot-vs-cold path specifically (the hot-hot swept case is covered
+/// by the `n_swept_*` tests).
+#[test]
+fn ab_hot_vs_cold_swept_catches_fast_impactor() {
+    let mut b = Bodies::with_capacity(300);
+    // A small cold belt ringed around the target column; the projectile's
+    // path misses every other body.
+    for k in 0..15usize {
+        for l in 0..15usize {
+            let i = b.push(
+                k as f64 * 2.0,
+                l as f64 * 2.0,
+                0.0,
+                0.0,
+                1e-4,
+                BodyKind::Planet,
+            );
+            b.r[i] = 0.99;
+        }
+    }
+    // Projectile: starts 20 units above the belt and ends 20 below it within
+    // one sub-tick. Endpoints are far outside contact range.
+    let target = 0usize; // belt body at (0, 0, 0)
+    let p = b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.r[p] = 0.5;
+    b._pz[p] = 20.0;
+    b.z[p] = -20.0;
+    assert!(!pair_hit(&b, p, target, false), "no endpoint overlap");
+    collision_pass(&mut b, DT, Some(&[p]));
+    assert_eq!(b.stats.merges, 1, "swept hot-vs-cold must merge the crossing");
+}
+
+/// Ground truth for the always-on hot-vs-cold complement: for a static
+/// population (no `_p -> x` motion, so the swept and static tests agree),
+/// the union of `find_collisions_hot` and `hot_vs_cold` must equal the full
+/// sweep restricted to pairs that touch the hot set. Both sizes run so each
+/// branch is exercised: the small one takes the brute-force full path, the
+/// hot O(n²) loop and the hot-vs-cold x-scan; the large one takes the hash
+/// grids in all three.
+#[test]
+fn ab_hot_vs_cold_matches_full_sweep() {
+    for &(n, hot_n, r) in &[(40usize, 20usize, 0.09), (520, 120, 0.05)] {
+        let mut b = Bodies::with_capacity(n);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (s >> 33) as f64 / (1u64 << 31) as f64
+        };
+        for _ in 0..n {
+            let i = b.push(
+                (rnd() - 0.5) * 0.4,
+                (rnd() - 0.5) * 0.4,
+                0.0,
+                0.0,
+                1.0,
+                BodyKind::Planet,
+            );
+            b.r[i] = r;
+        }
+        let hot: Vec<usize> = (0..hot_n).collect();
+
+        // `hot` is the index prefix, so "touches the hot set" == `i < hot_n`.
+        let mut expected: Vec<(usize, usize)> = find_collisions(&b, false, DT)
+            .into_iter()
+            .filter(|&(i, j)| i < hot_n || j < hot_n)
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        assert!(!expected.is_empty(), "n={n}: scenario must produce pairs");
+
+        let mut got = find_collisions_hot(&b, &hot, false, DT);
+        got.extend(hot_vs_cold(&b, &hot, &mut ColdScan::default()));
+        got.sort_unstable();
+        got.dedup();
+
+        assert_eq!(
+            got, expected,
+            "n={n}: hot ∪ hot-cold must equal the full sweep"
+        );
+    }
+}
+
+// ===========================================================================
 // ac — rubble bounce
 // ===========================================================================
 /// `rubble_bounce`'s guard is `if vn >= 0.0 { return; }`. In the *graze*

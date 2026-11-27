@@ -306,6 +306,8 @@ pub(super) struct BlockJob {
     bucket_pos: Vec<u32>,
     hot: Vec<usize>,
     active: Vec<u32>,
+    /// Per-sub-tick collision sweep scratch (hot-vs-cold buffers).
+    cold_scan: ColdScan,
     stale_accel: bool,
 }
 
@@ -369,6 +371,7 @@ impl BlockJob {
         bucket_pos,
         hot,
         active,
+        cold_scan: ColdScan::default(),
         stale_accel: false,
     }
     }
@@ -384,6 +387,7 @@ impl BlockJob {
     let mut bucket_pos = std::mem::take(&mut self.bucket_pos);
     let mut hot = std::mem::take(&mut self.hot);
     let mut active = std::mem::take(&mut self.active);
+    let mut cold_scan = std::mem::take(&mut self.cold_scan);
     let mut stale_accel = self.stale_accel;
     for tick in (self.tick + 1)..=ticks {
         // Drift everyone by the sub-tick dtf, snapshotting the old position
@@ -469,7 +473,7 @@ impl BlockJob {
                 b.stats.coalesces,
                 b.stats.bounces,
             );
-            collision_pass(b, dtf, Some(&hot));
+            collision_pass_scratch(b, dtf, Some(&hot), &mut cold_scan);
             settle_energy(b);
             let stats_after = (
                 b.stats.merges,
@@ -501,6 +505,7 @@ impl BlockJob {
             self.bucket_pos = bucket_pos;
             self.hot = hot;
             self.active = active;
+            self.cold_scan = cold_scan;
             self.stale_accel = stale_accel;
             return false;
         }

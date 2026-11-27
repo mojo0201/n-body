@@ -228,7 +228,7 @@ pub(super) fn find_collisions_hot(
     dt: f64,
 ) -> Vec<(usize, usize)> {
     let _ = dt;
-    if hot.len() * hot.len() > 4_000_000 {
+    if hot.len().saturating_mul(hot.len()) > HOT_FULL_SCAN_MIN {
         return find_collisions(b, sweep, dt);
     }
     let t_now = b.time;
@@ -342,21 +342,56 @@ pub(super) fn find_collisions_hot(
 /// Largest hot × cold product for which `hot_vs_cold` scans every pair.
 const HOT_SCAN_MAX: usize = 40_000;
 
-fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
+/// Largest hot × hot square (h²) below which `find_collisions_hot` pairs hot
+/// with hot. At or above it the hot set is dense enough that the full sweep —
+/// which also covers cold-vs-hot and cold-vs-cold — is cheaper, so
+/// `collision_pass_scratch` delegates there and skips the complementing pass.
+pub(super) const HOT_FULL_SCAN_MIN: usize = 4_000_000;
+
+/// Reusable scratch for the hot-vs-cold sweep.
+///
+/// `hot_vs_cold` touches several population-sized buffers (the live sets,
+/// the cold-by-x list, the counting-sort grid). One `ColdScan` lives inside
+/// `BlockJob` and is threaded through every sub-tick, so the per-sub-tick
+/// collision sweeps keep their capacity across the whole block instead of
+/// paying ~n-sized allocation churn per call.
+#[derive(Default)]
+pub(super) struct ColdScan {
+    in_hot: Vec<bool>,
+    live_hot: Vec<usize>,
+    cold: Vec<usize>,
+    sorted: Vec<(f64, usize)>,
+    cells: Vec<(i64, i64)>,
+    radii: Vec<f64>,
+    start: Vec<u32>,
+    fill: Vec<u32>,
+    items: Vec<u32>,
+}
+
+/// See `HOT_SCAN_MAX`. `s` supplies the population-sized scratch buffers.
+pub(super) fn hot_vs_cold(b: &Bodies, hot: &[usize], s: &mut ColdScan) -> Vec<(usize, usize)> {
     let t_now = b.time;
     let n = b.len();
-    let mut in_hot = vec![false; n];
+    s.in_hot.clear();
+    s.in_hot.resize(n, false);
     for &i in hot {
-        in_hot[i] = true;
+        if i < n {
+            s.in_hot[i] = true;
+        }
     }
-    let live_hot: Vec<usize> = hot
-        .iter()
-        .copied()
-        .filter(|&i| !b.dead[i] && t_now >= b.imm[i])
-        .collect();
-    let cold: Vec<usize> = (0..n)
-        .filter(|&j| !in_hot[j] && !b.dead[j] && t_now >= b.imm[j])
-        .collect();
+    s.live_hot.clear();
+    s.live_hot.extend(
+        hot.iter()
+            .copied()
+            .filter(|&i| i < n && !b.dead[i] && t_now >= b.imm[i]),
+    );
+    s.cold.clear();
+    for j in 0..n {
+        if !s.in_hot[j] && !b.dead[j] && t_now >= b.imm[j] {
+            s.cold.push(j);
+        }
+    }
+    let (live_hot, cold) = (&s.live_hot, &s.cold);
     if live_hot.is_empty() || cold.is_empty() {
         return Vec::new();
     }
@@ -385,14 +420,16 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
         // Cold bodies sorted by x: each hot body probes only the x-window
         // `[xi - cell, xi + cell]`. Output order differs from a plain scan, but
         // the caller sorts and dedups the pairs. Non-finite x can never hit.
-        let mut sorted: Vec<(f64, usize)> = cold
-            .iter()
-            .map(|&j| (b.x[j], j))
-            .filter(|&(x, _)| x.is_finite())
-            .collect();
+        let sorted = &mut s.sorted;
+        sorted.clear();
+        sorted.extend(
+            cold.iter()
+                .map(|&j| (b.x[j], j))
+                .filter(|&(x, _)| x.is_finite()),
+        );
         sorted.sort_unstable_by(|a, c| a.0.total_cmp(&c.0));
         let mut out = Vec::new();
-        for &i in &live_hot {
+        for &i in live_hot {
             let (xi, yi, ri) = (b.x[i], b.y[i], b.contact_r(i));
             let lo = sorted.partition_point(|&(x, _)| x < xi - cell);
             for &(x, j) in &sorted[lo..] {
@@ -418,20 +455,30 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
     // Counting-sort bucket table over the cold bodies (same scheme as
     // `find_collisions_hot`): hash collisions only add a few extra distance
     // checks, they never lose a pair.
-    let cells: Vec<(i64, i64)> = cold
-        .iter()
-        .map(|&j| ((b.x[j] * inv).floor() as i64, (b.y[j] * inv).floor() as i64))
-        .collect();
-    let radii: Vec<f64> = cold.iter().map(|&j| b.contact_r(j)).collect();
-    let mut start = vec![0u32; table + 1];
-    for &(cx, cy) in &cells {
+    let cells = &mut s.cells;
+    cells.clear();
+    cells.extend(
+        cold.iter()
+            .map(|&j| ((b.x[j] * inv).floor() as i64, (b.y[j] * inv).floor() as i64)),
+    );
+    let radii = &mut s.radii;
+    radii.clear();
+    radii.extend(cold.iter().map(|&j| b.contact_r(j)));
+    let start = &mut s.start;
+    start.clear();
+    start.resize(table + 1, 0);
+    for &(cx, cy) in cells.iter() {
         start[bucket(cx, cy) + 1] += 1;
     }
     for k in 0..table {
         start[k + 1] += start[k];
     }
-    let mut fill: Vec<u32> = start[..table].to_vec();
-    let mut items = vec![0u32; nc];
+    let fill = &mut s.fill;
+    fill.clear();
+    fill.extend_from_slice(&start[..table]);
+    let items = &mut s.items;
+    items.clear();
+    items.resize(nc, 0);
     for (p, &(cx, cy)) in cells.iter().enumerate() {
         let k = bucket(cx, cy);
         items[fill[k] as usize] = p as u32;
@@ -439,7 +486,7 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
     }
 
     let mut out = Vec::new();
-    for &i in &live_hot {
+    for &i in live_hot {
         let ri = b.contact_r(i);
         let cx = (b.x[i] * inv).floor() as i64;
         let cy = (b.y[i] * inv).floor() as i64;
@@ -478,21 +525,43 @@ fn hot_vs_cold(b: &Bodies, hot: &[usize]) -> Vec<(usize, usize)> {
 /// fragments inherit the same immunity so they cannot be re-hit on their
 /// birth step.
 pub(super) fn collision_pass(b: &mut Bodies, dt: f64, hot: Option<&[usize]>) {
+    collision_pass_scratch(b, dt, hot, &mut ColdScan::default());
+}
+
+/// `collision_pass` with a caller-owned scratch buffer for the hot-vs-cold
+/// sweep, so the block stepper reuses its buffers across sub-ticks.
+pub(super) fn collision_pass_scratch(
+    b: &mut Bodies,
+    dt: f64,
+    hot: Option<&[usize]>,
+    scratch: &mut ColdScan,
+) {
     if b.len() < 2 {
         return;
     }
     let mut spawns: Vec<Spawn> = Vec::new();
     let pairs = match hot {
         Some(h) => {
-            let mut p = find_collisions_hot(b, h, true, dt);
-            // Brute force is fine while hot × n stays small; above that
-            // it falls back to hot-vs-hot only.
-            if h.len() * b.len() <= 2_000_000 {
-                p.extend(hot_vs_cold(b, h));
+            // `find_collisions_hot` hands the whole population to
+            // `find_collisions` once the hot set is dense enough
+            // (h² > `HOT_FULL_SCAN_MIN`); that full sweep already covers
+            // cold-vs-hot (and cold-vs-cold), so there is nothing to add.
+            // Otherwise the hot-vs-hot pass must be complemented by
+            // `hot_vs_cold` *unconditionally*: every body drifts each
+            // sub-tick, and a fast body's swept path can cross the cold
+            // majority even when the hot set is small. The old `h·n ≤ 2e6`
+            // gate dropped those crossings entirely once the total count was
+            // high enough — a belt impactor tunnelling straight through cold
+            // matter.
+            if h.len().saturating_mul(h.len()) > HOT_FULL_SCAN_MIN {
+                find_collisions(b, true, dt)
+            } else {
+                let mut p = find_collisions_hot(b, h, true, dt);
+                p.extend(hot_vs_cold(b, h, scratch));
                 p.sort_unstable();
                 p.dedup();
+                p
             }
-            p
         }
         None => find_collisions(b, true, dt),
     };
