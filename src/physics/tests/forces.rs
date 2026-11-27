@@ -605,3 +605,127 @@ fn am_compute_accel_finite_across_sizes() {
         }
     }
 }
+
+// ===========================================================================
+// am — add_pn_corrections: sorted-x slab cache reuse
+// ===========================================================================
+//
+// The cache (`pn_order` / `pn_x0`) replaces the per-call O(n log n) sort.
+// Its contract:
+//   * a warm call with zero drift is **bit-identical** to the call that
+//     built the cache (same slab, same order, margin 0);
+//   * after a drift the cached path must find exactly the pairs the fresh
+//     path finds (the margin widens the slab on frozen positions; `pn_pair`
+//     re-verifies current distances). Only the host-side summation order
+//     freezes between sorts, a last-ULP effect in an O(v²/c²) ≈ 1e-8 term;
+//   * any change to the body count invalidates the cache.
+
+/// Warm cache, nothing moved: the reused slab must reproduce the freshly
+/// built call bit-for-bit.
+#[test]
+fn am_pn_cache_warm_reuse_is_bit_identical() {
+    let mut b = solar_disc(1200, 7);
+    compute_accel(&mut b);
+    let first: Vec<f64> = b.ax.clone();
+    compute_accel(&mut b); // warm cache, delta == 0, margin == 0
+    for i in 0..b.len() {
+        assert_eq!(
+            b.ax[i].to_bits(),
+            first[i].to_bits(),
+            "body {i}: warm cache changed the result"
+        );
+    }
+}
+
+/// After positions have drifted a little, the cached path (widened slab, no
+/// re-sort) must find the same pairs as a forced fresh build. Dropped pairs
+/// would show up as ~1e-8 relative errors; the tolerance is set to 1e-9, far
+/// above the ULP-level ordering difference we do allow.
+#[test]
+fn am_pn_cache_after_drift_matches_fresh() {
+    let mut b = solar_disc(500, 99);
+    compute_accel(&mut b); // build the cache
+    for i in 0..b.len() {
+        b.x[i] += 1e-4 * (i as f64); // small vs the ~1e4 Gm coupling cutoff
+    }
+    compute_accel(&mut b); // cached: margin = delta_max, no re-sort
+    let cached: Vec<f64> = b.ax.clone();
+    b.pn_valid = false; // force the fresh-build path next call
+    compute_accel(&mut b);
+    for i in 0..b.len() {
+        let denom = cached[i].abs().max(b.ax[i].abs()).max(1e-300);
+        let rel = (b.ax[i] - cached[i]).abs() / denom;
+        assert!(
+            rel < 1e-9,
+            "body {i}: cached {:.15e} vs fresh {:.15e} (rel {rel:.1e})",
+            cached[i],
+            b.ax[i]
+        );
+    }
+}
+
+/// The same property through the block-stepper entry point: a warm cache with
+/// an explicit `active` subset must agree with a forced fresh build.
+///
+/// `add_pn_corrections` accumulates onto the existing `ax` (the block stepper
+/// runs it after the Newtonian pass), so the acceleration columns are zeroed
+/// before each run to make the comparison one call deep.
+#[test]
+fn am_pn_active_subset_cached_matches_fresh() {
+    let mut b = solar_disc(120, 8);
+    // Every body active: the whole population is the active set.
+    let active: Vec<u32> = (0..b.len() as u32).collect();
+    add_pn_corrections(&mut b, Some(&active)); // build the cache
+    for i in 0..b.len() {
+        b.x[i] += 1e-4 * (i as f64);
+    }
+    for a in [&mut b.ax, &mut b.ay, &mut b.az] {
+        a.fill(0.0);
+    }
+    add_pn_corrections(&mut b, Some(&active)); // cached path
+    let cached: Vec<f64> = b.ax.clone();
+    b.ax.fill(0.0);
+    b.ay.fill(0.0);
+    b.az.fill(0.0);
+    b.pn_valid = false;
+    add_pn_corrections(&mut b, Some(&active)); // fresh path, same positions
+    for i in 0..b.len() {
+        let denom = cached[i].abs().max(b.ax[i].abs()).max(1e-300);
+        let rel = (b.ax[i] - cached[i]).abs() / denom;
+        assert!(rel < 1e-9, "body {i}: cached {:.15e} vs fresh {:.15e}", cached[i], b.ax[i]);
+    }
+}
+
+/// A `push` changes `len`, which must invalidate the cache rather than index
+/// stale arrays.
+#[test]
+fn am_pn_cache_invalidated_by_push() {
+    let mut b = solar_disc(20, 4);
+    compute_accel(&mut b);
+    b.push(300.0, 0.0, 0.0, 30.0, 5.0, BodyKind::Planet);
+    compute_accel(&mut b); // must rebuild, not panic or mis-index
+    for i in 0..b.len() {
+        assert!(b.ax[i].is_finite(), "body {i}");
+    }
+}
+
+/// Bodies that died since the last sort stay in the cached order but must be
+/// skipped when the slab is walked — exactly as the fresh path (which leaves
+/// them out of `order` entirely).
+#[test]
+fn am_pn_cache_skips_bodies_that_died() {
+    let mut b = solar_disc(150, 11);
+    compute_accel(&mut b);
+    b.dead[3] = true; // no compact: len unchanged, cache stays valid
+    compute_accel(&mut b); // cached path, dead body skipped
+    let cached: Vec<f64> = b.ax.clone();
+    b.pn_valid = false;
+    compute_accel(&mut b); // fresh path also has body 3 dead
+    for i in 0..b.len() {
+        assert_eq!(
+            b.ax[i].to_bits(),
+            cached[i].to_bits(),
+            "body {i}: dead-body handling differs between the paths"
+        );
+    }
+}

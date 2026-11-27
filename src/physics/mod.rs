@@ -1131,6 +1131,25 @@ pub struct Bodies {
     pub parent_cache: Vec<Option<usize>>,
     pub parent_cache_step: u64,
     pub parent_cache_valid: bool,
+    /// X-order cache for `forces::add_pn_corrections`: live bodies sorted by
+    /// (x, index) with the x positions frozen at the last build. Reused across
+    /// calls so the per-call O(n log n) sort is paid only after bodies have
+    /// drifted more than `PN_SORT_DELTA_FRAC` of the tightest host's coupling
+    /// radius; in between, the slab window is widened by the measured drift,
+    /// which keeps the candidate set exact. Invalid when `pn_len != len()` or
+    /// when a fresh build is wanted (`pn_valid = false`). Bodies that died
+    /// since the last build stay in `pn_order` until the next rebuild and are
+    /// skipped when the slab is walked.
+    pub pn_order: Vec<u32>,
+    /// Frozen x per body index at the last `pn_order` build (`x0[k]` is body
+    /// `k`'s x then). Length `n` whenever `pn_valid && pn_len == n`.
+    pub pn_x0: Vec<f64>,
+    pub pn_len: usize,
+    pub pn_valid: bool,
+    /// Reused scratch for `add_pn_corrections` (host list, active-body
+    /// bit-mask), so the hot path allocates nothing per call.
+    pub pn_hosts: Vec<usize>,
+    pub pn_mask: Vec<bool>,
     pub flashes: Vec<Flash>,
     /// Statistical dust fields, one per system. They are not bodies.
     pub dust_fields: Vec<DustField>,
@@ -1185,6 +1204,12 @@ impl Bodies {
             parent_cache: Vec::with_capacity(n),
             parent_cache_step: 0,
             parent_cache_valid: false,
+            pn_order: Vec::with_capacity(n),
+            pn_x0: Vec::with_capacity(n),
+            pn_len: 0,
+            pn_valid: false,
+            pn_hosts: Vec::with_capacity(n),
+            pn_mask: Vec::new(),
             flashes: Vec::new(),
             dust_fields: Vec::new(),
             time: 0.0,

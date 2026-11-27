@@ -405,7 +405,9 @@ pub(super) fn compute_accel_opt(b: &mut Bodies, limiter: bool) {
     // (perihelion precession); 2.5PN is the leading gravitational-wave
     // radiation reaction (orbital decay). Only run when at least one
     // body is moving at v/c > 1e-5 (about 3 km/s). Only pairs that
-    // include a host body are corrected, so the cost is O(hosts · n).
+    // include a host body are corrected, so the cost is O(hosts · n);
+    // the sorted-x slab cache inside `add_pn_corrections` keeps both the
+    // sort and the pair scans off the per-tick hot path.
     if n >= 2 && needs_pn(b) {
         add_pn_corrections(b, None);
     }
@@ -533,6 +535,11 @@ pub(super) fn account_gw_loss(b: &mut Bodies, dt: f64) {
 /// to `b.ax` / `b.ay`. Called from `compute_accel` after the Newtonian
 /// pass, and only when `needs_pn` is true.
 ///
+/// The host–body pair walk uses a sorted-x slab cache on `Bodies` (`pn_order`
+/// / `pn_x0`) that is rebuilt only when bodies have drifted appreciably (see
+/// `PN_SORT_DELTA_FRAC`), so quiet ticks avoid the O(n log n) sort entirely;
+/// buffers are all reused, so the function allocates nothing per call.
+///
 /// **1PN** produces the same perihelion precession as the full EIH
 /// equations. Verified against the Mercury limit: for a test particle on
 /// a circular orbit (m_i ≪ m_j, v_j ≈ 0), the bracket reduces to
@@ -638,6 +645,71 @@ fn pn_pair(b: &mut Bodies, i: usize, j: usize, on_i: bool, on_j: bool, inv_c2: f
     }
 }
 
+/// Fraction of the tightest host's PN coupling distance at which the sorted
+/// x-order cache in `add_pn_corrections` is rebuilt. Between rebuilds the
+/// slab window is widened by the measured drift, so correctness never depends
+/// on this value — it only trades re-sort cost against window width.
+const PN_SORT_DELTA_FRAC: f64 = 0.25;
+
+/// (Re)build the x-order cache for `add_pn_corrections`: `order` receives the
+/// live body indices sorted by (x, index) at the *current* positions, and
+/// `x0` receives a per-body copy of those x values (`x0[k]` is body `k`'s x
+/// at this build). The index tie-break makes the order a total order, so the
+/// cache (and the slabs the binary searches below produce) is independent of
+/// when the last build ran. Bodies that die afterwards stay in the order
+/// until the next build; the slab walk skips them.
+fn pn_rebuild_order(b: &Bodies, order: &mut Vec<u32>, x0: &mut Vec<f64>, n: usize) {
+    order.clear();
+    for k in 0..n {
+        if !b.dead[k] {
+            order.push(k as u32);
+        }
+    }
+    let x = &b.x;
+    order.sort_unstable_by(|&p, &q| {
+        x[p as usize]
+            .total_cmp(&x[q as usize])
+            .then_with(|| p.cmp(&q))
+    });
+    x0.clear();
+    x0.resize(n, 0.0);
+    for &k in order.iter() {
+        x0[k as usize] = x[k as usize];
+    }
+}
+
+/// First index `m` in `order` such that `x0[order[m]] >= target`. `order`
+/// must be sorted by these keys (see `pn_rebuild_order`). Analogous to
+/// `slice::partition_point` applied through the permutation.
+fn pn_partition_lo(order: &[u32], x0: &[f64], target: f64) -> usize {
+    let mut lo = 0;
+    let mut hi = order.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if x0[order[mid] as usize] < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// First index `m` in `order` such that `x0[order[m]] > target`.
+fn pn_partition_hi(order: &[u32], x0: &[f64], target: f64) -> usize {
+    let mut lo = 0;
+    let mut hi = order.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if x0[order[mid] as usize] <= target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let n = b.len();
     if n < 2 {
@@ -648,49 +720,107 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
     let inv_c5 = inv_c2 * inv_c2 / c;
 
     // When called from the block stepper, only update active bodies so
-    // inactive bodies don't get PN added twice.
-    let mask: Option<Vec<bool>> = active.map(|a| {
-        let mut m = vec![false; n];
-        for &k in a {
-            m[k as usize] = true;
+    // inactive bodies don't get PN added twice. `mask` is a reused scratch
+    // buffer (`Vec<bool>` is a bit-vector), so a call allocates nothing.
+    let uses_mask = active.is_some();
+    let mut mask = std::mem::take(&mut b.pn_mask);
+    if let Some(act) = active {
+        mask.clear();
+        mask.resize(n, false);
+        for &k in act {
+            mask[k as usize] = true;
         }
-        m
-    });
-    let on = |k: usize| mask.as_ref().is_none_or(|m| m[k]);
+    }
+    let on = |k: usize| !uses_mask || mask[k];
+
+    // Scratch out of the way so `pn_pair` below can borrow `b` mutably; the
+    // buffers themselves (and their capacity) are kept across calls.
+    let mut order = std::mem::take(&mut b.pn_order);
+    let mut x0 = std::mem::take(&mut b.pn_x0);
+    let mut hosts = std::mem::take(&mut b.pn_hosts);
+    // The x-order cache holds when the body set has not changed (`len` is
+    // bumped by every push / compaction) and a build happened at some point.
+    let cached = b.pn_valid && b.pn_len == n;
 
     // Every pair that gets PN terms contains a host body. The outer loop
     // visits hosts only. The `j` loop below skips a host `j` with `j < i`,
     // so a host-host pair is done once, and a host-planet pair is done
     // once. Planet-planet pairs get no PN terms (they are negligible).
-    let hosts: Vec<usize> = (0..n)
-        .filter(|&k| !b.dead[k] && is_host_kind(b.kind[k]))
-        .collect();
+    //
+    // Host list, `m_max` and — when the cache is usable — the largest
+    // displacement since the last build are collected in one pass.
+    hosts.clear();
+    let mut m_max = 0.0f64;
+    let mut m_host_min = f64::INFINITY;
+    let mut delta_max = 0.0f64;
+    for k in 0..n {
+        if b.dead[k] {
+            continue;
+        }
+        if is_host_kind(b.kind[k]) {
+            hosts.push(k);
+            let mk = b.m[k];
+            if mk < m_host_min {
+                m_host_min = mk;
+            }
+        }
+        let mk = b.m[k];
+        if mk > m_max {
+            m_max = mk;
+        }
+        if cached {
+            let d = (b.x[k] - x0[k]).abs();
+            if d > delta_max {
+                delta_max = d;
+            }
+        }
+    }
     // A host that is not active this tick only needs its pairs with active
     // bodies; those are the common case in a block step (a few fast bodies).
     // Each body still receives its terms from the hosts in the same order, so
     // the result is identical to visiting every pair.
     let any_active_host = hosts.iter().any(|&h| on(h));
-    // Bodies sorted by x, so each active host only scans the slab within its
-    // coupling cutoff instead of the whole population (matters with many
-    // systems, where almost every pair is far beyond the cutoff).
-    let mut order: Vec<u32> = Vec::new();
-    let mut xs: Vec<f64> = Vec::new();
-    let mut m_max = 0.0f64;
-    if any_active_host {
-        order = (0..n as u32).filter(|&k| !b.dead[k as usize]).collect();
-        order.sort_unstable_by(|&p, &q| b.x[p as usize].total_cmp(&b.x[q as usize]));
-        xs = order.iter().map(|&k| b.x[k as usize]).collect();
-        m_max = order.iter().map(|&k| b.m[k as usize]).fold(0.0, f64::max);
-    }
+
+    // Bodies sorted by (x, index), with x frozen at the build, so each active
+    // host only scans the slab within its coupling cutoff instead of the whole
+    // population (matters with many systems, where almost every pair is far
+    // beyond the cutoff). The sort is the O(n log n) part and is *not* run
+    // every call: it is rebuilt when missing, or when the bodies have drifted
+    // a noticeable fraction of the tightest host's coupling radius. In
+    // between, the slab window widens by `delta_max`, which keeps the
+    // candidate set exact — a body within `cut` of a host today was within
+    // `cut + delta_max` of it at the last build, so nothing is missed, and
+    // `pn_pair` (which re-checks the current distance against the per-pair
+    // cutoff) drops the few extra margin bodies.
+    let margin = if any_active_host {
+        if !cached {
+            pn_rebuild_order(&*b, &mut order, &mut x0, n);
+            b.pn_valid = true;
+            b.pn_len = n;
+            0.0
+        } else {
+            let cut_min = G * (m_host_min + m_max) * inv_c2 * (1.0 / PN_COUPLING_MIN);
+            if delta_max > PN_SORT_DELTA_FRAC * cut_min {
+                pn_rebuild_order(&*b, &mut order, &mut x0, n);
+                0.0
+            } else {
+                delta_max
+            }
+        }
+    } else {
+        0.0
+    };
+
     for &i in &hosts {
         if on(i) {
             let xi = b.x[i];
             let cut_max = G * (b.m[i] + m_max) * inv_c2 * (1.0 / PN_COUPLING_MIN);
-            let lo = xs.partition_point(|&x| x < xi - cut_max);
-            let hi = xs.partition_point(|&x| x <= xi + cut_max);
+            let span = cut_max + margin;
+            let lo = pn_partition_lo(&order, &x0, xi - span);
+            let hi = pn_partition_hi(&order, &x0, xi + span);
             for &ju in &order[lo..hi] {
                 let j = ju as usize;
-                if j == i || (is_host_kind(b.kind[j]) && j < i) {
+                if b.dead[j] || j == i || (is_host_kind(b.kind[j]) && j < i) {
                     continue;
                 }
                 pn_pair(b, i, j, true, on(j), inv_c2, inv_c5);
@@ -705,4 +835,10 @@ pub(super) fn add_pn_corrections(b: &mut Bodies, active: Option<&[u32]>) {
             }
         }
     }
+
+    // Put the scratch buffers back (capacity is preserved for the next call).
+    b.pn_order = order;
+    b.pn_x0 = x0;
+    b.pn_hosts = hosts;
+    b.pn_mask = mask;
 }
