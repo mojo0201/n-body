@@ -16,7 +16,11 @@ fn main() {
     let m0: f64 = b.m.iter().sum();
     let mom = |b: &Bodies| { let mut p = [0.0;2]; for i in 0..b.len() { if !b.dead[i] { p[0]+=b.m[i]*b.vx[i]; p[1]+=b.m[i]*b.vy[i]; } } p };
     let n0 = b.len();
+    let p0 = mom(&b);
     for s in 0..6000 { advance(&mut b, DT); if s % 2000 == 0 { println!("step {s}: {} bodies", b.len()); } }
+    let p1 = mom(&b);
+    println!("momentum {:.3e} {:.3e} -> {:.3e} {:.3e} (bodies change mass, so this is a drift check)",
+             p0[0], p0[1], p1[0], p1[1]);
     let splits = b.events.iter().filter(|e| e.text.contains("split in two")).count();
     println!("comets {} -> {} bodies, {} splits logged, exhausted {}", n0 - 1, b.len() - 1, splits, b.events.iter().filter(|e| e.text.contains("exhausted")).count());
     println!("mass lost to sublimation: {:.3e} M⊕ of {:.3e}", m0 - b.m.iter().sum::<f64>() , 300e-9);

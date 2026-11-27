@@ -82,12 +82,12 @@ fn am_force_direct_on_matches_newton_2body() {
     let f = G * M_SUN_ME * inv;
     let (ax_expected, ay_expected) = (f * dx, f * dy);
 
-    let (ax, ay, _) = force_direct_on(&b, 1);
+    let (ax, ay, _, _) = force_direct_on(&b, 1);
     assert_eq!(ax.to_bits(), ax_expected.to_bits(), "planet ax");
     assert_eq!(ay.to_bits(), ay_expected.to_bits(), "planet ay");
 
     // Newton's third law on the star side.
-    let (sx, sy, _) = force_direct_on(&b, 0);
+    let (sx, sy, _, _) = force_direct_on(&b, 0);
     assert_close(sx, -ax / M_SUN_ME, 1e-14, "star ax");
     assert_close(sy, -ay / M_SUN_ME, 1e-14, "star ay");
 }
@@ -118,7 +118,7 @@ fn am_force_direct_on_matches_newton_3body() {
             ax += f * dx;
             ay += f * dy;
         }
-        let (got_x, got_y, _) = force_direct_on(&b, i);
+        let (got_x, got_y, _, _) = force_direct_on(&b, i);
         assert_close(got_x, ax, 1e-14, &format!("body {i} ax"));
         assert_close(got_y, ay, 1e-14, &format!("body {i} ay"));
     }
@@ -130,7 +130,7 @@ fn am_force_direct_on_matches_newton_3body() {
 fn am_force_direct_on_single_body_is_zero() {
     let mut b = Bodies::with_capacity(1);
     b.push(3.0, -4.0, 1.0, 2.0, 1.0, BodyKind::Planet);
-    let (ax, ay, dt) = force_direct_on(&b, 0);
+    let (ax, ay, _, dt) = force_direct_on(&b, 0);
     assert_eq!((ax, ay), (0.0, 0.0));
     assert!(dt.is_infinite());
 }
@@ -142,7 +142,7 @@ fn am_force_direct_on_boundary_indices() {
     let b = solar_disc(5, 7);
     let n = b.len();
     for &i in &[0usize, n / 2, n - 1] {
-        let (got_x, got_y, _) = force_direct_on(&b, i);
+        let (got_x, got_y, _, _) = force_direct_on(&b, i);
         let (mut ax, mut ay) = (0.0, 0.0);
         for j in 0..n {
             if j == i {
@@ -170,7 +170,7 @@ fn am_force_direct_on_softens_coincident() {
     let mut b = Bodies::with_capacity(2);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
-    let (ax, ay, dt) = force_direct_on(&b, 0);
+    let (ax, ay, _, dt) = force_direct_on(&b, 0);
     assert_eq!((ax, ay), (0.0, 0.0), "coincident → no preferred direction");
     assert!(dt.is_finite() && dt > 0.0);
 }
@@ -184,7 +184,7 @@ fn am_force_direct_on_close_range_bounded() {
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let r = 0.5 * SOFT2.sqrt();
     b.push(r, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
-    let (ax, _, _) = force_direct_on(&b, 1);
+    let (ax, _, _, _) = force_direct_on(&b, 1);
     let dx = 0.0 - r;
     let d2 = dx * dx + SOFT2;
     let d = d2.sqrt();
@@ -209,8 +209,8 @@ fn am_force_direct_on_close_range_bounded() {
 #[test]
 fn am_range_empty_is_zero() {
     let b = solar_disc(5, 1);
-    let (sx, sy, sm, wm) = force_direct_range(&b, 0, 0..0);
-    assert_eq!((sx, sy, sm, wm), (0.0, 0.0, 0.0, 0.0));
+    let (sx, sy, sz, sm, wm) = force_direct_range(&b, 0, 0..0);
+    assert_eq!((sx, sy, sz, sm, wm), (0.0, 0.0, 0.0, 0.0, 0.0));
 }
 
 /// The two ranges `[0, i)` and `(i, n)` must together reproduce
@@ -223,9 +223,9 @@ fn am_range_partition_matches_direct() {
         let b = solar_disc(15, seed);
         let n = b.len();
         for i in 0..n {
-            let (ref_x, ref_y, ref_dt) = force_direct_on(&b, i);
-            let (hx, hy, hs, hw) = force_direct_range(&b, i, 0..i);
-            let (tx, ty, ts, tw) = force_direct_range(&b, i, (i + 1)..n);
+            let (ref_x, ref_y, _, ref_dt) = force_direct_on(&b, i);
+            let (hx, hy, _, hs, hw) = force_direct_range(&b, i, 0..i);
+            let (tx, ty, _, ts, tw) = force_direct_range(&b, i, (i + 1)..n);
             assert_close(hx + tx, ref_x, 1e-13, &format!("seed {seed} i {i} x"));
             assert_close(hy + ty, ref_y, 1e-13, &format!("seed {seed} i {i} y"));
             let dt = dt_limit(hs.max(ts), hw.max(tw));
@@ -248,7 +248,7 @@ fn am_sym_matches_direct() {
     for seed in 0..5u128 {
         let mut b = solar_disc(20, seed);
         let n = b.len();
-        let ref_acc: Vec<(f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
+        let ref_acc: Vec<(f64, f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
         compute_accel_direct_sym(&mut b);
         for i in 0..n {
             assert_close(
@@ -265,7 +265,7 @@ fn am_sym_matches_direct() {
             );
             assert_eq!(
                 b.dtl[i].to_bits(),
-                ref_acc[i].2.to_bits(),
+                ref_acc[i].3.to_bits(),
                 "seed {seed} i {i} dtl should be bit-identical",
             );
         }
@@ -337,8 +337,8 @@ fn am_parallel_matches_serial() {
         n - 1,
     ];
     for &i in &probes {
-        let (ref_x, ref_y, ref_dt) = force_direct_on(&b, i);
-        let (par_x, par_y, par_dt) = force_direct_on_parallel(&b, i);
+        let (ref_x, ref_y, _, ref_dt) = force_direct_on(&b, i);
+        let (par_x, par_y, _, par_dt) = force_direct_on_parallel(&b, i);
         assert_close(par_x, ref_x, 1e-11, &format!("i {i} x"));
         assert_close(par_y, ref_y, 1e-11, &format!("i {i} y"));
         // dt is a max → order-independent → bit-identical.
@@ -366,7 +366,8 @@ fn am_parallel_is_deterministic_across_threads() {
     let many = run(8);
     assert_eq!(one.0.to_bits(), many.0.to_bits(), "sx across thread counts");
     assert_eq!(one.1.to_bits(), many.1.to_bits(), "sy across thread counts");
-    assert_eq!(one.2.to_bits(), many.2.to_bits(), "dt across thread counts");
+    assert_eq!(one.2.to_bits(), many.2.to_bits(), "sz across thread counts");
+    assert_eq!(one.3.to_bits(), many.3.to_bits(), "dt across thread counts");
 }
 
 /// Boundary `i` values must still partition the j-loop correctly in the
@@ -376,8 +377,8 @@ fn am_parallel_boundary_indices() {
     let n = 2 * DIRECT_CHUNK + 300;
     let b = solar_disc(n, 3);
     for &i in &[0usize, n - 1] {
-        let (par_x, par_y, par_dt) = force_direct_on_parallel(&b, i);
-        let (ref_x, ref_y, ref_dt) = force_direct_on(&b, i);
+        let (par_x, par_y, _, par_dt) = force_direct_on_parallel(&b, i);
+        let (ref_x, ref_y, _, ref_dt) = force_direct_on(&b, i);
         assert_close(par_x, ref_x, 1e-11, &format!("i {i} x"));
         assert_close(par_y, ref_y, 1e-11, &format!("i {i} y"));
         assert_eq!(par_dt.to_bits(), ref_dt.to_bits(), "i {i} dt");
@@ -468,14 +469,14 @@ fn am_eval_forces_uses_provided_tree() {
     eval_forces_with(&mut b, &active, Some(&tree));
     let stale_first = b.ax[0];
     // Must exactly match `accel_for` on the *stale* tree.
-    let (exact_x, _, _) = tree.accel_for(&b, 0);
+    let (exact_x, _, _, _) = tree.accel_for(&b, 0);
     assert_eq!(
         stale_first.to_bits(),
         exact_x.to_bits(),
         "stale tree not used"
     );
     // Fresh build should differ.
-    let (fresh_x, _, _) = Tree::build(&b).accel_for(&b, 0);
+    let (fresh_x, _, _, _) = Tree::build(&b).accel_for(&b, 0);
     assert_ne!(
         stale_first.to_bits(),
         fresh_x.to_bits(),
@@ -495,7 +496,7 @@ fn am_eval_forces_ignores_tree_on_small_active() {
     let mut b = solar_disc(n, 5);
     let tree = Tree::build(&b);
     eval_forces_with(&mut b, &[0u32], Some(&tree));
-    let (ref_x, ref_y, _) = force_direct_on(&b, 0);
+    let (ref_x, ref_y, _, _) = force_direct_on(&b, 0);
     assert_eq!(b.ax[0].to_bits(), ref_x.to_bits(), "serial ax");
     assert_eq!(b.ay[0].to_bits(), ref_y.to_bits(), "serial ay");
 }
@@ -553,7 +554,15 @@ fn am_compute_accel_zeroes_com_accel() {
 fn am_compute_accel_matches_force_direct_on() {
     for n in [5usize, 200] {
         let mut b = solar_disc(n, n as u128);
-        let ref_acc: Vec<(f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
+        // Park the disc: `compute_accel` adds the 1PN/2.5PN terms whenever a
+        // body moves faster than ~3 km/s (`PN_V_OVER_C_MIN`), and those are a
+        // relative O(v²/c²) ≈ 1e-8 correction that `force_direct_on` — the
+        // Newtonian reference — does not contain. With zero velocities the
+        // comparison is purely Newtonian and the 1e-10 tolerance is meaningful.
+        b.vx.iter_mut().for_each(|v| *v = 0.0);
+        b.vy.iter_mut().for_each(|v| *v = 0.0);
+        b.vz.iter_mut().for_each(|v| *v = 0.0);
+        let ref_acc: Vec<(f64, f64, f64, f64)> = (0..n).map(|i| force_direct_on(&b, i)).collect();
         compute_accel(&mut b);
         let mt: f64 = b.m.iter().sum();
         let (mut cx, mut cy) = (0.0, 0.0);

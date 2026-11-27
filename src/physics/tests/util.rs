@@ -484,10 +484,8 @@ fn w_star_class_every_branch_and_boundary() {
     ] {
         assert!(x > 1e-3, "threshold {x} too small for relative eps");
     }
-    assert!(CLASS_STAR_M_MAX < CLASS_STAR_K_MAX);
-    assert!(CLASS_STAR_K_MAX < CLASS_STAR_G_MAX);
-    assert!(CLASS_STAR_G_MAX < CLASS_STAR_F_MAX);
-    assert!(CLASS_STAR_F_MAX < CLASS_STAR_A_MAX);
+    // The threshold ordering is a property of the constants; it is asserted
+    // at compile time at the bottom of this file.
 
     // Deeply inside each class, no epsilon needed.
     assert_eq!(s(CLASS_STAR_M_MAX * 0.5), 'M');
@@ -528,7 +526,6 @@ fn w_bd_class_every_branch_and_boundary() {
     let below = |x: f64| x * (1.0 - 1e-6);
     let above = |x: f64| x * (1.0 + 1e-6);
 
-    assert!(55.0 < 1e4, "upper class must be reachable");
     assert_eq!(c(1e4), 'M');
     assert_eq!(c(above(55.0)), 'M');
     assert_eq!(c(below(55.0)), 'L');
@@ -888,9 +885,34 @@ fn w_body_class_equals_class_name_for_non_moons() {
 #[test]
 fn x_luminosity_mass_law() {
     assert!((star_luminosity(BodyKind::Star, M_SUN_ME) - 1.0).abs() < 1e-6);
-    // 10 M☉ → 10^3.5 = 3162
+    // Piecewise main-sequence relation (see `star_luminosity`): M^4 up to
+    // 2 M☉, 1.4·M^3.5 up to 55 M☉, then linear. 10 M☉ → 1.4·10^3.5 = 4427.
     let l10 = star_luminosity(BodyKind::Star, 10.0 * M_SUN_ME);
-    assert!((l10 / 3162.28 - 1.0).abs() < 0.01, "10 M☉ L = {}", l10);
+    assert!((l10 / (1.4 * 3162.28) - 1.0).abs() < 0.01, "10 M☉ L = {}", l10);
+    // The four branches are independent fits, so each join agrees only to a
+    // few percent (and the 2 M☉ one steps *down* by 1 %); what must hold is
+    // that the steps are small and that each branch grows with mass.
+    for m in [0.43f64, 2.0, 55.0] {
+        let s = m * M_SUN_ME;
+        let (lo, hi) = (
+            star_luminosity(BodyKind::Star, s * (1.0 - 1e-9)),
+            star_luminosity(BodyKind::Star, s * (1.0 + 1e-9)),
+        );
+        assert!(
+            (hi / lo - 1.0).abs() < 0.05,
+            "join at {m} M☉ must be within 5 %: {lo} vs {hi}"
+        );
+    }
+    for m in [0.2f64, 0.5, 1.0, 1.5, 5.0, 30.0] {
+        let s = m * M_SUN_ME;
+        assert!(
+            star_luminosity(BodyKind::Star, s * 1.001) > star_luminosity(BodyKind::Star, s),
+            "luminosity must grow with mass inside a branch: {m} M☉"
+        );
+    }
+    // Low-mass end: below 0.43 M☉ the relation flattens to 0.23·M^2.3.
+    let l01 = star_luminosity(BodyKind::Star, 0.1 * M_SUN_ME);
+    assert!((l01 / (0.23 * 0.1f64.powf(2.3)) - 1.0).abs() < 1e-9, "0.1 M☉ L = {}", l01);
     assert_eq!(star_luminosity(BodyKind::Planet, 1.0), 0.0);
 }
 
@@ -932,10 +954,11 @@ fn x_effective_temperature() {
 #[test]
 fn x_temperature_at_bd_boundary() {
     let t_bd = star_temperature(BodyKind::Star, STAR_M_MIN);
-    // Actual value is ~1739 K. The window tolerates formula drift but
-    // still rejects a temperature that blew up toward solar (5772 K) or
-    // bottomed out below the coldest late-M dwarf (~1300 K).
-    assert!(t_bd > 1500.0 && t_bd < 2500.0, "BD-boundary T = {}", t_bd);
+    // ~2570 K with the piecewise L and R laws. The window tolerates formula
+    // drift but still rejects a temperature that blew up toward solar
+    // (5772 K) or bottomed out below the coldest late-M dwarf (~1300 K).
+    // The hottest late-M dwarfs are ~2800 K, so the upper bound sits there.
+    assert!(t_bd > 1500.0 && t_bd < 2800.0, "BD-boundary T = {}", t_bd);
     // Must be strictly cooler than the Sun — the whole point of
     // STAR_M_MIN being at the bottom of the main sequence.
     assert!(t_bd < star_temperature(BodyKind::Star, M_SUN_ME));
@@ -944,8 +967,9 @@ fn x_temperature_at_bd_boundary() {
 #[test]
 fn x_main_sequence_lifetime() {
     assert!((star_lifetime_gyr(BodyKind::Star, M_SUN_ME) - 10.0).abs() < 0.01);
+    // t = 10 Gyr · M/L with the piecewise L: 10·10/4427 = 0.0226 Gyr.
     let l10 = star_lifetime_gyr(BodyKind::Star, 10.0 * M_SUN_ME);
-    assert!((l10 - 0.0316).abs() < 1e-3, "10 M☉ lifetime {}", l10);
+    assert!((l10 - 0.0226).abs() < 1e-3, "10 M☉ lifetime {}", l10);
     assert!(star_lifetime_gyr(BodyKind::BrownDwarf, BD_M_MIN).is_infinite());
 }
 
@@ -969,8 +993,13 @@ fn x_habitable_zone_and_flux() {
     let mut b = Bodies::with_capacity(2);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let au = au_in_gm();
-    assert!((stellar_flux(&b, au, 0.0, 1) - 1.0).abs() < 1e-6);
-    assert!((stellar_flux(&b, 2.0 * au, 0.0, 1) - 0.25).abs() < 1e-6);
+    // A newborn star is dimmer than the 1 L☉ mid-MS normalisation
+    // (`ms_lum_factor`), so compare against its actual luminosity rather
+    // than assuming 1 L☉, and pin the inverse-square law itself.
+    let l = luminosity_of(&b, 0);
+    assert!(l > 0.0 && l < 1.0, "newborn solar-mass L = {l}");
+    assert!((stellar_flux(&b, au, 0.0, 1) - l).abs() < 1e-9 * l);
+    assert!((stellar_flux(&b, 2.0 * au, 0.0, 1) - 0.25 * l).abs() < 1e-9 * l);
     assert_eq!(stellar_flux(&b, 0.0, 0.0, 0), 0.0);
     // Earth's equilibrium temperature should be ~255 K.
     assert!((equilibrium_temp(1.0) - 255.0).abs() < 1.0);
@@ -1257,3 +1286,16 @@ fn z_solar_extent_zero_systems() {
     // Same base radius applies to n = 1 (the ring term is 0 there too).
     assert_eq!(solar_extent_gm(1), SOLAR_SYSTEM_RADIUS_GM);
 }
+
+// ===========================================================================
+// Compile-time invariants
+// ===========================================================================
+
+/// The spectral-class thresholds must be strictly increasing, or the
+/// `star_class`/`bd_class` branching tests below would be testing nothing.
+const _: () = assert!(
+    CLASS_STAR_M_MAX < CLASS_STAR_K_MAX
+        && CLASS_STAR_K_MAX < CLASS_STAR_G_MAX
+        && CLASS_STAR_G_MAX < CLASS_STAR_F_MAX
+        && CLASS_STAR_F_MAX < CLASS_STAR_A_MAX
+);

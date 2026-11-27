@@ -213,17 +213,14 @@ fn an_debris_stride_caps_at_256() {
     };
     let segs_500 = build(500);
     let segs_600 = build(600);
-    assert!(
-        segs_600.len() < segs_500.len(),
-        "600-debris ({}) not strided below 500-debris ({})",
-        segs_600.len(),
-        segs_500.len(),
-    );
+    // At most 256 debris rings are drawn, so the stride is ceil(n / 256):
+    // 500 debris → stride 2 → 250 rings, 600 → stride 3 → 200 rings. Every
+    // ring is 32 segments at this zoom (the minimum point count).
+    const SEG_PER_RING: usize = 32;
+    assert_eq!(segs_500.len(), 250 * SEG_PER_RING, "500-debris rings");
+    assert_eq!(segs_600.len(), 200 * SEG_PER_RING, "600-debris rings");
     let ratio = segs_600.len() as f64 / segs_500.len() as f64;
-    assert!(
-        (0.4..=0.7).contains(&ratio),
-        "expected ~0.5, got {ratio:.3}"
-    );
+    assert!((ratio - 0.8).abs() < 1e-12, "expected 0.8, got {ratio:.3}");
 }
 
 #[test]

@@ -20,8 +20,12 @@ use super::*;
 pub fn star_luminosity(kind: BodyKind, m: f64) -> f64 {
     match kind {
         BodyKind::Star => {
-            // Piecewise main-sequence mass–luminosity relation (continuous at
-            // the breaks): M<0.43: 0.23 M^2.3; <2: M^4; <55: 1.4 M^3.5; else 32000 M.
+            // Piecewise main-sequence mass–luminosity relation: M<0.43:
+            // 0.23 M^2.3; <2: M^4; <55: 1.4 M^3.5; else 32000 M. The branch
+            // coefficients are fits over each mass range, so the joins agree
+            // only to a few percent (3 % at 0.43 M☉, 1 % at 2 M☉) — close
+            // enough to be visually continuous, and the anchors that matter
+            // (1 L☉ at 1 M☉, 1.4·10^3.5 at 10 M☉) are exact.
             let s = m / M_SUN_ME;
             if s < 0.43 {
                 0.23 * s.powf(2.3)
@@ -69,15 +73,19 @@ pub fn star_temperature(kind: BodyKind, m: f64) -> f64 {
 
 /// Main-sequence lifetime in Gyr.
 ///
-/// From the fuel-burn-rate argument: available fuel ∝ M, burn rate ∝ L
-/// ∝ M^3.5, so t_MS ∝ M^-2.5. Normalized so 1 M☉ lasts ~10 Gyr.
-/// Brown dwarfs and remnants have no main sequence and return infinity.
+/// From the fuel-burn-rate argument: available fuel ∝ M, burn rate ∝ L(M),
+/// so t_MS ∝ M/L(M) — with the piecewise `star_luminosity`, that is
+/// 10 Gyr · M/L. Floored at 3 Myr: the most massive stars do not live
+/// shorter than that. Brown dwarfs and remnants have no main sequence and
+/// return infinity, and so does a non-positive mass (there is no star to
+/// evolve), which keeps `age/t_life` finite for degenerate input.
 pub fn star_lifetime_gyr(kind: BodyKind, m: f64) -> f64 {
     match kind {
         BodyKind::Star => {
-            // Fuel ∝ M, burn rate ∝ L(M), so t = 10 Gyr · M / L. Floored at
-            // 3 Myr: the most massive stars do not live shorter than that.
             let s = m / M_SUN_ME;
+            if !(s > 0.0) {
+                return f64::INFINITY;
+            }
             (10.0 * s / star_luminosity(kind, m)).max(0.003)
         }
         BodyKind::BrownDwarf | BodyKind::WhiteDwarf | BodyKind::NeutronStar => f64::INFINITY,

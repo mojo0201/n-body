@@ -7,7 +7,8 @@
 #   3. release build of headless
 #   4. headless CLI contract (--n 0 → exit 2; --min-ratio fail/pass; --json;
 #      --quiet --json → exactly 1 line; --solar smoke run)
-#   5. bench compilation
+#   5. every example compiles (they are the project's ad-hoc diagnostics and
+#      are the first thing to rot when a signature changes)
 #   6. sweep.sh output format (header + rows, all 6-tab TSV fields) and
 #      --help does not leak shell code
 #
@@ -81,8 +82,9 @@ if [ "$QUIET_LINES" -ne 1 ]; then
 fi
 echo "  ok: --quiet --json suppresses progress (1 line)"
 
-echo "== 5. bench compilation =="
-cargo bench --no-run 2>&1 | tail -1
+echo "== 5. examples compile =="
+cargo build --examples --quiet
+echo "  ok: all examples build"
 
 echo "== 6. sweep.sh format =="
 TSV=$(mktemp)

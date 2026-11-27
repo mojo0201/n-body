@@ -43,28 +43,40 @@ fn al_evolution_is_off_by_default() {
     assert_eq!(b.kind[0], BodyKind::Star);
 }
 
-/// At age 0 every evolutionary track must collapse exactly onto the
-/// static `physical_radius` / `star_luminosity` / `star_temperature`
-/// relations. This is what makes presets look identical whether or not
-/// evolution is on. The tolerance is exact equality (not epsilon) because
-/// the code multiplies by `(1 + growth * 0.0) == 1.0` on the age-0 branch.
+/// The static relations describe a star about halfway through its main
+/// sequence (`EVO_MS_REF_FRAC`: the Sun today). `star_state` must reproduce
+/// them exactly at that point, and apply the documented MS growth factors
+/// either side of it. Presets therefore look identical with evolution on or
+/// off only for a mid-MS star; a newborn one is dimmer and smaller, and the
+/// factors are normalised so that is the *only* difference.
 #[test]
 fn al_age_zero_matches_the_old_relations() {
     for s in [0.1_f64, 0.5, 1.0, 2.0, 7.0, 30.0] {
         let m = s * M_SUN_ME;
+        let t_ms = star_lifetime_gyr(BodyKind::Star, m);
+        let r0 = physical_radius(BodyKind::Star, m);
+        let l0 = star_luminosity(BodyKind::Star, m);
+
+        // Reference point: the static relations, exactly.
+        let mid = star_state(m, m, EVO_MS_REF_FRAC * t_ms);
+        // The growth factors are normalised to exactly 1 at this fraction, but
+        // `star_state` re-derives the fraction from age/t_ms, so the match is
+        // to fp, not bit-exact.
+        assert!(
+            (mid.radius_gm / r0 - 1.0).abs() < 1e-12,
+            "star_state at the reference age must match physical_radius"
+        );
+        assert!(
+            (mid.luminosity / l0 - 1.0).abs() < 1e-12,
+            "star_state at the reference age must match star_luminosity"
+        );
+
+        // Age 0: the same relations times the documented MS factors.
         let st = star_state(m, m, 0.0);
-        assert_eq!(
-            st.radius_gm,
-            physical_radius(BodyKind::Star, m),
-            "star_state at age 0 must match physical_radius"
-        );
-        assert_eq!(
-            st.luminosity,
-            star_luminosity(BodyKind::Star, m),
-            "star_state at age 0 must match star_luminosity"
-        );
+        assert_eq!(st.radius_gm, r0 * ms_radius_factor(0.0));
+        assert_eq!(st.luminosity, l0 * ms_lum_factor(0.0));
         let t = star_temperature(BodyKind::Star, m);
-        assert!((st.temperature - t).abs() < 1e-9 * t);
+        assert!((st.temperature - t).abs() < 0.2 * t, "newborn T {} vs {}", st.temperature, t);
         assert_eq!(st.phase, StellarPhase::MainSequence);
     }
 }
@@ -267,7 +279,11 @@ fn al_white_dwarf_cooling_decreases_luminosity() {
     let l1 = wd_luminosity(m, 1.0);
     let l10 = wd_luminosity(m, 10.0);
     let ratio = l1 / l10;
-    let want = 10f64.powf(WD_COOL_EXP);
+    // 1 and 10 Gyr both sit in the post-Mestel regime, so the ratio is the
+    // pure power law with the late slope; WD_COOL_T0_GYR shifts both ages
+    // by the same amount and is kept for exactness.
+    let t = |age: f64| age + WD_COOL_T0_GYR;
+    let want = (t(1.0) / t(10.0)).powf(-WD_COOL_EXP_LATE);
     assert!(
         (ratio / want - 1.0).abs() < 0.01,
         "10 Gyr fainter by {ratio} (want {want})"

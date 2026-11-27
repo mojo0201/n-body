@@ -14,8 +14,7 @@ fn main() {
                 let mut b = Bodies::with_capacity(n * 4 + 64);
                 spawn_system_with_info(&mut b, n, seed);
                 for _ in 0..steps { advance(&mut b, DT); }
-                let nan = (0..b.len()).any(|i| !(b.x[i].is_finite() && b.y[i].is_finite() && b.vx[i].is_finite() && b.m[i].is_finite()));
-                nan
+                (0..b.len()).any(|i| !(b.x[i].is_finite() && b.y[i].is_finite() && b.vx[i].is_finite() && b.m[i].is_finite()))
             }));
             match r {
                 Err(e) => { bad += 1; let m = e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default(); println!("PANIC seed {seed} n {n}: {m}"); }

@@ -22,6 +22,7 @@
 
 use crate::physics::dust::{grind_belts, BELT_GRIND_MIN_M, SEQUENTIAL_GRAIN_THRESHOLD};
 use crate::physics::*;
+use super::shared::*;
 
 // ===========================================================================
 // Fixtures
@@ -47,8 +48,10 @@ fn sun_field(size_um: f64, r: f64) -> (Bodies, DustField) {
         grains: vec![Grain {
             x: r,
             y: 0.0,
+            z: 0.0,
             vx: 0.0,
             vy: v,
+            vz: 0.0,
             mass: 1.0,
             size_um,
             ttl: f32::INFINITY,
@@ -244,8 +247,10 @@ fn step_skips_invalid_primary() {
         grains: vec![Grain {
             x: 100.0,
             y: 0.0,
+            z: 0.0,
             vx: 0.0,
             vy: 0.0,
+            vz: 0.0,
             mass: 1.0,
             size_um: 100.0,
             ttl: f32::INFINITY,
@@ -359,8 +364,10 @@ fn grain_near_companion_star_is_removed() {
         grains: vec![Grain {
             x: 100.0 + 0.5 * R_SUN_GM,
             y: 0.0,
+            z: 0.0,
             vx: 0.0,
             vy: 0.0,
+            vz: 0.0,
             mass: 1.0,
             size_um: 100.0,
             ttl: f32::INFINITY,
@@ -392,8 +399,10 @@ fn sequential_and_parallel_agree() {
             grains.push(Grain {
                 x: r,
                 y: 0.0,
+                z: 0.0,
                 vx: 0.0,
                 vy: v,
+                vz: 0.0,
                 mass: 1.0,
                 size_um: 100.0,
                 ttl: f32::INFINITY,
@@ -456,7 +465,7 @@ fn beta_of_known_values() {
 #[test]
 fn emitted_mass_is_conserved_and_follows_cascade() {
     let mut b = deposit_rig(500.0);
-    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 2.0, None, 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, None, 0.0);
     let grains = &b.dust_fields[0].grains;
     assert_eq!(grains.len(), DUST_EMIT_GRAINS);
     let total: f64 = grains.iter().map(|g| g.mass).sum();
@@ -475,7 +484,7 @@ fn emitted_mass_is_conserved_and_follows_cascade() {
 fn deposit_adds_grains_to_matching_field() {
     let mut b = deposit_rig(500.0);
     assert!(b.dust_fields[0].grains.is_empty());
-    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
     assert_eq!(b.dust_fields[0].grains.len(), DUST_EMIT_GRAINS);
 }
 
@@ -483,7 +492,7 @@ fn deposit_adds_grains_to_matching_field() {
 #[test]
 fn deposit_skips_out_of_extent() {
     let mut b = deposit_rig(100.0);
-    deposit(&mut b, 200.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    deposit(&mut b, 200.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
     assert!(
         b.dust_fields[0].grains.is_empty(),
         "deposit outside extent must not emit"
@@ -495,7 +504,7 @@ fn deposit_skips_out_of_extent() {
 fn deposit_skips_when_fields_empty() {
     let mut b = Bodies::with_capacity(0);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
-    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
     assert!(b.dust_fields.is_empty());
 }
 
@@ -506,7 +515,7 @@ fn deposit_skips_when_fields_empty() {
 #[test]
 fn deposit_with_direction_offsets_along_tail() {
     let mut b = deposit_rig(500.0);
-    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, Some((1.0, 0.0, 0.0)), 0.0);
     let grains = &b.dust_fields[0].grains;
     assert_eq!(grains.len(), DUST_EMIT_GRAINS);
     let mut xs: Vec<f64> = grains.iter().map(|g| g.x).collect();
@@ -534,6 +543,7 @@ fn deposit_with_direction_offsets_along_tail() {
 /// under `1e4·period` steps.
 #[test]
 fn belt_grinding_conserves_mass_and_feeds_dust() {
+    let _mode = accelerated();
     let (mut b, i) = belt_body(150.0, 0.01);
     let mut f = empty_field(500.0);
     let mut rng = XorShift::new(9);
@@ -552,6 +562,7 @@ fn belt_grinding_conserves_mass_and_feeds_dust() {
 /// mass than a 0.003 M⊕ belt over the same number of steps.
 #[test]
 fn massive_belts_grind_faster() {
+    let _mode = accelerated();
     let run = |m_body: f64| {
         let (mut b, i) = belt_body(150.0, m_body);
         let mut f = empty_field(500.0);
@@ -595,8 +606,10 @@ fn grinding_respects_grain_cap() {
         Grain {
             x: 0.0,
             y: 0.0,
+            z: 0.0,
             vx: 0.0,
             vy: 0.0,
+            vz: 0.0,
             mass: 0.0,
             size_um: 1.0,
             ttl: f32::INFINITY,
@@ -626,8 +639,10 @@ fn filler_grain() -> Grain {
     Grain {
         x: 0.0,
         y: 0.0,
+        z: 0.0,
         vx: 0.0,
         vy: 0.0,
+        vz: 0.0,
         mass: 0.0,
         size_um: 1.0,
         ttl: f32::INFINITY,
@@ -686,7 +701,7 @@ fn infinite_ttl_never_expires() {
 #[test]
 fn comet_dust_gets_finite_lifetime() {
     let mut b = deposit_rig(500.0);
-    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, Some((1.0, 0.0, 0.0)), 0.0);
     let grains = &b.dust_fields[0].grains;
     assert_eq!(grains.len(), DUST_EMIT_GRAINS);
     let (lo, hi) = (0.5 * COMET_DUST_LIFE_TU, 1.5 * COMET_DUST_LIFE_TU);
@@ -709,7 +724,7 @@ fn comet_dust_gets_finite_lifetime() {
 #[test]
 fn collision_dust_uses_noncomet_lifetime() {
     let mut b = deposit_rig(500.0);
-    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
     let grains = &b.dust_fields[0].grains;
     assert_eq!(grains.len(), DUST_EMIT_GRAINS);
     for g in grains {
@@ -725,9 +740,9 @@ fn comet_dust_stops_at_field_cap() {
     b.dust_fields[0]
         .grains
         .resize(DUST_COMET_FIELD_CAP - DUST_EMIT_GRAINS, filler_grain());
-    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, Some((1.0, 0.0, 0.0)), 0.0);
     assert_eq!(b.dust_fields[0].grains.len(), DUST_COMET_FIELD_CAP);
-    deposit(&mut b, 100.0, 0.0, 0.0, 10.0, 1.0, Some((1.0, 0.0)), 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, Some((1.0, 0.0, 0.0)), 0.0);
     assert_eq!(
         b.dust_fields[0].grains.len(),
         DUST_COMET_FIELD_CAP,
@@ -743,7 +758,7 @@ fn collision_dust_ignores_comet_cap() {
     b.dust_fields[0]
         .grains
         .resize(DUST_COMET_FIELD_CAP, filler_grain());
-    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
+    deposit(&mut b, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, None, 0.0);
     assert_eq!(
         b.dust_fields[0].grains.len(),
         DUST_COMET_FIELD_CAP + DUST_EMIT_GRAINS

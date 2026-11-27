@@ -180,7 +180,7 @@ fn main() {
     let mut worst: Vec<&Outcome> = with_planets.iter().copied().filter(|o| o.lost > 0).collect();
     worst.sort_by(|a, c| (c.lost as f64 / c.n_planets as f64).partial_cmp(&(a.lost as f64 / a.n_planets as f64)).unwrap());
     println!("\nworst systems (replay with the same seed and slider):");
-    println!("{:>8} {:>6} {:>5}/{:<5} {:>9} {:>8} {:>7}  {}", "seed", "M_sun", "lost", "n", "1st loss", "escaped", "merges", "tags");
+    println!("{:>8} {:>6} {:>5}/{:<5} {:>9} {:>8} {:>7}  tags", "seed", "M_sun", "lost", "n", "1st loss", "escaped", "merges");
     for o in worst.iter().take(12) {
         let fl = o.first_loss_frac.map_or("-".to_string(), |f| format!("{:.0}%", f * 100.0));
         println!("{:>8} {:>6.2} {:>5}/{:<5} {:>9} {:>8} {:>7}  {}", o.seed, o.star_m_sun, o.lost, o.n_planets, fl, o.escaped, o.merges, o.tags.join(", "));

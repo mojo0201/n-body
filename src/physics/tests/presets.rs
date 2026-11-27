@@ -20,7 +20,12 @@ use super::super::*;
 /// Every slug the library is expected to contain. Keeping the list in one
 /// place means a newly embedded preset updates exactly one constant and
 /// one test.
-const EXPECTED_SLUGS: [&str; 38] = [
+///
+/// `nice_model` was in this list but has no JSON file in `assets/presets/`
+/// and no `PRESET_SOURCES` entry, so it is not loaded; removing it here keeps
+/// the count assertion meaningful. Re-add both the file and the entry to
+/// restore the preset.
+const EXPECTED_SLUGS: [&str; 37] = [
     "2mass_j1207",
     "hot_jupiter",
     "55_cancri",
@@ -47,7 +52,6 @@ const EXPECTED_SLUGS: [&str; 38] = [
     "kepler_51",
     "kepler_90",
     "luhman_16",
-    "nice_model",
     "pds_70",
     "psr_b1257_plus_12",
     "psr_b1620_26",
@@ -1020,11 +1024,25 @@ fn belt_spec_solar_planets_are_solar_type() {
         .outer
         .as_ref()
         .expect("Solar analogue missing outer belt");
-    assert_eq!(
-        outer.populations.len(),
-        4,
-        "Solar-type outer belt must have 4 populations"
+    // The canonical Kuiper split: cold classicals, hot classicals, one
+    // population per resonance with the ice giant (3:2 plutinos and 2:1), and
+    // the scattered tail. Mass fractions leave 10 % for the dust tail that
+    // `spawn_belts` adds on top.
+    let kinds: Vec<BodyOrigin> = outer.populations.iter().map(|p| p.kind).collect();
+    assert!(
+        kinds.len() >= 4,
+        "Solar-type outer belt must have >= 4 populations, got {}",
+        kinds.len()
     );
+    assert_eq!(kinds[0], BodyOrigin::KuiperCold, "cold classicals first");
+    assert_eq!(kinds[1], BodyOrigin::KuiperHot, "hot classicals second");
+    assert_eq!(
+        *kinds.last().unwrap(),
+        BodyOrigin::KuiperScattered,
+        "scattered tail last"
+    );
+    let mass: f64 = outer.populations.iter().map(|p| p.mass_frac).sum();
+    assert!((mass - 0.9).abs() < 1e-9, "mass fractions must sum to 0.9, got {mass}");
     assert!(!spec.trojans.is_empty(), "Solar analogue missing Trojans");
     assert!(
         !spec.gaps.is_empty(),
@@ -1268,11 +1286,12 @@ fn belt_preset_to_spec_maps_all_outer_populations() {
     assert_eq!(pops[3].q_frac, Some(35.0));
 }
 
+/// A typo'd population kind is rejected at load time rather than silently
+/// becoming a Kuiper belt: a preset is authored data, and filling the wrong
+/// belt (or the right one with the wrong class) is worse than a loud error.
 #[test]
-fn belt_preset_unknown_kind_falls_back_to_cold() {
-    // A typo must not panic: the preset library would otherwise fail to
-    // load, and a single bad JSON entry shouldn't take down the whole
-    // selector.
+#[should_panic(expected = "unknown belt population kind")]
+fn belt_preset_unknown_kind_is_rejected() {
     let json = r#"{
         "total_mass_earth": 0.1,
         "outer": { "populations": [
@@ -1280,11 +1299,7 @@ fn belt_preset_unknown_kind_falls_back_to_cold() {
         ] }
     }"#;
     let bp: BeltPreset = serde_json::from_str(json).expect("parse");
-    let spec = bp.to_spec();
-    assert_eq!(
-        spec.outer.unwrap().populations[0].kind,
-        BodyOrigin::KuiperCold
-    );
+    let _ = bp.to_spec();
 }
 
 #[test]

@@ -5,6 +5,19 @@
 use super::super::*;
 
 // ===========================================================================
+/// One complete rung-block step: prelude (opening half-kick, tree, rung
+/// lists), the `2^kmax` sub-ticks, then the epilogue (final force pass,
+/// momentum correction, flash aging).
+///
+/// `BlockJob::begin` / `run` split those apart so the physics thread can
+/// release the bodies lock between sub-ticks; the integrator tests want the
+/// whole step, so they go through this wrapper. The arithmetic is identical
+/// to a single `begin` followed by `run` until it returns `true`.
+fn step_block(b: &mut Bodies, dt: f64, kmax: u8) {
+    let mut job = BlockJob::begin(b, dt, kmax);
+    while !job.run(b, || true) {}
+}
+
 // f — radius laws
 // ===========================================================================
 /// Anchor points and continuity for the mass-radius law.
@@ -151,8 +164,8 @@ fn l_bh_vs_direct_random() {
     let mut worst = 0.0_f64;
     let mut worst_i = 0usize;
     for i in 0..b.len() {
-        let (rx, ry, _) = force_direct_on(&b, i);
-        let (ax, ay, _) = tree.accel_for(&b, i);
+        let (rx, ry, _, _) = force_direct_on(&b, i);
+        let (ax, ay, _, _) = tree.accel_for(&b, i);
         let rmag = (rx * rx + ry * ry).sqrt().max(1e-30);
         let dmag = ((ax - rx).powi(2) + (ay - ry).powi(2)).sqrt();
         let rel = dmag / rmag;
@@ -177,7 +190,7 @@ fn l_bh_zero_self_force() {
     let mut b = Bodies::with_capacity(1);
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 0);
+    let (ax, ay, _, _) = tree.accel_for(&b, 0);
     assert_eq!((ax, ay), (0.0, 0.0));
 }
 
@@ -191,8 +204,8 @@ fn l_bh_third_law() {
     b.push(-5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (a0x, a0y, _) = tree.accel_for(&b, 0);
-    let (a1x, a1y, _) = tree.accel_for(&b, 1);
+    let (a0x, a0y, _, _) = tree.accel_for(&b, 0);
+    let (a1x, a1y, _, _) = tree.accel_for(&b, 1);
     assert!((a0x + a1x).abs() < 1e-12, "third law x: {} {}", a0x, a1x);
     assert!((a0y + a1y).abs() < 1e-12, "third law y: {} {}", a0y, a1y);
     assert!(a0x > 0.0, "body 0 is pulled toward +x");
@@ -208,9 +221,9 @@ fn l_bh_handles_coincident() {
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 0);
+    let (ax, ay, _, _) = tree.accel_for(&b, 0);
     assert!(ax.is_finite() && ay.is_finite(), "body 0: {} {}", ax, ay);
-    let (ax, ay, _) = tree.accel_for(&b, 1);
+    let (ax, ay, _, _) = tree.accel_for(&b, 1);
     assert!(ax.is_finite() && ay.is_finite(), "body 1: {} {}", ax, ay);
 }
 
@@ -305,7 +318,7 @@ fn ae_yoshida_energy_conservation() {
     compute_accel(&mut b);
     rebase_energy(&mut b);
     for _ in 0..200 {
-        yoshida_step(&mut b, DT);
+        yoshida_step(&mut b, DT, true);
     }
     let drift = energy_drift_pct(&b).unwrap().abs();
     assert!(drift < 0.05, "yoshida drift {:.4}%", drift);
@@ -318,7 +331,7 @@ fn ae_yoshida_energy_conservation() {
 /// even if all the individual stage tests passed.
 #[test]
 fn ae_yoshida_beats_leapfrog() {
-    let run = |step: fn(&mut Bodies, f64), n: usize| -> f64 {
+    let run = |step: fn(&mut Bodies, f64, bool), n: usize| -> f64 {
         let mut b = Bodies::with_capacity(2);
         b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
         let a = 5.0;
@@ -327,7 +340,7 @@ fn ae_yoshida_beats_leapfrog() {
         compute_accel(&mut b);
         rebase_energy(&mut b);
         for _ in 0..n {
-            step(&mut b, DT);
+            step(&mut b, DT, true);
         }
         energy_drift_pct(&b).unwrap().abs()
     };
@@ -411,7 +424,7 @@ fn ah_osculating_ellipse_circular() {
     let a = 5.0;
     let v = (G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
-    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).unwrap();
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).unwrap();
     assert!(pts.len() >= 32, "expected at least 32 points");
     for p in &pts {
         let r = ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
@@ -429,7 +442,7 @@ fn ah_osculating_ellipse_hyperbolic_none() {
     let a = 5.0;
     let v_esc = (2.0 * G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, 2.0 * v_esc, 1.0, BodyKind::Planet);
-    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
+    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
 }
 
 // ===========================================================================
@@ -463,8 +476,8 @@ fn ai_bh_error_below_documented_bound() {
         let tree = Tree::build(&b);
         let mut worst = 0.0_f64;
         for i in 0..b.len() {
-            let (rx, ry, _) = force_direct_on(&b, i);
-            let (ax, ay, _) = tree.accel_for(&b, i);
+            let (rx, ry, _, _) = force_direct_on(&b, i);
+            let (ax, ay, _, _) = tree.accel_for(&b, i);
             let rmag = (rx * rx + ry * ry).sqrt().max(1e-30);
             let dmag = ((ax - rx).powi(2) + (ay - ry).powi(2)).sqrt();
             worst = worst.max(dmag / rmag);
@@ -614,31 +627,36 @@ fn l_bh_build_coincident_collapses() {
     assert!(collapsed[0].children.iter().all(|&c| c < 0));
 }
 
-/// One body per quadrant → internal root with all four children filled.
-/// Empty quadrants would receive zero-mass phantom nodes instead.
+/// One body per octant → internal root with all eight children filled.
+/// Empty octants get no node at all (`children[q] == -1`), so a missing
+/// octant would show up here as a negative index.
 #[test]
 fn l_bh_build_all_quadrants() {
-    let mut b = Bodies::with_capacity(4);
-    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        b.push(x, y, 0.0, 0.0, 1.0, BodyKind::Planet);
+    let mut b = Bodies::with_capacity(8);
+    for z in [-1.0, 1.0] {
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            // `push` takes (x, y, vx, vy, m, kind); z is a field, not an arg.
+            let i = b.push(x, y, 0.0, 0.0, 1.0, BodyKind::Planet);
+            b.z[i] = z;
+        }
     }
     let tree = Tree::build(&b);
     assert_eq!(tree.nodes[0].body, -1, "root is internal");
     assert!(
         tree.nodes[0].children.iter().all(|&c| c >= 0),
-        "all four quadrants must be filled"
+        "all eight octants must be filled"
     );
-    assert!((tree.nodes[0].m - 4.0).abs() < 1e-15);
+    assert!((tree.nodes[0].m - 8.0).abs() < 1e-15);
     assert!(tree.nodes[0].com_x.abs() < 1e-15);
     assert!(tree.nodes[0].com_y.abs() < 1e-15);
+    assert!(tree.nodes[0].com_z.abs() < 1e-15);
 }
 
-/// Bodies at (-1, 0) and (1, 0) put the root cell at (0, 0), so both
-/// bodies have `y == cy`. The `< cy` split is strict, so `0 < 0` is false
-/// and both go high-y (q2, q3). Empty quadrants receive zero-mass phantom
-/// nodes (`m == 0`, `body == -1`), not `-1` child indices — so the
-/// discriminator between "empty" and "filled" is the child's mass, not
-/// its index sign.
+/// Bodies at (-1, 0, 0) and (1, 0, 0) put the root cell at (0, 0, 0), so
+/// both bodies have `y == cy` and `z == cz`. Both splits are strict (`<`),
+/// so `0 < 0` is false and both land in the high-y, high-z half. Octant
+/// order is `x | y << 1 | z << 2`, so only q6 (low x) and q7 (high x) are
+/// filled; an empty octant has no node at all (`children[q] == -1`).
 #[test]
 fn l_bh_build_boundary_uses_strict_less_than() {
     let mut b = Bodies::with_capacity(2);
@@ -647,23 +665,23 @@ fn l_bh_build_boundary_uses_strict_less_than() {
     let tree = Tree::build(&b);
     assert_eq!(tree.nodes[0].body, -1);
 
-    let child_m = |q: usize| -> f64 {
-        let ci = tree.nodes[0].children[q];
-        assert!(ci >= 0, "q{q} must have a child node (phantom or real)");
-        tree.nodes[ci as usize].m
-    };
-    assert_eq!(
-        child_m(0),
-        0.0,
-        "q0 (low-x low-y) must be a zero-mass phantom"
-    );
-    assert_eq!(
-        child_m(1),
-        0.0,
-        "q1 (high-x low-y) must be a zero-mass phantom"
-    );
-    assert!(child_m(2) > 0.0, "q2 (low-x high-y) must hold a body");
-    assert!(child_m(3) > 0.0, "q3 (high-x high-y) must hold a body");
+    let filled = |q: usize| tree.nodes[0].children[q] >= 0;
+    for (q, want) in [
+        (0, false),
+        (1, false),
+        (2, false),
+        (3, false),
+        (4, false),
+        (5, false),
+        (6, true),
+        (7, true),
+    ] {
+        assert_eq!(filled(q), want, "octant q{q} filled state");
+    }
+    for q in [6, 7] {
+        let m = tree.nodes[tree.nodes[0].children[q] as usize].m;
+        assert!((m - 1.0).abs() < 1e-15, "q{q} must hold exactly one body");
+    }
 }
 
 /// Sub-`MIN_NODE_SIZE` clusters must not cause unbounded recursion. The
@@ -684,7 +702,7 @@ fn l_bh_build_min_node_size_terminates() {
         tree.nodes.len()
     );
     for i in 0..b.len() {
-        let (ax, ay, _) = tree.accel_for(&b, i);
+        let (ax, ay, _, _) = tree.accel_for(&b, i);
         assert!(ax.is_finite() && ay.is_finite(), "body {i}: {ax} {ay}");
     }
 }
@@ -718,8 +736,8 @@ fn l_bh_accel_accepts_far_cluster() {
     }
     b.push(100.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 4);
-    let (dx, dy, _) = force_direct_on(&b, 4);
+    let (ax, ay, _, _) = tree.accel_for(&b, 4);
+    let (dx, dy, _, _) = force_direct_on(&b, 4);
     let err = (ax - dx).hypot(ay - dy) / dx.hypot(dy);
     assert!(err < 1e-3, "far-cluster relative error {err:e}");
 }
@@ -737,8 +755,8 @@ fn l_bh_accel_rejects_close_cluster() {
     }
     b.push(0.01, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 4);
-    let (dx, dy, _) = force_direct_on(&b, 4);
+    let (ax, ay, _, _) = tree.accel_for(&b, 4);
+    let (dx, dy, _, _) = force_direct_on(&b, 4);
     let err = (ax - dx).hypot(ay - dy) / dx.hypot(dy);
     assert!(err < 1e-10, "close-cluster relative error {err:e}");
 }
@@ -754,7 +772,7 @@ fn l_bh_accel_coincident_near_probe_finite() {
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(0.5 * SOFT2.sqrt(), 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 2);
+    let (ax, ay, _, _) = tree.accel_for(&b, 2);
     assert!(ax.is_finite() && ay.is_finite(), "ax {ax}, ay {ay}");
 }
 
@@ -769,8 +787,8 @@ fn l_bh_accel_coincident_cluster_far() {
     }
     b.push(10.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 3);
-    let (dx, dy, _) = force_direct_on(&b, 3);
+    let (ax, ay, _, _) = tree.accel_for(&b, 3);
+    let (dx, dy, _, _) = force_direct_on(&b, 3);
     let err = (ax - dx).hypot(ay - dy) / dx.hypot(dy);
     assert!(err < 1e-12, "coincident-cluster error {err:e}");
 }
@@ -783,8 +801,8 @@ fn l_bh_accel_zero_mass_phantom_ignored() {
     b.push(-1.0, -1.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(1.0, 1.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 0);
-    let (dx, dy, _) = force_direct_on(&b, 0);
+    let (ax, ay, _, _) = tree.accel_for(&b, 0);
+    let (dx, dy, _, _) = force_direct_on(&b, 0);
     let err = (ax - dx).hypot(ay - dy) / dx.hypot(dy);
     assert!(err < 1e-12, "phantom leaked into force: {err:e}");
 }
@@ -798,8 +816,8 @@ fn l_bh_accel_root_accepted_at_infinity() {
     b.push(0.1, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(1e6, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 2);
-    let (dx, dy, _) = force_direct_on(&b, 2);
+    let (ax, ay, _, _) = tree.accel_for(&b, 2);
+    let (dx, dy, _, _) = force_direct_on(&b, 2);
     let err = (ax - dx).hypot(ay - dy) / dx.hypot(dy);
     assert!(err < 1e-10, "COM collapse error {err:e}");
 }
@@ -812,7 +830,7 @@ fn l_bh_accel_matches_newton_2body() {
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, _) = tree.accel_for(&b, 1);
+    let (ax, ay, _, _) = tree.accel_for(&b, 1);
     let d2 = 25.0 + SOFT2;
     let d3 = d2 * d2.sqrt();
     let expected_ax = -G * M_SUN_ME * 5.0 / d3;
@@ -832,7 +850,7 @@ fn l_bh_accel_dt_limit_2body() {
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(5.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (_, _, dt) = tree.accel_for(&b, 0);
+    let (_, _, _, dt) = tree.accel_for(&b, 0);
     let d2 = 25.0 + SOFT2;
     let d3 = d2 * d2.sqrt();
     let s_max = 2.0 / d3;
@@ -848,7 +866,7 @@ fn l_bh_accel_single_body_dt_infinite() {
     let mut b = Bodies::with_capacity(1);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let tree = Tree::build(&b);
-    let (ax, ay, dt) = tree.accel_for(&b, 0);
+    let (ax, ay, _, dt) = tree.accel_for(&b, 0);
     assert_eq!((ax, ay), (0.0, 0.0));
     assert!(dt.is_infinite(), "expected inf, got {dt}");
 }
@@ -877,7 +895,7 @@ fn l_bh_accel_never_nan_across_configs() {
         }
         let tree = Tree::build(&b);
         for i in 0..b.len() {
-            let (ax, ay, dt) = tree.accel_for(&b, i);
+            let (ax, ay, _, dt) = tree.accel_for(&b, i);
             assert!(ax.is_finite(), "seed {seed} body {i} ax = {ax}");
             assert!(ay.is_finite(), "seed {seed} body {i} ay = {ay}");
             assert!(
@@ -1058,7 +1076,7 @@ fn ae_flash_lifecycle() {
     let mut b = Bodies::with_capacity(1);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     let t0 = b.time;
-    flash_at(&mut b, 1.0, 2.0, 0.1);
+    flash_at(&mut b, 1.0, 2.0, 0.0, 0.1);
     assert_eq!(b.flashes.len(), 1);
     assert!((b.flashes[0].expires_at - (t0 + FLASH_LIFE)).abs() < 1e-15);
 
@@ -1093,6 +1111,7 @@ fn ae_flash_retain_live_only() {
     b.flashes.push(Flash {
         x: 0.0,
         y: 0.0,
+        z: 0.0,
         r0: 0.1,
         age: 0.0,
         life: FLASH_LIFE,
@@ -1101,6 +1120,7 @@ fn ae_flash_retain_live_only() {
     b.flashes.push(Flash {
         x: 1.0,
         y: 0.0,
+        z: 0.0,
         r0: 0.1,
         age: 0.0,
         life: FLASH_LIFE,
@@ -1115,11 +1135,10 @@ fn ae_flash_retain_live_only() {
 /// advanced by exactly `dt` (the block duration).
 #[test]
 fn ae_flash_survives_short_block() {
-    assert!(FLASH_LIFE > DT, "test assumes flash outlives one block");
     let mut b = Bodies::with_capacity(1);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     compute_accel(&mut b);
-    flash_at(&mut b, 0.0, 0.0, 0.1);
+    flash_at(&mut b, 0.0, 0.0, 0.0, 0.1);
     step_block(&mut b, DT, 0);
     assert_eq!(b.flashes.len(), 1);
     assert!((b.flashes[0].age - DT).abs() < 1e-15);
@@ -1133,7 +1152,7 @@ fn ae_flash_expires_during_block() {
     let mut b = Bodies::with_capacity(1);
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     compute_accel(&mut b);
-    flash_at(&mut b, 0.0, 0.0, 0.1);
+    flash_at(&mut b, 0.0, 0.0, 0.0, 0.1);
     b.flashes[0].expires_at = b.time + 0.5 * DT; // dies mid-block
     step_block(&mut b, DT, 0);
     assert_eq!(b.flashes.len(), 0, "must expire before block ends");
@@ -1175,7 +1194,7 @@ fn ae_yoshida_step_flash_aging() {
     b.push(0.0, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
     b.push(0.0, 0.0, 0.0, 0.0, 0.5, BodyKind::Planet);
     compute_accel(&mut b);
-    yoshida_step(&mut b, DT);
+    yoshida_step(&mut b, DT, true);
     assert!(
         !b.flashes.is_empty(),
         "coincident pair must merge and flash"
@@ -1483,7 +1502,7 @@ fn ah_osculating_ellipse_degenerate_returns_none() {
     b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     // r = 1e-10 < 1e-9.
     b.push(1e-10, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
-    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
+    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
 }
 
 /// `a > 100_000`: bound orbit, but too large to draw. Constructed with
@@ -1499,7 +1518,7 @@ fn ah_osculating_ellipse_huge_a_none() {
     // `e >= 0.9999` guard is NOT what rejects this.
     let v = (1.5e-6 * mu).sqrt();
     b.push(r, 0.0, 0.0, v, 1.0, BodyKind::Planet);
-    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
+    assert!(osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none());
 }
 
 /// `e >= 0.9999`: near-parabolic but bound and finite-a. Constructed at
@@ -1518,7 +1537,7 @@ fn ah_osculating_ellipse_near_parabolic_none() {
     assert!(o.bound && o.semi_major < 100_000.0);
     assert!(o.ecc >= 0.9999);
     assert!(
-        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none(),
+        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).is_none(),
         "e={} must be rejected",
         o.ecc,
     );
@@ -1534,7 +1553,7 @@ fn ah_osculating_ellipse_point_count_clamp_low() {
     let a = 1e-4;
     let v = (G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
-    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).unwrap();
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1.0).unwrap();
     assert_eq!(pts.len(), 32);
 }
 
@@ -1547,7 +1566,7 @@ fn ah_osculating_ellipse_point_count_clamp_high() {
     let a = 100.0;
     let v = (G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
-    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1e6).unwrap();
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 1e6).unwrap();
     assert_eq!(pts.len(), ORBIT_TABLE_SIZE);
 }
 
@@ -1562,7 +1581,7 @@ fn ah_osculating_ellipse_point_count_power_of_two_and_stride() {
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
     for zoom_log in -6..=8 {
         let zoom = 10f64.powi(zoom_log);
-        let n = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom)
+        let n = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom)
             .unwrap()
             .len();
         assert!(n.is_power_of_two(), "zoom=1e{zoom_log}: n={n} not pow2");
@@ -1588,7 +1607,7 @@ fn ah_osculating_ellipse_npts_rounds_up() {
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
     // circum_px = 2000 ⇒ raw = 100 ⇒ next_pow2 = 128.
     let zoom = 2000.0 / (a * std::f64::consts::TAU);
-    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
     assert_eq!(pts.len(), 128);
 }
 
@@ -1601,7 +1620,7 @@ fn ah_osculating_ellipse_zoom_monotone() {
     let v = (G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
     let n = |z: f64| {
-        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, z)
+        osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, z)
             .unwrap()
             .len()
     };
@@ -1623,7 +1642,7 @@ fn ah_osculating_ellipse_zero_and_negative_zoom() {
     let v = (G * M_SUN_ME / a).sqrt();
     b.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
     for zoom in [0.0, -1.0, -1e6] {
-        let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
+        let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, zoom).unwrap();
         assert_eq!(pts.len(), 32, "zoom={zoom} must clamp to min");
     }
 }
@@ -1648,7 +1667,7 @@ fn ah_osculating_ellipse_eccentric_geometry() {
     let apo = o.semi_major * (1.0 + o.ecc);
 
     // High zoom covers the whole ellipse densely.
-    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
+    let pts = osculating_ellipse(&b, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
     assert!(pts.len() >= 64);
 
     // Every vertex is on the orbit: distance from focus ∈ [peri, apo].
@@ -1684,13 +1703,13 @@ fn ah_osculating_ellipse_world_space_translation() {
     let mut b1 = Bodies::with_capacity(2);
     b1.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     b1.push(a, 0.0, 0.0, v, 1.0, BodyKind::Planet);
-    let pts1 = osculating_ellipse(&b1, 1, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
+    let pts1 = osculating_ellipse(&b1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, M_SUN_ME, 100.0).unwrap();
 
     let (sx, sy, svx, svy) = (1000.0, -500.0, 1.0, -2.0);
     let mut b2 = Bodies::with_capacity(2);
     b2.push(sx, sy, svx, svy, M_SUN_ME, BodyKind::Star);
     b2.push(sx + a, sy, svx, svy + v, 1.0, BodyKind::Planet);
-    let pts2 = osculating_ellipse(&b2, 1, sx, sy, svx, svy, M_SUN_ME, 100.0).unwrap();
+    let pts2 = osculating_ellipse(&b2, 1, sx, sy, 0.0, svx, svy, 0.0, M_SUN_ME, 100.0).unwrap();
 
     assert_eq!(pts1.len(), pts2.len());
     for (p1, p2) in pts1.iter().zip(pts2.iter()) {
@@ -1698,3 +1717,10 @@ fn ah_osculating_ellipse_world_space_translation() {
         assert!(((p1[1] as f64 + sy) - p2[1] as f64).abs() < 1e-3, "y");
     }
 }
+
+// ===========================================================================
+// Compile-time invariants
+// ===========================================================================
+
+/// `ae_flash_survives_short_block` assumes a flash outlives one block step.
+const _: () = assert!(FLASH_LIFE > DT);

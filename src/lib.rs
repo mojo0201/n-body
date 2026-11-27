@@ -1,8 +1,9 @@
-//! Library surface for `main.rs` and the criterion benchmarks.
+//! Library surface for `main.rs`, the `headless` benchmark binary and the
+//! unit-test suite.
 //!
 //! `main.rs` is a thin binary that drives the winit event loop; the actual
 //! simulation, renderer and UI live in modules declared here so they can
-//! be imported by `benches/`.
+//! be imported by `src/bin/` and `src/physics/tests/`.
 
 // Deliberate, crate-wide: `!(x > 0.0)` is the NaN-safe form of "not a positive
 // number" the physics relies on; the hot loops index several parallel arrays

@@ -14,12 +14,22 @@
 
 use crate::physics::tides::{tidal_dissipation, TIDAL_BOOST, TIDAL_K2_STAR, TIDAL_Q_STAR};
 use crate::physics::*;
+use super::shared::*;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Sun + a planet on a circular orbit at `a_au`.
+///
+/// The planet's spin is set to the synchronous value, because a close-in
+/// planet is tidally locked in practice. That matters for the tests: with
+/// `Ω_planet > n` the tide the planet raises on the *star* would drive the
+/// orbit **outward**, which would mask the host tide these tests are about.
+/// Leaving the spin at the model's lazy default (a 10 h day for giants) makes
+/// a hot Jupiter migrate outward until it synchronises. `fast_rotator_
+/// migrates_outward` drives the *host* spin instead, and
+/// `synchronous_orbit_unchanged` locks both bodies.
 ///
 /// μ = G·(M_* + m_p) is used for the orbital velocity so the orbit is
 /// truly circular: a_sma = r exactly, which makes the Hut-rate and
@@ -31,12 +41,38 @@ fn setup_hot_jupiter(planet_mass: f64, a_au: f64) -> (Bodies, usize, usize) {
     let a0 = a_au * au_in_gm();
     let v = (G * (b.m[star] + planet_mass) / a0).sqrt();
     let planet = b.push(a0, 0.0, 0.0, v, planet_mass, BodyKind::Planet);
+    b.spin[planet] = synchronous_spin(&b, star, planet);
     b.parent_cache = vec![None, Some(star)];
     b.parent_cache_valid = true;
     (b, star, planet)
 }
 
+/// Spin angular momentum that puts `child` into corotation with its orbit
+/// about `host` (Ω = n), in the same units as `Bodies::spin`.
+///
+/// Uses the *current* separation as the orbital radius, so it is exact only
+/// for the circular fixtures here. On an eccentric orbit it must be given that
+/// orbit's semi-major axis instead, or the planet tide comes out non-zero and
+/// pushes the orbit (this is how `two_planets_decay_independently` used to
+/// fail).
+fn synchronous_spin(b: &Bodies, host: usize, child: usize) -> f64 {
+    let dx = b.x[child] - b.x[host];
+    let dy = b.y[child] - b.y[host];
+    let a = dx.hypot(dy).max(1e-12);
+    let n = (G * (b.m[host] + b.m[child]) / (a * a * a)).sqrt();
+    let k = match b.kind[child] {
+        BodyKind::Star => 0.1,
+        BodyKind::BrownDwarf => 0.15,
+        _ => 0.3,
+    };
+    k * b.m[child] * b.r[child] * b.r[child] * n
+}
+
+
 /// Generic host-of-arbitrary-kind with a planet on a circular orbit.
+///
+/// The planet starts at corotation, like `setup_hot_jupiter`, so only the
+/// tide it raises on the host is active.
 fn setup_host_planet(
     host_kind: BodyKind,
     host_mass: f64,
@@ -50,14 +86,19 @@ fn setup_host_planet(
     let a0 = a_au * au_in_gm();
     let v = (G * (host_mass + planet_mass) / a0).sqrt();
     let planet = b.push(a0, 0.0, 0.0, v, planet_mass, BodyKind::Planet);
+    b.spin[planet] = synchronous_spin(&b, host, planet);
     b.parent_cache = vec![None, Some(host)];
     b.parent_cache_valid = true;
     (b, host, planet)
 }
 
 /// Specific-angular-momentum magnitude `|r × v|` from the host to `planet`,
-/// weighted by reduced mass, plus the host spin (angular velocity × inertia
-/// in code units). Conserved exactly by `tidal_dissipation`.
+/// weighted by reduced mass, plus *both* spins in code units.
+///
+/// Both are needed: `tidal_dissipation` runs a tide in each direction, so the
+/// host's bulge takes L from the orbit into the host spin, and the planet's
+/// bulge (when it is not synchronous) takes L into the planet's spin. Leaving
+/// the planet term out shows up as a spurious ~1e-7 drift per 10⁴ steps.
 fn total_angular_momentum(b: &Bodies, host: usize, planet: usize) -> f64 {
     let dx = b.x[planet] - b.x[host];
     let dy = b.y[planet] - b.y[host];
@@ -67,7 +108,7 @@ fn total_angular_momentum(b: &Bodies, host: usize, planet: usize) -> f64 {
     let m_p = b.m[planet];
     let mu_red = m_h * m_p / (m_h + m_p);
     let l_orb = mu_red * (dx * dvy - dy * dvx);
-    l_orb + b.spin[host]
+    l_orb + b.spin[host] + b.spin[planet]
 }
 
 /// Semi-major axis (in code units) from vis-viva, relative to `host`.
@@ -107,6 +148,7 @@ fn snapshot(b: &Bodies, i: usize) -> (f64, f64, f64, f64, f64) {
 
 #[test]
 fn hot_jupiter_decays_and_spins_up_host() {
+    let _mode = accelerated();
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let v0 = b.vx[planet].hypot(b.vy[planet]);
     let spin0 = b.spin[star];
@@ -122,6 +164,7 @@ fn hot_jupiter_decays_and_spins_up_host() {
 
 #[test]
 fn earth_mass_barely_feels_tides() {
+    let _mode = accelerated();
     // Rate ∝ q = m_p/m_*, so 1 M⊕ vs 1 M_J is a ~10⁻³ suppression.
     let (mut b, _star, planet) = setup_hot_jupiter(1.0, 0.02);
     let v0 = b.vx[planet].hypot(b.vy[planet]);
@@ -135,6 +178,7 @@ fn earth_mass_barely_feels_tides() {
 
 #[test]
 fn distant_planet_unchanged() {
+    let _mode = accelerated();
     // 1 AU is far outside 50 R∗; the squared-distance early-out fires.
     let (mut b, _star, planet) = setup_hot_jupiter(JUPITER_MASS, 1.0);
     let v0 = b.vy[planet];
@@ -231,8 +275,11 @@ fn dead_host_skipped() {
 
 #[test]
 fn non_host_kind_parent_skipped() {
+    // A tidal host is a star, brown dwarf, white dwarf, neutron star, black
+    // hole — or a planet (planet–moon tides). A dwarf planet is none of
+    // those, so the pair must be left alone.
     let mut b = Bodies::with_capacity(2);
-    let p0 = b.push(0.0, 0.0, 0.0, 0.0, JUPITER_MASS, BodyKind::Planet);
+    let p0 = b.push(0.0, 0.0, 0.0, 0.0, JUPITER_MASS, BodyKind::DwarfPlanet);
     b.r[p0] = R_SUN_GM;
     let a0 = 0.02 * au_in_gm();
     let v = (G * b.m[p0] / a0).sqrt();
@@ -324,6 +371,7 @@ fn zero_mass_planet_skipped() {
 
 #[test]
 fn fast_rotator_migrates_outward() {
+    let _mode = accelerated();
     // Ω = 4 n → decay factor = −3.  Planet gains v_t, host loses spin.
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let inertia = 0.1 * b.m[star] * b.r[star] * b.r[star]; // k = 0.1 for a star
@@ -349,7 +397,10 @@ fn fast_rotator_migrates_outward() {
 
 #[test]
 fn synchronous_orbit_unchanged() {
-    // Ω = n → decay factor = 0 → no evolution.
+    let _mode = accelerated();
+    // Both bodies tidally locked (Ω_host = Ω_planet = n) → neither bulge
+    // lags → no evolution. The planet is already synchronous from the
+    // fixture; the host spin is what this test sets.
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let inertia = 0.1 * b.m[star] * b.r[star] * b.r[star];
     let r = b.x[planet].hypot(b.y[planet]);
@@ -358,6 +409,7 @@ fn synchronous_orbit_unchanged() {
 
     let v0 = b.vy[planet];
     let s0 = b.spin[star];
+    let sp0 = b.spin[planet];
     for _ in 0..1_000 {
         tidal_dissipation(&mut b, DT);
     }
@@ -371,6 +423,12 @@ fn synchronous_orbit_unchanged() {
         rel_s < 1e-12,
         "synchronous spin must not evolve: rel_s = {rel_s}"
     );
+    assert!(
+        (b.spin[planet] - sp0).abs() <= 1e-12 * sp0.abs(),
+        "synchronous planet spin must not evolve: {} -> {}",
+        sp0,
+        b.spin[planet]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -379,6 +437,7 @@ fn synchronous_orbit_unchanged() {
 
 #[test]
 fn total_angular_momentum_conserved() {
+    let _mode = accelerated();
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let l0 = total_angular_momentum(&b, star, planet);
     for _ in 0..10_000 {
@@ -392,6 +451,7 @@ fn total_angular_momentum_conserved() {
 
 #[test]
 fn one_step_matches_hut_rate() {
+    let _mode = accelerated();
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
 
     let dx = b.x[planet] - b.x[star];
@@ -418,17 +478,25 @@ fn one_step_matches_hut_rate() {
     let new_vt_pred = v_t * (1.0 - 0.5 * frac);
 
     tidal_dissipation(&mut b, DT);
-    let vt_obs = b.vy[planet];
+    // The kick is applied to the *relative* velocity and shared between the
+    // masses (`share_relative_kick`), so compare the relative tangential
+    // component, not the planet's absolute velocity.
+    let vt_obs = b.vy[planet] - b.vy[star];
 
     let rel_err = (vt_obs - new_vt_pred).abs() / new_vt_pred.abs();
+    // 1e-9, not fp-exact: the planet's own tide is suppressed only to the
+    // extent that its spin is synchronous (Ω_p/n differs from 1 in the last
+    // bits), which leaks ~1e-11 into the tangential speed. The Hut
+    // coefficient is still pinned to nine digits.
     assert!(
-        rel_err < 1e-13,
+        rel_err < 1e-9,
         "single-step v_t mismatch: pred {new_vt_pred}, obs {vt_obs}, rel_err {rel_err:e}"
     );
 }
 
 #[test]
 fn per_step_change_capped_for_huge_dt() {
+    let _mode = accelerated();
     // Absurd dt must still respect the ±5% per-step clamp (TIDAL_MAX_FRAC).
     let (mut b, _star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let v0 = b.vx[planet].hypot(b.vy[planet]);
@@ -440,6 +508,7 @@ fn per_step_change_capped_for_huge_dt() {
 
 #[test]
 fn negative_frac_clamped_for_huge_spin() {
+    let _mode = accelerated();
     // Fast rotator with absurd spin + huge dt: the negative clamp must
     // fire, and the velocity must not blow up.
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
@@ -457,6 +526,7 @@ fn negative_frac_clamped_for_huge_spin() {
 
 #[test]
 fn accumulation_is_linear_in_steps() {
+    let _mode = accelerated();
     // Two integrations with equal total step should agree to fp precision
     // (the per-step update is O(frac); a single vs. two half-steps differ
     // only at O(frac²), well below the tolerance).
@@ -480,10 +550,18 @@ fn accumulation_is_linear_in_steps() {
 
 #[test]
 fn eccentric_orbit_circularizes() {
+    let _mode = accelerated();
     // Circular setup then boost v_t by 15% → e ≈ 0.32. Tides should reduce e.
     let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
+    // Circularisation needs the orbit to be *integrated*: damping the
+    // velocity at a fixed position is not a circularisation. Give the planet
+    // its own (fast) spin back — the bulge the star raises on the planet is
+    // the channel that damps eccentricity — and run the full step loop.
+    b.spin[planet] = 0.0;
     let v_circ = b.vy[planet];
     b.vy[planet] = 1.15 * v_circ;
+    b.vx[planet] = 0.10 * v_circ;
+    compute_accel(&mut b);
 
     let e0 = eccentricity(&b, star, planet);
     assert!(
@@ -492,7 +570,7 @@ fn eccentric_orbit_circularizes() {
     );
 
     for _ in 0..20_000 {
-        tidal_dissipation(&mut b, DT);
+        advance(&mut b, DT);
     }
     let e1 = eccentricity(&b, star, planet);
     assert!(e1 < e0, "eccentricity must decrease: {e0} -> {e1}");
@@ -504,6 +582,7 @@ fn eccentric_orbit_circularizes() {
 
 #[test]
 fn host_inertia_affects_first_step_decay() {
+    let _mode = accelerated();
     // Same L_spin on hosts of different k gives different Ω/n, hence a
     // different decay factor. For k_star = 0.1, k_bd = 0.15 and
     // L_spin = I_star · 0.5 n:
@@ -538,6 +617,7 @@ fn host_inertia_affects_first_step_decay() {
 
 #[test]
 fn two_planets_decay_independently() {
+    let _mode = accelerated();
     let mut b = Bodies::with_capacity(3);
     let star = b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
     b.r[star] = R_SUN_GM;
@@ -545,26 +625,62 @@ fn two_planets_decay_independently() {
     let v0 = (G * b.m[star] / a0).sqrt();
     // Two Jupiters at slightly different a, so their v_t differ slightly.
     let p1 = b.push(a0, 0.0, 0.0, v0, JUPITER_MASS, BodyKind::Planet);
-    let p2 = b.push(0.0, a0 * 1.1, -v0, 0.0, JUPITER_MASS, BodyKind::Planet);
+    let v2 = (G * b.m[star] / (a0 * 1.1)).sqrt();
+    let p2 = b.push(0.0, a0 * 1.1, -v2, 0.0, JUPITER_MASS, BodyKind::Planet);
+    // Both tidally locked, so only the host tide acts on each orbit.
+    b.spin[p1] = synchronous_spin(&b, star, p1);
+    b.spin[p2] = synchronous_spin(&b, star, p2);
     b.parent_cache = vec![None, Some(star), Some(star)];
     b.parent_cache_valid = true;
 
-    let v1_0 = b.vx[p1].hypot(b.vy[p1]);
-    let v2_0 = b.vx[p2].hypot(b.vy[p2]);
+    let rel = |b: &Bodies, i: usize| (b.vx[i] - b.vx[star]).hypot(b.vy[i] - b.vy[star]);
+    let v1_0 = rel(&b, p1);
+    let v2_0 = rel(&b, p2);
     let spin0 = b.spin[star];
     for _ in 0..1_000 {
         tidal_dissipation(&mut b, DT);
     }
-    let v1_1 = b.vx[p1].hypot(b.vy[p1]);
-    let v2_1 = b.vx[p2].hypot(b.vy[p2]);
+    let v1_1 = rel(&b, p1);
+    let v2_1 = rel(&b, p2);
     assert!(v1_1 < v1_0);
     assert!(v2_1 < v2_0);
     assert!(b.spin[star] > spin0, "both planets must feed the same spin");
 }
 
+/// The app's default mode is *physical*: every boost is 1. This test pins
+/// that default and the size of the switch, because the realism of every
+/// other tidal number depends on it. Physical mode must be exactly
+/// `TIDAL_BOOST` times slower than the accelerated demo mode.
+#[test]
+fn physical_mode_is_the_default_and_much_slower() {
+    let decay = |mode: SimMode| {
+        let _mode = mode;
+        let (mut b, _star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
+        let v0 = b.vy[planet];
+        for _ in 0..200 {
+            tidal_dissipation(&mut b, DT);
+        }
+        (v0 - b.vy[planet]) / v0
+    };
+    // Read the mode with every flipping test quiesced, so a test that holds
+    // the guard in another thread cannot be observed here.
+    assert!(resting_mode(), "the app must start in physical mode");
+    let phys = decay(physical());
+    let boosted = decay(accelerated());
+    assert!(phys > 0.0, "physical tides must still act: {phys}");
+    assert!(boosted > 0.0, "accelerated tides must act: {boosted}");
+    let ratio = boosted / phys;
+    // 0.5 %, not exact: over 200 steps the *physical* decay is a relative
+    // change of ~5e-12, close to the accumulated rounding of the velocity
+    // itself, so the ratio is fp-limited (measured 999 237 vs 1 000 000).
+    assert!(
+        (ratio / TIDAL_BOOST - 1.0).abs() < 5e-3,
+        "boost ratio {ratio} should be TIDAL_BOOST = {TIDAL_BOOST}"
+    );
+}
+
 #[test]
 fn unrelated_bodies_untouched() {
-    // A body with no parent in the cache must come through unchanged.
     let (mut b, _star, _planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
     let ast = b.push(10.0 * au_in_gm(), 0.0, 0.0, 0.0, 0.0, BodyKind::DwarfPlanet);
     b.parent_cache.push(None);

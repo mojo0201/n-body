@@ -15,7 +15,7 @@ fn main() {
         b.z[i] = z; b.vz[i] = vz;
         for _ in 0..30000 { advance(&mut b, DT); }
         for k in 0..b.len() { for v in [b.x[k], b.y[k], b.z[k], b.vx[k], b.vy[k], b.vz[k], b.m[k], b.spin[k]] { h = (h ^ v.to_bits()).wrapping_mul(1099511628211); } }
-        td += b.stats.tidal as u64; nb += b.len();
+        td += b.stats.tidal; nb += b.len();
         eprintln!("case rp={rp} tidal={} n={} merges={}", b.stats.tidal, b.len(), b.stats.merges);
     }
     println!("tidal={td} bodies={nb} hash={h:016x}");

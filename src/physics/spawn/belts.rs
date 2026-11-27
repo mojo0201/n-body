@@ -241,9 +241,13 @@ pub(in crate::physics) fn giant_near(
         }
         // Compare the semi-major axis (vis-viva), not the instantaneous
         // radius, so eccentric giants still match their trojan clusters.
-        let (dx, dy) = (b.x[i] - centre.0, b.y[i] - centre.1);
-        let (dvx, dvy) = (b.vx[i] - centre.2, b.vy[i] - centre.3);
-        let inv_a = 2.0 / dx.hypot(dy) - (dvx * dvx + dvy * dvy) / (G * (centre.4 + b.m[i]));
+        // Full 3D state: systems are tilted, and a 2D vis-viva would give
+        // every inclined giant the wrong `a` (and hence drop its Trojans).
+        let (dx, dy, dz) = (b.x[i] - centre.0, b.y[i] - centre.1, b.z[i]);
+        let (dvx, dvy, dvz) = (b.vx[i] - centre.2, b.vy[i] - centre.3, b.vz[i]);
+        let r = (dx * dx + dy * dy + dz * dz).sqrt();
+        let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
+        let inv_a = 2.0 / r - v2 / (G * (centre.4 + b.m[i]));
         if inv_a <= 0.0 {
             continue; // unbound
         }
@@ -277,6 +281,12 @@ pub(in crate::physics) fn giant_mass_near(
 
 /// Spawn a Trojan at the L4 (`lead = +1`) or L5 (`lead = -1`) point of
 /// a giant at `a_gm`. `giant_angle` is that giant's current azimuth.
+///
+/// Known simplification: the azimuth is measured in the reference (z = 0)
+/// plane and only the *inclination* of the Trojan orbit is randomised, so in a
+/// strongly tilted system the cloud stays 60° from the giant in projection
+/// rather than in the giant's own orbital plane. Aligning it properly needs the
+/// giant's orbit normal (see `orbit_normal`, which the moon spawner uses).
 pub(in crate::physics) fn spawn_trojan(
     b: &mut Bodies,
     centre: (f64, f64, f64, f64, f64),
@@ -291,11 +301,16 @@ pub(in crate::physics) fn spawn_trojan(
     let jitter = (rng.next_f64() - 0.5) * 0.7; // ±20 degrees
     let omega = giant_angle + lead * std::f64::consts::PI / 3.0 + jitter;
     let (cx, cy, cvx, cvy, mc) = centre;
-    let (inc, node) = tilt_rayleigh(
+    // Only the inclination is taken from the tilt draw: a random longitude of
+    // the ascending node would rotate the orbit's azimuth, which is exactly
+    // where the L4/L5 offset lives — a random node smears the cloud around
+    // the whole orbit instead of leaving it 60° from the giant. The draw is
+    // still consumed so the RNG stream is unchanged.
+    let (inc, _node) = tilt_rayleigh(
         tilt_key(&[omega, a_gm, e]),
         population_sigma_deg(BodyOrigin::Trojan, 0.0).unwrap_or(12.0),
     );
-    let (x, y, z, vx, vy, vz) = kepler_state_incl(G * mc, a_gm, e, 0.0, omega, inc, node);
+    let (x, y, z, vx, vy, vz) = kepler_state_incl(G * mc, a_gm, e, 0.0, omega, inc, 0.0);
     let kind = classify_small_body(m);
     let i = push3(b, [cx + x, cy + y, z], [cvx + vx, cvy + vy, vz], m, kind);
     b.origin[i] = BodyOrigin::Trojan;

@@ -63,8 +63,8 @@ fn l_stale_tree_close_pair_matches_direct() {
         b.x[i] += b.vx[i] * DT;
         b.y[i] += b.vy[i] * DT;
     }
-    let (tx, ty, _) = tree.accel_for(&b, moon);
-    let (dx, dy, _) = force_direct_on(&b, moon);
+    let (tx, ty, _, _) = tree.accel_for(&b, moon);
+    let (dx, dy, _, _) = force_direct_on(&b, moon);
     let err = (tx - dx).hypot(ty - dy) / dx.hypot(dy);
     assert!(err < 1e-9, "stale-tree error {err:e} on the Moon");
 }

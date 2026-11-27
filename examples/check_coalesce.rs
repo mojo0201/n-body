@@ -9,7 +9,7 @@ fn main() {
         let hst = b.push(0.0, 60.0, 0.0, 0.0, 3000.0, BodyKind::Star); let _ = hst;
         for _ in 0..30000 { advance(&mut b, DT); }
         for k in 0..b.len() { for v in [b.x[k], b.y[k], b.z[k], b.vx[k], b.vy[k], b.m[k]] { h = (h ^ v.to_bits()).wrapping_mul(1099511628211); } }
-        co += b.stats.coalesces as u64; im += b.stats.impacts as u64; me += b.stats.merges as u64; nb += b.len();
+        co += b.stats.coalesces; im += b.stats.impacts; me += b.stats.merges; nb += b.len();
     }
     println!("bodies={nb} coalesces={co} impacts={im} merges={me} hash={h:016x}");
 }

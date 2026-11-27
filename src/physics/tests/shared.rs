@@ -94,6 +94,42 @@ pub(super) fn star_pair_centre(b: &Bodies) -> (f64, f64, f64, f64, f64) {
     )
 }
 
+/// Full 3D state `(x, y, z, vx, vy, vz, m)` of body `i`, for [`osc_a3`].
+pub(super) fn body_ref3(b: &Bodies, i: usize) -> (f64, f64, f64, f64, f64, f64, f64) {
+    (b.x[i], b.y[i], b.z[i], b.vx[i], b.vy[i], b.vz[i], b.m[i])
+}
+
+/// Barycentre of the first two bodies, as a 3D reference state.
+pub(super) fn star_pair_centre3(b: &Bodies) -> (f64, f64, f64, f64, f64, f64, f64) {
+    let m = b.m[0] + b.m[1];
+    let w = |a: &[f64]| (b.m[0] * a[0] + b.m[1] * a[1]) / m;
+    (w(&b.x), w(&b.y), w(&b.z), w(&b.vx), w(&b.vy), w(&b.vz), m)
+}
+
+/// Osculating semi-major axis of body `i` about a 3D centre, from the full
+/// relative state.
+///
+/// Preferred over [`osc_a`] whenever the system may be tilted: a 2D vis-viva
+/// drops the z terms, so an inclined orbit gets the wrong `a` (and a stability
+/// test that asserts a lower bound on `a` fails for reasons that have nothing
+/// to do with the spawner). Rotation-invariant by construction.
+///
+/// Like [`osc_a`], `c.6` is the *whole* mass to use (host, or host + body for
+/// a pair); the body's own mass is not added again.
+pub(super) fn osc_a3(b: &Bodies, i: usize, c: (f64, f64, f64, f64, f64, f64, f64)) -> f64 {
+    let (dx, dy, dz) = (b.x[i] - c.0, b.y[i] - c.1, b.z[i] - c.2);
+    let (dvx, dvy, dvz) = (b.vx[i] - c.3, b.vy[i] - c.4, b.vz[i] - c.5);
+    let r = (dx * dx + dy * dy + dz * dz).sqrt();
+    let v2 = dvx * dvx + dvy * dvy + dvz * dvz;
+    1.0 / (2.0 / r - v2 / (G * c.6))
+}
+
+/// Distance (Gm) between body `i` and a 3D reference state, including z.
+pub(super) fn dist3(b: &Bodies, i: usize, c: (f64, f64, f64, f64, f64, f64, f64)) -> f64 {
+    let (dx, dy, dz) = (b.x[i] - c.0, b.y[i] - c.1, b.z[i] - c.2);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 /// True iff body `i` is a moon of a planet (its parent is a Planet or
 /// DwarfPlanet, not a star or remnant). Use this instead of
 /// `find_parent(b, i).is_some()` when you mean "is a moon": the latter
@@ -267,3 +303,77 @@ pub(super) fn sma_about_primary(b: &Bodies, i: usize) -> f64 {
     let mu = G * (b.m[0] + b.m[i]);
     1.0 / (2.0 / r - (dvx * dvx + dvy * dvy) / mu)
 }
+
+// ===========================================================================
+// Simulation mode (physical vs accelerated)
+// ===========================================================================
+
+/// Serialises every test that changes the process-global simulation mode.
+static SIM_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_mode() -> std::sync::MutexGuard<'static, ()> {
+    SIM_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Holds the process-global simulation mode (`physical_mode`) at a chosen
+/// value for the lifetime of the guard and restores the previous one on drop,
+/// including on panic.
+///
+/// The mode is a process-wide switch, not a parameter: `tidal_dissipation`,
+/// the dust integrator (`pr_drag_boost`), `yarkovsky` and `belt_grinding` all
+/// read it. Two consequences for tests:
+///
+/// * Every test that flips it must take this guard, so two of them cannot run
+///   at the same time and leave the mode in the wrong state for a third.
+/// * Tests that *depend* on a rate (tides, drag, grinding) should also take it,
+///   which is what the mutual exclusion buys: while a boosted test runs, no
+///   other rate-dependent test can be looking at the same global.
+///
+/// Tests that only use the mode-neutral parts of the physics (gravity,
+/// collisions, spawning geometry, integrator bookkeeping) do not take it; at
+/// most they see a boost that their assertions are insensitive to.
+pub(super) struct SimMode {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: bool,
+}
+
+impl SimMode {
+    /// Set the mode to `physical` for the guard's lifetime.
+    pub(super) fn set(physical: bool) -> Self {
+        let lock = lock_mode();
+        let previous = physical_mode();
+        set_physical_mode(physical);
+        SimMode {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+/// The mode with every mode-flipping test quiesced. Each one restores the
+/// previous value on drop, so this is the process-wide default.
+pub(super) fn resting_mode() -> bool {
+    let _lock = lock_mode();
+    physical_mode()
+}
+
+impl Drop for SimMode {
+    fn drop(&mut self) {
+        set_physical_mode(self.previous);
+    }
+}
+
+/// Accelerated (demo) mode: tides ×`TIDAL_BOOST`, PR drag ×`PR_DRAG_BOOST`,
+/// belt grinding on. Use it for any test that has to observe dissipation
+/// within a few thousand steps, which is why those tests exist at all.
+pub(super) fn accelerated() -> SimMode {
+    SimMode::set(false)
+}
+
+/// Physical mode: every boost is 1 and belt grinding is off. The app's
+/// default, so tests that must match what a user sees without touching the
+/// "accelerated tides and drag" checkbox use this.
+pub(super) fn physical() -> SimMode {
+    SimMode::set(true)
+}
+
