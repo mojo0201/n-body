@@ -1441,10 +1441,13 @@ impl Bodies {
 
     /// Recompute `parent_cache` for every body.
     ///
-    /// O(n²) overall because `find_parent_cached` scans the host table, so
-    /// call it every ~100 steps rather than every step. Any operation that
-    /// can change parent relationships outside the normal step cadence (user
-    /// edit, spawn) should call it directly.
+    /// O(n·h + m·log m + n·log m), where `h` = hosts and `m`
+    /// = moon-parent candidates: the host scan is linear in both, and the
+    /// moon-parent scan is pruned to a local candidate set by a spatial
+    /// index built once per refresh (see `MoonIndex`). Call it every ~100
+    /// steps rather than every step. Any operation that can change parent
+    /// relationships outside the normal step cadence (user edit, spawn)
+    /// should call it directly.
     pub fn refresh_parent_cache(&mut self) {
         let n = self.len();
         let mut cache = std::mem::take(&mut self.parent_cache);

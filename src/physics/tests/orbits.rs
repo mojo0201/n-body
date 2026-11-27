@@ -2120,6 +2120,135 @@ fn s_spawn_moon_creates_a_bound_moon() {
     assert_eq!(find_parent(&b, m), Some(earth));
 }
 
+/// `refresh_parent_cache`'s moon scan must be bit-identical regardless of
+/// whether the spatial index (`MoonIndex`) is in use. The test builds a
+/// population well past `MOON_TREE_MIN` — a Plummer cluster of systems plus
+/// hundreds of dense planet-kind bodies in far corners — so the index prunes
+/// most candidates per query, then checks *every* body through all three
+/// paths: tree-pruned cached, plain-scan cached, and the true uncached
+/// `find_parent`.
+#[test]
+fn parent_cache_index_matches_plain_scan_at_scale() {
+    let mut b = Bodies::with_capacity(14_000);
+    spawn_random_systems(&mut b, 40, 0xB0BAC, 6);
+    let mut rng = XorShift::new(0xC0FFEE);
+    let centres = [
+        (1e4f64, 0.0f64, 0.0f64),
+        (-1e4, 1e4, 0.0),
+        (1e4, -1e4, 1e4),
+        (-1e4, -1e4, -1e4),
+    ];
+    for &(cx, cy, cz) in &centres {
+        for _ in 0..800usize {
+            let m = 1e-6 + rng.next_f64() * 1e-5;
+            let (px, py, pz) = (
+                cx + (rng.next_f64() - 0.5) * 4.0,
+                cy + (rng.next_f64() - 0.5) * 4.0,
+                cz + (rng.next_f64() - 0.5) * 4.0,
+            );
+            let i = b.push(px, py, 0.0, 0.0, m, BodyKind::DwarfPlanet);
+            b.z[i] = pz;
+            b.r[i] = 2e-4;
+        }
+    }
+    let n = b.len();
+    assert!(n > 3_400, "population {n} too small to stress the index");
+
+    let ctx = build_parent_context(&b);
+    assert!(ctx.moon_index.is_some(), "index must be built at this size");
+    let plain = ParentContext {
+        hosts: ctx.hosts.clone(),
+        partners: ctx.partners.clone(),
+        moons: ctx.moons.clone(),
+        moon_index: None,
+    };
+
+    for i in 0..n {
+        let cached = find_parent_cached(&b, i, &ctx);
+        assert_eq!(
+            cached,
+            find_parent_cached(&b, i, &plain),
+            "forest vs plain scan diverged for body {i}"
+        );
+        assert_eq!(
+            cached,
+            find_parent(&b, i),
+            "pruned moon scan diverged from find_parent for body {i}"
+        );
+    }
+}
+
+/// A moon inside its host's Hill reach must be classified as a moon, and
+/// one outside must not — through both the spatial-index and plain-scan
+/// paths, agreeing with the uncached `find_parent`. The inside/outside
+/// placement uses 0.4 × and 0.6 × `r_hill` so the float ratio is clearly on
+/// one side of `MOON_HILL_FRAC` (the exact-boundary case is float-ambiguous
+/// even for the plain scan).
+#[test]
+fn parent_cache_moon_at_hill_boundary_selects_planet() {
+    let mut b = Bodies::with_capacity(700);
+    let au = au_in_gm();
+    b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    let v = (G * M_SUN_ME / au).sqrt();
+    let planet = b.push(au, 0.0, 0.0, 0.0, 1.0, BodyKind::Planet);
+    b.vy[planet] = v;
+    let rhill = au * (1.0 / (3.0 * M_SUN_ME)).cbrt();
+    let inside = b.push(
+        au + 0.4 * rhill,
+        0.0,
+        0.0,
+        (G * M_SUN_ME / (au + 0.4 * rhill)).sqrt(),
+        0.0123,
+        BodyKind::Planet,
+    );
+    let outside = b.push(
+        au + 0.6 * rhill,
+        0.0,
+        0.0,
+        (G * M_SUN_ME / (au + 0.6 * rhill)).sqrt(),
+        0.0123,
+        BodyKind::Planet,
+    );
+    // Distant clutter forces the index to be built (well past
+    // `MOON_TREE_MIN` candidates) while staying far outside every reach.
+    let mut rng = XorShift::new(7);
+    for _ in 0..400usize {
+        let i = b.push(
+            3.0 * au + (rng.next_f64() - 0.5) * au,
+            0.0,
+            0.0,
+            0.0,
+            1e-5,
+            BodyKind::DwarfPlanet,
+        );
+        b.r[i] = 1e-4;
+    }
+
+    let ctx = build_parent_context(&b);
+    assert!(ctx.moon_index.is_some(), "index must be built");
+    let plain = ParentContext {
+        hosts: ctx.hosts.clone(),
+        partners: ctx.partners.clone(),
+        moons: ctx.moons.clone(),
+        moon_index: None,
+    };
+
+    assert_eq!(find_parent_cached(&b, inside, &ctx), Some(planet));
+    assert_eq!(find_parent_cached(&b, inside, &plain), Some(planet));
+    assert_eq!(find_parent(&b, inside), Some(planet));
+    assert_eq!(find_parent_cached(&b, outside, &ctx), Some(0));
+    assert_eq!(find_parent_cached(&b, outside, &plain), Some(0));
+    assert_eq!(find_parent(&b, outside), Some(0));
+    // And the two cached paths agree system-wide.
+    for i in 0..b.len() {
+        assert_eq!(
+            find_parent_cached(&b, i, &ctx),
+            find_parent_cached(&b, i, &plain),
+            "body {i}"
+        );
+    }
+}
+
 #[test]
 fn s_add_ring_creates_small_particles() {
     let mut b = Bodies::with_capacity(0);

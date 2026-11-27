@@ -255,8 +255,10 @@ pub(super) fn orbit_reference_cached(
 }
 
 /// Per-refresh cache for `find_parent_cached`. Building this once turns
-/// parent finding for the whole system from O(N·H + N²) into O(H² + N·P),
-/// where H = hosts, P = potential moon parents.
+/// parent finding for the whole system from O(N·H + N²) into
+/// O(H² + N·H + N·log M + M·log M), where H = hosts and M = potential moon
+/// parents. The `MoonIndex` prunes the moon scan to a local candidate set
+/// without ever dropping a selectable candidate.
 pub struct ParentContext {
     /// All host bodies, ascending.
     pub hosts: Vec<usize>,
@@ -267,6 +269,10 @@ pub struct ParentContext {
     /// Ascending order is required: `find_parent_cached` tie-breaks on
     /// `<=`, so it must see candidates in the same order as `find_parent`.
     pub(super) moons: Vec<usize>,
+    /// Spatial index over `moons` used to prune the Hill-reach scan to a
+    /// local candidate set. `None` below `MOON_TREE_MIN` candidates, where
+    /// the plain scan over `moons` is used instead (equivalent results).
+    pub(super) moon_index: Option<MoonIndex>,
 }
 
 pub fn build_parent_context(b: &Bodies) -> ParentContext {
@@ -285,17 +291,276 @@ pub fn build_parent_context(b: &Bodies) -> ParentContext {
     for &h in &hosts {
         partners[h] = binary_partner_in(b, &hosts, h);
     }
+    let moon_index = MoonIndex::build(b, &moons);
     ParentContext {
         hosts,
         partners,
         moons,
+        moon_index,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Moon-candidate spatial index
+// ---------------------------------------------------------------------------
+//
+// `find_parent_cached` only ever *selects* a moon candidate `k` for body `i`
+// when `d(i,k) ≤ MOON_HILL_FRAC · r_hill(k about i's host h)` — that is
+// exactly the initial `ratio ≤ best_ratio` gate. A candidate outside its
+// Hill reach can never win, no matter the scan order, so a conservative
+// spatial query that returns at least every in-reach candidate, then runs
+// the same ratio loop over them in ascending index order, reproduces the
+// unbounded scan bit-for-bit. That is what removes the quadratic
+// `N × moons` term from `refresh_parent_cache`: the tree turns it into
+// `N · O(log M + candidates)` with an `O(M log M)` construction.
+//
+// The hierarchy is a median-split tree (widest axis at each level) whose
+// leaves partition the ascending `items` slice, so a leaf scan followed by a
+// global sort preserves the ascending-index contract `find_parent_cached`
+// relies on for tie-breaking.
+pub(super) struct MoonIndex {
+    /// Ascending candidate bodies; leaves partition this slice into
+    /// contiguous ranges.
+    items: Vec<usize>,
+    /// Node 0 is the root. Internal nodes store their children in
+    /// `start` (left) and `count` (right).
+    nodes: Vec<MoonNode>,
+}
+
+/// Leaves stop splitting below this many candidates.
+const MOON_TREE_LEAF: usize = 16;
+
+/// Below this many candidates a plain scan beats the tree's fixed cost.
+/// The choice only changes the query *strategy*, never the candidate set,
+/// so the two paths are equivalent.
+const MOON_TREE_MIN: usize = 128;
+
+#[derive(Clone, Copy)]
+struct MoonNode {
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+    /// Max over the subtree of `m_k^(1/3)`, for the conservative reach bound.
+    wmax: f64,
+    /// Leaf: first index into `items`. Internal: left child node.
+    start: u32,
+    /// Leaf: item count. Internal: right child node.
+    count: u32,
+    is_leaf: bool,
+}
+
+impl MoonIndex {
+    /// Build the hierarchy over the candidate list, or `None` when the list
+    /// is too small to amortise a tree.
+    fn build(b: &Bodies, moons: &[usize]) -> Option<MoonIndex> {
+        if moons.len() < MOON_TREE_MIN {
+            return None;
+        }
+        let leaves = moons.len().div_ceil(MOON_TREE_LEAF);
+        let mut items = moons.to_vec();
+        let mut nodes: Vec<MoonNode> = Vec::with_capacity(2 * leaves);
+        let n = items.len();
+        build_rec(b, &mut items, 0, n, &mut nodes);
+        Some(MoonIndex { items, nodes })
+    }
+
+    /// Append every candidate that *could* lie within Hill reach of body `i`
+    /// about host `h` to `out`. The pruning is conservative: a node is only
+    /// skipped when **no** item inside it can satisfy
+    /// `d(i,k) ≤ MOON_HILL_FRAC · r_hill(k, h)`, so no selectable candidate
+    /// is ever dropped. `out` is not sorted; callers sort before the ratio
+    /// scan so the scan order matches the plain loop.
+    pub(super) fn collect(&self, b: &Bodies, i: usize, h: usize, out: &mut Vec<usize>) {
+        let (xi, yi, zi) = (b.x[i], b.y[i], b.z[i]);
+        let dih = ((xi - b.x[h]).powi(2) + (yi - b.y[h]).powi(2) + (zi - b.z[h]).powi(2)).sqrt();
+        let reach_pref = MOON_HILL_FRAC / (3.0 * b.m[h]).cbrt();
+        // The reach bound combines several f64 roundings (bbox extents,
+        // `cbrt`, the division). Inflating it slightly guarantees a node is
+        // pruned only when it genuinely cannot contain an in-reach
+        // candidate — the soundness requirement.
+        let reach_pref = reach_pref * (1.0 + 1e-9);
+        // DFS with a fixed stack: a balanced tree over ≤ `MAX_BODIES`
+        // candidates is at most ~14 levels deep, so 64 entries is plenty.
+        // The root is the last node pushed by `build_rec` (post-order).
+        let mut stack = [0u32; 64];
+        let mut sp = 1usize;
+        stack[0] = (self.nodes.len() - 1) as u32;
+        while sp > 0 {
+            sp -= 1;
+            let node = self.nodes[stack[sp] as usize];
+            // Per-axis distance to the bbox: `0` when the query point
+            // projects inside the slab, else the gap to the nearer face.
+            let dx = if xi < node.min_x {
+                node.min_x - xi
+            } else if xi > node.max_x {
+                xi - node.max_x
+            } else {
+                0.0
+            };
+            let dy = if yi < node.min_y {
+                node.min_y - yi
+            } else if yi > node.max_y {
+                yi - node.max_y
+            } else {
+                0.0
+            };
+            let dz = if zi < node.min_z {
+                node.min_z - zi
+            } else if zi > node.max_z {
+                zi - node.max_z
+            } else {
+                0.0
+            };
+            let dmin = (dx * dx + dy * dy + dz * dz).sqrt();
+            // Farthest corner of the bbox is an upper bound on the distance
+            // of every item inside it, so `dmax + dih ≥ d(k,h)` for all k.
+            let dx_max = (xi - node.min_x).abs().max((xi - node.max_x).abs());
+            let dy_max = (yi - node.min_y).abs().max((yi - node.max_y).abs());
+            let dz_max = (zi - node.min_z).abs().max((zi - node.max_z).abs());
+            let dmax = (dx_max * dx_max + dy_max * dy_max + dz_max * dz_max).sqrt();
+            if dmin > reach_pref * node.wmax * (dmax + dih) {
+                continue;
+            }
+            if node.is_leaf {
+                let s = node.start as usize;
+                out.extend_from_slice(&self.items[s..s + node.count as usize]);
+            } else {
+                stack[sp] = node.start;
+                stack[sp + 1] = node.count;
+                sp += 2;
+            }
+        }
+    }
+}
+
+/// Recursively build the median-split hierarchy over `items[lo..hi]`,
+/// pushing node `this` last. Internal nodes record their left and right
+/// child indices in `start` and `count`. Returns the node index of `this`.
+fn build_rec(
+    b: &Bodies,
+    items: &mut [usize],
+    lo: usize,
+    hi: usize,
+    nodes: &mut Vec<MoonNode>,
+) -> usize {
+    let n = hi - lo;
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    let mut wmax = 0.0f64;
+    for &k in &items[lo..hi] {
+        min_x = min_x.min(b.x[k]);
+        min_y = min_y.min(b.y[k]);
+        min_z = min_z.min(b.z[k]);
+        max_x = max_x.max(b.x[k]);
+        max_y = max_y.max(b.y[k]);
+        max_z = max_z.max(b.z[k]);
+        let w = b.m[k].cbrt();
+        if w > wmax {
+            wmax = w;
+        }
+    }
+    if n <= MOON_TREE_LEAF {
+        nodes.push(MoonNode {
+            min_x,
+            min_y,
+            min_z,
+            max_x,
+            max_y,
+            max_z,
+            wmax,
+            start: lo as u32,
+            count: n as u32,
+            is_leaf: true,
+        });
+        return nodes.len() - 1;
+    }
+    let ex = max_x - min_x;
+    let ey = max_y - min_y;
+    let ez = max_z - min_z;
+    let mid = lo + n / 2;
+    if ex >= ey && ex >= ez {
+        items[lo..hi].select_nth_unstable_by(n / 2, |&a, &c| b.x[a].total_cmp(&b.x[c]));
+    } else if ey >= ez {
+        items[lo..hi].select_nth_unstable_by(n / 2, |&a, &c| b.y[a].total_cmp(&b.y[c]));
+    } else {
+        items[lo..hi].select_nth_unstable_by(n / 2, |&a, &c| b.z[a].total_cmp(&b.z[c]));
+    }
+    let left = build_rec(b, items, lo, mid, nodes);
+    let right = build_rec(b, items, mid, hi, nodes);
+    nodes.push(MoonNode {
+        min_x,
+        min_y,
+        min_z,
+        max_x,
+        max_y,
+        max_z,
+        wmax,
+        start: left as u32,
+        count: right as u32,
+        is_leaf: false,
+    });
+    nodes.len() - 1
+}
+
+thread_local! {
+    /// Reused per-thread buffer for the moon-candidate list, so the parallel
+    /// `refresh_parent_cache` does not allocate one `Vec` per body. The
+    /// capacity is retained across calls, growing only to the largest
+    /// candidate set any single body needs.
+    static MOON_CAND_BUF: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shared tail of the cached and cached-indexed moon scans: choose the best
+/// moon parent of body `i` (host `h`) among the candidates `cand`, which are
+/// scanned in ascending order so the `<=` tie-break matches `find_parent`.
+/// `fallback` is the value to keep when no candidate wins (the host).
+fn best_moon_parent(
+    b: &Bodies,
+    i: usize,
+    h: usize,
+    cand: &[usize],
+    fallback: Option<usize>,
+) -> Option<usize> {
+    let mut parent = fallback;
+    let mut best_ratio = MOON_HILL_FRAC;
+    for &k in cand {
+        if k == i || b.m[k] <= b.m[i] {
+            continue;
+        }
+        let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2) + (b.z[k] - b.z[h]).powi(2))
+            .sqrt();
+        let rh = dh * (b.m[k] / (3.0 * b.m[h])).cbrt();
+        if rh <= 0.0 {
+            continue;
+        }
+        let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2))
+            .sqrt();
+        let ratio = dk / rh;
+        // `<=` (not `<`) so a moon spawned at exactly
+        // MOON_HILL_FRAC * r_hill is classified as a moon.
+        if ratio <= best_ratio {
+            best_ratio = ratio;
+            parent = Some(k);
+        }
+    }
+    parent
 }
 
 /// Parent of body `i`, using a prebuilt `ParentContext`. Contract: the
 /// result must be bit-identical to `find_parent(b, i)` for the same
 /// `Bodies` (same candidate set, same iteration order, same partner
 /// value). Any change here must be mirrored there.
+///
+/// The moon-parent scan consults `MoonIndex` when one was built; see its
+/// notes for why pruning by Hill reach cannot change the result.
 pub(super) fn find_parent_cached(b: &Bodies, i: usize, ctx: &ParentContext) -> Option<usize> {
     if !matches!(b.kind[i], BodyKind::Planet | BodyKind::DwarfPlanet) {
         return None;
@@ -331,26 +596,29 @@ pub(super) fn find_parent_cached(b: &Bodies, i: usize, ctx: &ParentContext) -> O
         }
     }
     let mut parent = host;
-    let mut best_ratio = MOON_HILL_FRAC;
     if let Some(h) = host {
-        for &k in &ctx.moons {
-            if k == i || b.m[k] <= b.m[i] {
-                continue;
+        // Moon candidates are scanned via the spatial index when one is
+        // available. The index only prunes candidates whose Hill reach
+        // cannot contain `i` (i.e. ones no scan order could select), so the
+        // result is identical to scanning `ctx.moons` directly — see the
+        // `MoonIndex` notes.
+        parent = match &ctx.moon_index {
+            Some(idx) => {
+                let cand = MOON_CAND_BUF.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    buf.clear();
+                    idx.collect(b, i, h, &mut buf);
+                    buf.sort_unstable();
+                    std::mem::take(&mut *buf)
+                });
+                let p = best_moon_parent(b, i, h, &cand, host);
+                MOON_CAND_BUF.with(|buf| {
+                    *buf.borrow_mut() = cand;
+                });
+                p
             }
-            let dh = ((b.x[k] - b.x[h]).powi(2) + (b.y[k] - b.y[h]).powi(2) + (b.z[k] - b.z[h]).powi(2)).sqrt();
-            let rh = dh * (b.m[k] / (3.0 * b.m[h])).cbrt();
-            if rh <= 0.0 {
-                continue;
-            }
-            let dk = ((b.x[k] - b.x[i]).powi(2) + (b.y[k] - b.y[i]).powi(2) + (b.z[k] - b.z[i]).powi(2)).sqrt();
-            let ratio = dk / rh;
-            // `<=` (not `<`) so a moon spawned at exactly
-            // MOON_HILL_FRAC * r_hill is classified as a moon.
-            if ratio <= best_ratio {
-                best_ratio = ratio;
-                parent = Some(k);
-            }
-        }
+            None => best_moon_parent(b, i, h, &ctx.moons, host),
+        };
     }
     parent
 }
