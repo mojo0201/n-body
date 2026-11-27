@@ -13,6 +13,12 @@
 //!
 //! `TAU` is written fully qualified (`std::f64::consts::TAU`) below, matching
 //! the existing style here; the bare name is not in scope via the globs.
+//!
+//! Four `#[ignore]`d tests (`g_ic_primary_diversity`, `g_ic_hot_jupiter_rate`,
+//! `hierarchical_stars_respect_stability_limit`,
+//! `spawn_triples_and_quadruples_exist`) each run 1 500–4 000 full
+//! `spawn_system` draws and take 2–4 min in debug. Run them with:
+//!     cargo test --lib physics::tests::spawn -- --ignored
 
 use super::super::*;
 use super::shared::*;
@@ -55,6 +61,7 @@ fn g_ic_random_architecture_sane() {
 /// one of the three `sample_primary` branches (stellar / BD draw) or the
 /// `remnant_of` conversion has stopped firing.
 #[test]
+#[ignore = "1 500 `spawn_system` draws; ~115 s in debug. Run with -- --ignored"]
 fn g_ic_primary_diversity() {
     let mut seen = [false; 5];
     for seed in 0..1500u128 {
@@ -146,6 +153,7 @@ fn g_ic_imf_median_mass() {
 /// [0.3 %, 3 %] band accommodates Poisson noise over 2000 seeds plus the
 /// per-host metallicity boost from `giant_occ`.
 #[test]
+#[ignore = "2 000 `spawn_system` draws; ~148 s in debug. Run with -- --ignored"]
 fn g_ic_hot_jupiter_rate() {
     let au = au_in_gm();
     let (mut hosts, mut hj) = (0u32, 0u32);
@@ -987,6 +995,7 @@ fn spawn_unstable_giant_systems_exist() {
 /// safe bound given ~46 % of FGK stars are binary and the triple/quad
 /// probabilities stack on top.
 #[test]
+#[ignore = "4 000 `spawn_system` draws; ~250 s in debug. Run with -- --ignored"]
 fn spawn_triples_and_quadruples_exist() {
     let (mut hosts, mut triples, mut quads) = (0u32, 0u32, 0u32);
     for seed in 0..4000u128 {
@@ -1020,6 +1029,7 @@ fn spawn_triples_and_quadruples_exist() {
 /// the Mardling–Aarseth stability check with a healthy safety margin;
 /// a failure means `plan_outer_star` is producing unstable hierarchies.
 #[test]
+#[ignore = "3 000 `spawn_system_with_info` draws; ~209 s in debug. Run with -- --ignored"]
 fn hierarchical_stars_respect_stability_limit() {
     for seed in 0..3000u128 {
         let mut b = Bodies::with_capacity(20);
