@@ -1733,3 +1733,59 @@ fn s_evolved_remnants_produce_debris() {
     assert!(n_rem > 20, "only {n_rem} remnant primaries");
     assert!(n_with > 0, "no evolved system produced debris");
 }
+
+/// Hot planets must be spawned **already locked** (Ω = n), and nothing else
+/// may be.
+///
+/// A hot Jupiter left on its 10 h birth day has Ω_p ≫ n, so its own tide
+/// drives the orbit *outward* until it locks; under the accelerated planet
+/// tide that outward term is comparable to the stellar tide pulling it in, so
+/// the planet recedes and never migrates. Distant planets must stay free:
+/// their despinning time is longer than the system's age, and capping them at
+/// corotation would be unphysical (Jupiter is supersynchronous).
+#[test]
+fn spawn_locks_hot_planets_and_leaves_distant_ones_free() {
+    let mut hot = 0u32;
+    let mut far = 0u32;
+    for seed in 0..300u128 {
+        let mut b = Bodies::with_capacity(100);
+        spawn_system(&mut b, 100, seed);
+        for i in 1..b.len() {
+            if b.kind[i] != BodyKind::Planet
+                || b.origin[i] != BodyOrigin::Spawned
+                || is_moon(&b, i)
+            {
+                continue;
+            }
+            let Some(host) = find_parent(&b, i) else {
+                continue;
+            };
+            if !matches!(b.kind[host], BodyKind::Star | BodyKind::BrownDwarf) {
+                continue;
+            }
+            let o = orbit_info(&b, i, host);
+            if !o.bound || !(o.semi_major > 0.0) {
+                continue;
+            }
+            let a_au = o.semi_major / au_in_gm();
+            if a_au < 0.1 {
+                hot += 1;
+                let want = corotation_spin(&b, host, i, o.semi_major);
+                assert!(
+                    want > 0.0 && (b.spin[i] / want - 1.0).abs() < 1e-9,
+                    "seed {seed}: planet at {a_au:.3} AU must spawn locked (spin {} vs {want})",
+                    b.spin[i]
+                );
+            } else if a_au > 2.0 {
+                far += 1;
+                assert_eq!(
+                    b.spin[i], 0.0,
+                    "seed {seed}: planet at {a_au:.2} AU must keep its birth day"
+                );
+            }
+        }
+    }
+    assert!(hot > 0, "no planet inside 0.1 AU in 300 seeds — the test proves nothing");
+    assert!(far > 0, "no planet beyond 2 AU in 300 seeds");
+}
+

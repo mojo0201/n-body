@@ -135,6 +135,135 @@ pub fn tidal_heating_w(b: &Bodies, j: usize, host: usize) -> f64 {
     10.5 * k2q * G_SI * mh * mh * r.powi(5) * n * e * e / a.powi(6)
 }
 
+/// Seconds in a Julian gigayear.
+const GYR_S: f64 = 3.155_76e16;
+
+/// Despinning e-folds a body must have had for the spawner to call it locked:
+/// after three e-folds the spin is within 5 % of corotation.
+const LOCK_E_FOLDS: f64 = 3.0;
+
+/// The spin a body is given if nobody sets one: a 10 h day for giants, 24 h
+/// for everything else (the same lazy default `tidal_dissipation` applies).
+fn default_spin(b: &Bodies, i: usize) -> f64 {
+    let hours = if b.m[i] >= GIANT_M_MIN { 10.0 } else { 24.0 };
+    initial_planet_spin(b.m[i], b.r[i], hours)
+}
+
+/// Spin angular momentum that puts `child` into corotation with its orbit
+/// about `host` (Ω = n), in sim units. `a_gm` is the semi-major axis in Gm.
+pub fn corotation_spin(b: &Bodies, host: usize, child: usize, a_gm: f64) -> f64 {
+    let n = (G * (b.m[host] + b.m[child]) / (a_gm * a_gm * a_gm)).sqrt();
+    inertia_factor(b.kind[child]) * b.m[child] * b.r[child] * b.r[child] * n
+}
+
+/// Tidal despinning time of `child` by `host`, in Gyr.
+///
+/// The equilibrium tide exerts the torque `N = (3/2)(k₂/Q) G M_h² R⁵ / a⁶`
+/// (Goldreich & Soter 1966), so with `L = kM R²Ω` the spin decays on
+/// `τ = L/N` = `Ω k M a⁶ / ((3/2)(k₂/Q) G M_h² R³)`. Both are evaluated in
+/// simulation units, which is why only `G` (not `G_SI`) appears.
+///
+/// Uses the **physical** `k₂/Q` (no `TIDAL_BOOST`), so the answer does not
+/// depend on the physical/accelerated switch: a system must spawn the same in
+/// both modes.
+pub fn despin_time_gyr(b: &Bodies, host: usize, child: usize, a_gm: f64) -> f64 {
+    if a_gm <= 0.0 || !a_gm.is_finite() || b.r[child] <= 0.0 {
+        return f64::INFINITY;
+    }
+    let l_spin = if b.spin[child] > 0.0 {
+        b.spin[child]
+    } else {
+        default_spin(b, child)
+    };
+    let k2q = if b.m[child] >= GIANT_M_MIN {
+        TIDAL_K2_Q_GIANT
+    } else {
+        TIDAL_K2_Q_ROCKY
+    };
+    let mh = b.m[host];
+    let r = b.r[child];
+    // Torque in M⊕·Gm²/tu²; L/N is then a time in tu.
+    let torque = 1.5 * k2q * G * mh * mh * r.powi(5) / a_gm.powi(6);
+    if !(torque > 0.0) || !l_spin.is_finite() {
+        return f64::INFINITY;
+    }
+    l_spin / torque * time_unit_s() / GYR_S
+}
+
+/// Age (Gyr) of the system `i` belongs to: the first ancestor with a known
+/// age. A moon's own `age_gyr` is 0, so walking up to the star is what gives
+/// it one.
+fn system_age_gyr(b: &Bodies, mut i: usize) -> f64 {
+    for _ in 0..8 {
+        if b.age_gyr[i] > 0.0 {
+            return b.age_gyr[i];
+        }
+        match find_parent(b, i) {
+            Some(p) if p != i => i = p,
+            _ => break,
+        }
+    }
+    0.0
+}
+
+/// Start every planet and moon that its host's tide has had time to despin at
+/// corotation (Ω = n), instead of leaving it on the 10 h / 24 h birth day.
+///
+/// A hot Jupiter is observed to be (pseudo)synchronously rotating: its own
+/// tide despins it in years, long before we see it. Leaving it at a 10 h day
+/// gives Ω_p ≫ n, and the planet's own tide then pushes the orbit **outward**
+/// — under the accelerated planet-tide boost that outward term is of the same
+/// order as the stellar tide pulling it in, so the hot Jupiter recedes until
+/// it locks and never migrates. Locking it here lets the host's tide do the
+/// work it does in reality. The same criterion locks moons (all of which are
+/// synchronous) and leaves distant planets supersynchronous, as they are.
+///
+/// Only `spin == 0.0` bodies are touched: that is the "not initialised yet"
+/// sentinel `tidal_dissipation` uses, so a spawner that set a spin itself
+/// keeps it. Only spawned bodies are considered (`BodyOrigin::Spawned`):
+/// belt, Kuiper and debris bodies never read their spin. No RNG is drawn, so
+/// seeded systems stay bit-identical.
+pub fn lock_despun_planets(b: &mut Bodies) {
+    let n = b.len();
+    for j in 0..n {
+        if b.spin[j] != 0.0 || b.dead[j] {
+            continue;
+        }
+        if !matches!(b.kind[j], BodyKind::Planet | BodyKind::DwarfPlanet) {
+            continue;
+        }
+        if b.m[j] < SPIN_M_MIN || !(b.r[j] > 0.0) {
+            continue;
+        }
+        // Belt, Kuiper and debris bodies never use their spin (Yarkovsky's
+        // sense comes from the body id), so only spawned planets and moons are
+        // worth the parent lookup. This keeps a 200 000-body cluster spawn to
+        // O(planets) rather than O(n).
+        if b.origin[j] != BodyOrigin::Spawned {
+            continue;
+        }
+        let Some(host) = find_parent(b, j) else {
+            continue;
+        };
+        if host >= n || host == j || b.dead[host] {
+            continue;
+        }
+        // A moon's own age is 0, so the walk starts at the host and climbs to
+        // the star that way.
+        let age = system_age_gyr(b, host);
+        if !(age > 0.0) {
+            continue;
+        }
+        let o = orbit_info(b, j, host);
+        if !o.bound || !(o.semi_major > 0.0) || !o.semi_major.is_finite() {
+            continue;
+        }
+        if despin_time_gyr(b, host, j, o.semi_major) * LOCK_E_FOLDS < age {
+            b.spin[j] = corotation_spin(b, host, j, o.semi_major);
+        }
+    }
+}
+
 /// Apply equilibrium tides to every bound pair (child `j`, parent `host`):
 /// planets and moons about stars or planets, and companion stars or brown
 /// dwarfs about their primaries.

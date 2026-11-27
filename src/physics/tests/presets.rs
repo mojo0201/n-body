@@ -701,6 +701,8 @@ fn spawn_from_preset_bodies_matches_seeded_after_finalize() {
     compute_accel(&mut b);
     rebase_energy(&mut b);
     b.refresh_parent_cache();
+    // Mirror the production finalisation exactly, including the spawn lock.
+    lock_despun_planets(&mut b);
     dust::init_fields(&mut b, None);
     if preset.dust_boost != 1.0 {
         for f in b.dust_fields.iter_mut() {
@@ -1321,3 +1323,32 @@ fn belt_preset_to_spec_preserves_trojans_and_gaps() {
     assert!((spec.trojans[0].leading_frac - 0.5).abs() < 1e-12);
     assert_eq!(spec.gaps.len(), 2);
 }
+
+/// A preset hot Jupiter must spawn at corotation, exactly like a random one.
+///
+/// 51 Peg b sits at 0.053 AU with a 4.8 Gyr host: its spin despins in
+/// ~10⁶ yr, so it is observed synchronised. On the 10 h birth day its own
+/// tide would push it *outward* before the star's tide could spiral it in,
+/// which is the bug the random-system spawner had.
+#[test]
+fn preset_hot_jupiter_spawns_locked() {
+    let preset = load_preset_by_slug("hot_jupiter").expect("hot_jupiter preset is wired in");
+    let mut b = Bodies::with_capacity(256);
+    spawn_from_preset(&mut b, &preset);
+
+    let planet = (0..b.len())
+        .find(|&i| b.kind[i] == BodyKind::Planet && b.origin[i] == BodyOrigin::Spawned)
+        .expect("the preset has a spawned planet");
+    let host = find_parent(&b, planet).expect("the planet has a host");
+    let a = orbit_info(&b, planet, host).semi_major;
+    assert!(a > 0.0 && a.is_finite());
+
+    let want = corotation_spin(&b, host, planet, a);
+    assert!(want > 0.0, "corotation spin must be positive");
+    assert!(
+        (b.spin[planet] / want - 1.0).abs() < 1e-6,
+        "51 Peg b must spawn locked: spin {} vs corotation {want}",
+        b.spin[planet]
+    );
+}
+

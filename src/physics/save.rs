@@ -39,8 +39,15 @@ pub const SAVE_VERSION: u32 = 2;
 pub const SAVE_DIR: &str = "saves";
 /// End of every save file name.
 pub const SAVE_EXT: &str = ".nbody.json";
-/// Upper limit on bodies in one file. Protects against a damaged file.
-pub const SAVE_MAX_BODIES: usize = 2_000_000;
+/// Upper limit on bodies in one save file: the engine cap, `MAX_BODIES`.
+///
+/// Defined *from* `MAX_BODIES` rather than as its own number, because a file
+/// the engine cannot hold is not a loadable save: `restore_save` builds a
+/// fresh `Bodies` and everything downstream (body budgeting, the tree, the
+/// renderer) assumes the live count fits under the cap. The two constants were
+/// once 2 000 000 and 256 000, so a 2 M-body file passed validation and then
+/// filled the engine past its limit.
+pub const SAVE_MAX_BODIES: usize = MAX_BODIES;
 /// Longest save name, in characters.
 const SAVE_NAME_MAX: usize = 48;
 
@@ -444,13 +451,25 @@ fn check_save_header(f: &SaveFile) -> Result<(), String> {
     if s.bodies.is_empty() {
         return Err("the save has no bodies".to_string());
     }
-    if s.bodies.len() > SAVE_MAX_BODIES {
-        return Err(format!("the save has too many bodies ({})", s.bodies.len()));
-    }
+    check_body_count(s.bodies.len())?;
     need_finite(
         "the simulation",
         &[s.time, s.metallicity, s.stats.energy0, s.stats.energy_offset],
     )
+}
+
+/// Reject a body count this build cannot hold.
+///
+/// Kept separate from `check_save_header` so the boundary can be tested
+/// without materialising a 256 000-entry save, and public so a caller can
+/// reject an oversized file from its metadata before parsing it.
+pub fn check_body_count(count: usize) -> Result<(), String> {
+    if count > SAVE_MAX_BODIES {
+        return Err(format!(
+            "the save has {count} bodies but this build supports at most {SAVE_MAX_BODIES}"
+        ));
+    }
+    Ok(())
 }
 
 /// Rebuild every body, checking values and id uniqueness as it goes.

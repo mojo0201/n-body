@@ -1158,7 +1158,8 @@ pub fn spawn_preset_with_seed(b: &mut Bodies, preset: &SystemPreset, phase_seed:
 
 /// Build star, companions, planets, moons and belts into `b`, **without**
 /// the expensive finalisation step (`recenter_com`, `compute_accel`,
-/// `rebase_energy`, `refresh_parent_cache`, `dust::init_fields`).
+/// `rebase_energy`, `refresh_parent_cache`, `lock_despun_planets`,
+/// `dust::init_fields`).
 ///
 /// The split exists so `spawn_solar_systems_impl` can build N temporary
 /// systems cheaply: it needs each system's body list to compute its reach
@@ -1516,6 +1517,9 @@ pub(super) fn spawn_from_preset_seeded(
     compute_accel(b);
     rebase_energy(b);
     b.refresh_parent_cache();
+    // Same spawn rule as a random system: 51 Peg b is observed locked, and a
+    // 10 h birth day would make its own tide drive it outward first.
+    lock_despun_planets(b);
     dust::init_fields(b, None);
     // `dust_boost` defaults to 1.0; the common case is a no-op multiply
     // across every grain, so skip the traversal entirely when the boost is
@@ -1804,6 +1808,7 @@ pub(super) fn spawn_solar_systems_impl(b: &mut Bodies, count: usize) -> (f64, Ve
     // Orbit lines and colours read the parent of every body. Fill the cache
     // now, or the first frame draws every system about the first star.
     b.refresh_parent_cache();
+    lock_despun_planets(b);
     b.dust_fields.clear();
     dust::init_fields(b, Some(&ranges));
     // Effective scale of the cluster, for the caller (`t_multi_system_ring`

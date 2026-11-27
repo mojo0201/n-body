@@ -133,6 +133,13 @@ every later draw.
   Close binary stars circularise during the run.
 - Planet-raised tides run at `PLANET_BOOST_REL` (10⁻² of the stellar rate):
   planets are far more dissipative than stars.
+- Bodies whose tidal despinning time is short compared with the system's age
+  (three e-folds inside it) are **spawned already locked**
+  (`lock_despun_planets`): hot Jupiters (~3×10³ yr at 0.02 AU), close rocky
+  planets and moons. A hot Jupiter on a 10 h birth day has Ω_p ≫ n, so its own
+  tide would drive it *outward* until it locked and the host's inward tide
+  would never get to act; locked, it inspirals as observed. Distant planets
+  keep their birth day — Jupiter really is supersynchronous.
 - Spin transfer stops at corotation so a light body cannot overshoot.
 - `tidal_heating_w` (Peale 1979) is shown in the planet panel with the rotation state.
 

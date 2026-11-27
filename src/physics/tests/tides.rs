@@ -12,7 +12,10 @@
 //!   * Misc:     DwarfPlanet is *not* acted on (loop filters on Planet);
 //!               two-planet independence; unrelated bodies untouched.
 
-use crate::physics::tides::{tidal_dissipation, TIDAL_BOOST, TIDAL_K2_STAR, TIDAL_Q_STAR};
+use crate::physics::tides::{
+    corotation_spin, despin_time_gyr, lock_despun_planets, tidal_dissipation, TIDAL_BOOST,
+    TIDAL_K2_STAR, TIDAL_Q_STAR,
+};
 use crate::physics::*;
 use super::shared::*;
 
@@ -690,3 +693,180 @@ fn unrelated_bodies_untouched() {
     }
     assert_eq!(snapshot(&b, ast), before);
 }
+
+// ===========================================================================
+// Spin at spawn: hot Jupiters are locked, not born spinning at 10 h
+// ===========================================================================
+
+/// The payoff, stated as a contrast. With the orbit locked, the host's tide
+/// shrinks it. On the unlocked (pre-fix) state the planet's own tide drives it
+/// **outward**, so it recedes until it locks and never inspirals during the
+/// window you actually watch — the reason hot Jupiters looked wrong.
+#[test]
+fn locked_hot_jupiter_migrates_inward_an_unlocked_one_does_not() {
+    let run = |locked: bool| {
+        let _mode = accelerated();
+        let (mut b, star, planet) = setup_hot_jupiter(JUPITER_MASS, 0.02);
+        // `setup_hot_jupiter` starts the planet at corotation, which is what
+        // `lock_despun_planets` now does for real systems. Setting spin to 0
+        // puts it back on the 10 h birth day the old spawn path left it with.
+        if !locked {
+            b.spin[planet] = 0.0;
+        }
+        let before = orbit_info(&b, planet, star).semi_major;
+        for _ in 0..4_000 {
+            tidal_dissipation(&mut b, DT);
+        }
+        let after = orbit_info(&b, planet, star).semi_major;
+        (before, after)
+    };
+
+    let (a_before, a_locked) = run(true);
+    assert!(
+        a_locked < a_before,
+        "a locked hot Jupiter must inspiral: {a_before} -> {a_locked}"
+    );
+
+    let (a_free_before, a_free) = run(false);
+    assert!(
+        a_free > a_free_before,
+        "an unlocked hot Jupiter recedes (the bug): {a_free_before} -> {a_free}"
+    );
+}
+
+/// A solar-mass star and a planet on a circular orbit at `a_au`, with the
+/// planet's **spin unset** (0.0), so `despin_time_gyr` uses the birth day the
+/// tide model would give it (10 h giants, 24 h others).
+fn unspent_planet(a_au: f64, m: f64) -> (Bodies, usize, usize) {
+    let mut b = Bodies::with_capacity(2);
+    let star = b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    b.r[star] = R_SUN_GM;
+    let a = a_au * au_in_gm();
+    let v = (G * (b.m[star] + m) / a).sqrt();
+    let planet = b.push(a, 0.0, 0.0, v, m, BodyKind::Planet);
+    b.parent_cache = vec![None, Some(star)];
+    b.parent_cache_valid = true;
+    (b, star, planet)
+}
+
+/// `corotation_spin` really is synchronous: recovering Ω from `L = k m R² Ω`
+/// must give `n` to floating point.
+#[test]
+fn corotation_spin_is_synchronous() {
+    let (b, star, planet) = unspent_planet(0.02, JUPITER_MASS);
+    let a = 0.02 * au_in_gm();
+    let l = corotation_spin(&b, star, planet, a);
+    // `inertia_factor` is 0.3 for planets.
+    let omega = l / (0.3 * b.m[planet] * b.r[planet].powi(2));
+    let n = (G * (b.m[star] + b.m[planet]) / (a * a * a)).sqrt();
+    assert!(
+        (omega / n - 1.0).abs() < 1e-12,
+        "Ω/n = {} — corotation_spin is not synchronous",
+        omega / n
+    );
+}
+
+/// The despinning timescale has to separate the three cases the spawn rule
+/// relies on: a hot Jupiter locks in ~3×10³ yr, Earth needs ~10¹¹ yr (so
+/// solar tides alone never lock it), and Jupiter is effectively eternal. The
+/// hot-Jupiter value was cross-checked against the SI form of the same torque
+/// (τ = Ω k m a⁶ / 1.5(k₂/Q)GM²R³ = 3314 yr, vs 3350 yr in sim units) before
+/// it was pinned here.
+#[test]
+fn despin_time_orders_planets_by_orbit() {
+    let (b1, s1, p1) = unspent_planet(0.02, JUPITER_MASS);
+    let hot = despin_time_gyr(&b1, s1, p1, 0.02 * au_in_gm());
+
+    let (b2, s2, p2) = unspent_planet(1.0, 1.0);
+    let earth = despin_time_gyr(&b2, s2, p2, au_in_gm());
+
+    let (b3, s3, p3) = unspent_planet(5.2, JUPITER_MASS);
+    let jupiter = despin_time_gyr(&b3, s3, p3, 5.2 * au_in_gm());
+
+    assert!(
+        (1e-7..1e-5).contains(&hot),
+        "a hot Jupiter despins in ~10³ yr, got {} yr",
+        hot * 1e9
+    );
+    assert!(
+        (10.0..1e4).contains(&earth),
+        "Earth's solar despinning time is ~10² Gyr, got {earth}"
+    );
+    assert!(
+        jupiter > 1e6,
+        "Jupiter must not despin within the age of the universe, got {jupiter} Gyr"
+    );
+    assert!(hot < earth && earth < jupiter, "timescales must order by a");
+}
+
+/// Spawning must not depend on the physical/accelerated switch, or the same
+/// seed would produce different systems in the two modes.
+#[test]
+fn despin_time_ignores_the_simulation_mode() {
+    let (b, star, planet) = unspent_planet(0.05, JUPITER_MASS);
+    let a = 0.05 * au_in_gm();
+    let in_physical = {
+        let _mode = physical();
+        despin_time_gyr(&b, star, planet, a)
+    };
+    let in_accelerated = {
+        let _mode = accelerated();
+        despin_time_gyr(&b, star, planet, a)
+    };
+    assert!(in_physical.is_finite());
+    assert_eq!(
+        in_physical, in_accelerated,
+        "despinning must use the unboosted k2/Q"
+    );
+}
+
+/// The hook itself: a solar-age star locks a hot Jupiter, leaves Earth (1 AU)
+/// and Jupiter (5.2 AU) on their birth days, and never touches a spin that was
+/// already set.
+#[test]
+fn lock_despun_planets_locks_close_orbits_only() {
+    let mut b = Bodies::with_capacity(4);
+    let star = b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    b.r[star] = R_SUN_GM;
+    b.age_gyr[star] = 4.6;
+    let place = |b: &mut Bodies, a_au: f64, m: f64| {
+        let a = a_au * au_in_gm();
+        let v = (G * (b.m[star] + m) / a).sqrt();
+        b.push(a, 0.0, 0.0, v, m, BodyKind::Planet)
+    };
+    let hot = place(&mut b, 0.02, JUPITER_MASS);
+    let earth = place(&mut b, 1.0, 1.0);
+    let jupiter = place(&mut b, 5.2, JUPITER_MASS);
+    b.refresh_parent_cache();
+
+    lock_despun_planets(&mut b);
+
+    let want = corotation_spin(&b, star, hot, 0.02 * au_in_gm());
+    assert!(
+        want > 0.0 && (b.spin[hot] / want - 1.0).abs() < 1e-9,
+        "hot Jupiter must spawn at corotation, got {} vs {want}",
+        b.spin[hot]
+    );
+    assert_eq!(b.spin[earth], 0.0, "Earth keeps its 24 h day");
+    assert_eq!(b.spin[jupiter], 0.0, "Jupiter keeps its 10 h day");
+}
+
+/// A spin that the spawner set deliberately (`spin != 0`, the "already
+/// initialised" sentinel) must survive the hook untouched.
+#[test]
+fn lock_despun_planets_respects_an_existing_spin() {
+    let mut b = Bodies::with_capacity(2);
+    let star = b.push(0.0, 0.0, 0.0, 0.0, M_SUN_ME, BodyKind::Star);
+    b.r[star] = R_SUN_GM;
+    b.age_gyr[star] = 4.6;
+    let a = 0.02 * au_in_gm();
+    let v = (G * (b.m[star] + JUPITER_MASS) / a).sqrt();
+    let planet = b.push(a, 0.0, 0.0, v, JUPITER_MASS, BodyKind::Planet);
+    b.spin[planet] = 12.0;
+    b.refresh_parent_cache();
+
+    lock_despun_planets(&mut b);
+
+    assert_eq!(b.spin[planet], 12.0, "an explicit spin must not be overwritten");
+}
+

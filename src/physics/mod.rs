@@ -507,7 +507,12 @@ pub const CULL_DIST: f64 = 100_000.0;
 /// removed here.
 pub const HARD_CULL_DIST: f64 = 1_000_000.0;
 
-/// Hard cap on the number of bodies. `Bodies` panics or truncates above this.
+/// Hard cap on the number of bodies.
+///
+/// `Bodies::push` does not enforce this itself — every caller that can add
+/// bodies does (`collisions::room`, the interstellar/rogue spawns, the
+/// UI's body-count clamp, and `save::check_body_count` on load). Anything
+/// that grows a `Bodies` without checking is a bug.
 pub const MAX_BODIES: usize = 256_000;
 
 // ---- Collisions & debris ---------------------------------------------------

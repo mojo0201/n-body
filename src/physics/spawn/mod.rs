@@ -1087,6 +1087,11 @@ pub(in crate::physics) fn spawn_system_opts(
         evolve_early_scaled(b, relax_frac);
         recenter_com(b);
     }
+    // Lock the planets and moons whose own tide has had time to despin them
+    // (hot Jupiters, close moons). Without this a hot Jupiter starts at a 10 h
+    // day and its own tide drives it *outward* before the host's tide can pull
+    // it in. Done after the early-evolution pass, so it sees the final orbits.
+    lock_despun_planets(b);
     compute_accel(b);
     rebase_energy(b);
     dust::init_fields(b, None);
