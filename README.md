@@ -10,6 +10,9 @@ cargo run --release --bin nbody-rust
 
 Requires egui/egui-wgpu/egui-winit 0.37, wgpu 30, winit 0.30 (see `Cargo.toml`).
 
+The physics is exercised headlessly by `cargo test --lib` and gated by
+`scripts/ci.sh`; see [Building and testing](#building-and-testing).
+
 ## Units
 
 | Quantity | Unit |
@@ -25,19 +28,33 @@ Requires egui/egui-wgpu/egui-winit 0.37, wgpu 30, winit 0.30 (see `Cargo.toml`).
 
 ```
 src/main.rs            window, wgpu setup, render/physics thread split
+src/lib.rs             library surface for the binaries and the tests
 src/render.rs/.wgsl    instanced renderer; black-hole ray tracer; colours
-src/ui.rs, theme.rs    egui panels, stats, info text
+src/sim_thread.rs      physics thread: owns the step loop, lock slices
+src/sim_frame.rs       per-frame readout published to the UI
+src/sim_actions.rs     UI actions → simulation changes
+src/sim_saves.rs       loading, saving, timeline replay
+src/history.rs         timeline snapshots and replay state
+src/view.rs, trail.rs  camera; orbit and trail geometry
+src/theme.rs, ui/      egui: dock, stats, plots, inspector, saves, systems, ...
+src/bin/               headless.rs (throughput/energy bench), find_planets.rs
 src/physics/
   mod.rs               Bodies (struct of arrays), constants, helpers
   integrator.rs        Yoshida 4th order / block leapfrog, step pipeline
-  forces.rs, barnes_hut.rs   direct sums, tree, 1PN / 2.5PN
+  forces.rs, barnes_hut.rs   direct sums, octree, 1PN / 2.5PN
   evolution.rs         stellar evolution, remnants, mass transfer
-  tides.rs             tides, spin, tidal locking, heating
+  early.rs             sandboxed pass that resolves instabilities at spawn
+  tides.rs             tides (both directions), spin, locking, heating
   yarkovsky.rs         Yarkovsky drift of small bodies
   migration.rs         gas-disk migration and resonance capture
   collisions.rs, debris.rs, dust.rs, orbits.rs, energy.rs, ...
-  spawn/               random systems: primary, binaries, planets, belts, moons
-  presets.rs, save.rs  real systems (JSON) and save files
+  climate.rs, transit.rs, names.rs/naming.rs, orbit_lines.rs, edit.rs, rng.rs
+  spawn/               mod.rs (primary, tilt, Kepler placement), systems.rs
+                       (architecture, moons), belts.rs, binary.rs, cluster.rs
+  presets.rs, save.rs  real systems (JSON in assets/presets) and save files
+  tests/               headless unit tests, one module per area
+examples/              ~44 ad-hoc diagnostics (check_moon, crash_scan, ...)
+scripts/ci.sh, sweep.sh  the CI gate and the throughput sweep
 ```
 
 The render thread and physics thread share `Bodies` behind a mutex. `ui::draw`
@@ -49,14 +66,33 @@ runs under that lock and must stay fast and read-only. `render.rs` and
 Spawning is seeded. Code that adds random draws to an existing path changes every
 system generated after it, so new features use a private RNG seeded from the object
 (see the terrestrial-moon block in `spawn/systems.rs`) or a hash of the body id
-(Yarkovsky spin sign) instead of the main stream.
+(Yarkovsky spin sign) instead of the main stream. A draw that is no longer needed
+is still *consumed* for the same reason: `spawn_trojan` throws away its node
+longitude but keeps taking it, so adding and removing a feature does not renumber
+every later draw.
 
 ## Realism model
+
+**Gravity and integration**
+- Exact O(n²) pair sums up to `BH_THRESHOLD` = 600 bodies (serial below
+  `PAR_DIRECT_MIN` = 150, parallel above); a Barnes–Hut octree above that with
+  θ = 0.5 (`BH_THETA`, ≈1 % force error). Softening is 100 km (`SOFT2`).
+- Adaptive block stepping: a body on rung r advances `DT / 2^r`, and the step is
+  Yoshida 4th order with a per-step velocity limiter, so close encounters stay
+  stable without global sub-stepping.
+- 1PN and 2.5PN post-Newtonian terms: periapsis precession, and the
+  gravitational-wave inspiral of very tight pairs.
 
 **Stars**
 - Piecewise main-sequence mass–luminosity (0.23 M^2.3 below 0.43 M☉, M⁴ to 2 M☉,
   1.4 M^3.5 to 55 M☉, then linear) and mass–radius (M^0.8 below 1 M☉, M^0.57 above).
-- Lifetime t = 10 Gyr · M / L, floored at 3 Myr.
+- Lifetime t = 10 Gyr · M / L, floored at 3 Myr for stars. Brown dwarfs,
+  remnants and non-positive masses have no main sequence and return infinity,
+  so `age / t_life` stays finite for degenerate input.
+- Radius and luminosity grow along the main sequence (`EVO_MS_RADIUS_GROWTH`
+  0.4, `EVO_MS_LUM_GROWTH` 0.9: the Sun runs 0.7 → 1.35 L☉), normalised so a star
+  46 % through its main sequence (`EVO_MS_REF_FRAC`) has exactly the mass–radius
+  and mass–luminosity value — a newborn Sun is *dimmer* than 1 L☉.
 - Giant phases, supernova kicks, white dwarf / brown dwarf cooling, remnants.
 
 **Climate**
@@ -74,11 +110,29 @@ system generated after it, so new features use a private RNG seeded from the obj
 - About 25 % of rocky planets of 0.3–50 M⊕ with room in their Hill sphere get an
   impact-formed moon of 0.3–3 % of the planet's mass.
 
+**Inclinations**
+- Every orbit is 3D. Each planetary system draws its own flatness (Rayleigh
+  scale log-uniform 0.7–4.2°, so Kepler-flat ≈1° up to dynamically hot ≈4°);
+  small-body populations use their own dispersions — asteroid belt 7°, Hilda 8°,
+  Trojans 12°, cold Kuiper 2°, hot/resonant/scattered Kuiper 10–15°,
+  short-period comets 12° — and long-period comets (a > 200 AU) are isotropic.
+- `set_inclination_scale(s)` is a global multiplier on every draw: 1 is the
+  default (realistic), 0 makes every orbit coplanar, which is what
+  `examples/baseline.rs` pins. There is no UI control for it yet; the dock only
+  *reports* the inclination of the selected body.
+- The octree, osculating elements, moon orbits, orbit lines and the timeline are
+  all 3D; nothing is projected onto the ecliptic.
+
 **Tides and spin**
 - Planets and moons have spin (day length lazily initialised: 10 h giants, 24 h
-  others). Tides raised on a body by its parent despin it to corotation (locking),
-  circularise orbits and push moons outward; tides on the parent act as before.
+  others). Every bound pair runs a tide in *both* directions: the host's bulge
+  takes angular momentum from the orbit into the host's spin (inward migration
+  while the host rotates slower than the orbit, outward while it spins faster),
+  and the planet's bulge despins it toward corotation — tidal locking — and
+  circularises the orbit. Tides act inside `TIDAL_MAX_RADII` (50 host radii).
   Close binary stars circularise during the run.
+- Planet-raised tides run at `PLANET_BOOST_REL` (10⁻² of the stellar rate):
+  planets are far more dissipative than stars.
 - Spin transfer stops at corotation so a light body cannot overshoot.
 - `tidal_heating_w` (Peale 1979) is shown in the planet panel with the rotation state.
 
@@ -117,9 +171,70 @@ system generated after it, so new features use a private RNG seeded from the obj
 Real tidal, Poynting–Robertson and Yarkovsky rates are far too slow to see, so they
 are multiplied by boosts (`TIDAL_BOOST` 10⁶, `PR_DRAG_BOOST` 100, `YARKOVSKY_BOOST`
 10⁴; planet-tide boost is 10⁻² of the stellar one). Physical mode sets all of them
-to 1 and turns belt grinding off. The app starts in physical mode; the dock's
-"accelerated tides and drag" checkbox switches the boosts on.
+to 1 and turns belt grinding off (`belt_grind_per_orbit()` returns 0). The app
+starts in physical mode, so out of the box **nothing** dissipates within a session:
+a hot Jupiter inspiral takes ~Gyr. The dock's "accelerated tides and drag"
+checkbox switches the boosts on, which is what you want for a demo.
+
+## Caps and limits
+
+| Limit | Value |
+|---|---|
+| Bodies in one simulation (`MAX_BODIES`) | 256 000 |
+| Grains per dust field (`DUST_MAX_GRAINS`) | 256 000 |
+| Grains a comet field emits (`DUST_COMET_FIELD_CAP`) | 100 000 |
+| Dust fields (`MAX_DUST_FIELDS`) | 256 |
+| Dust points drawn per frame (`MAX_DUST_POINTS`) | 2 000 000 |
+| Planets with orbit lines (`ORBIT_MAX_BODIES`) | 4 000 (debris: 256 rings) |
+| Trail points / vertices | 4 000 / 100 000 |
+
+`Bodies::push` refuses to grow past `MAX_BODIES`, and the UI warns when a spawn
+request would be clamped to fit.
+
+## Building and testing
+
+```
+cargo run --release --bin nbody-rust       # the app
+cargo test --lib                           # ~630 headless physics tests
+cargo clippy --all-targets -- -D warnings  # what CI enforces
+scripts/ci.sh                              # the whole gate
+```
+
+- The tests live in `src/physics/tests/`, one module per area: forces and the
+  octree, the integrator, conservation laws, tides, dust and drag, collisions,
+  debris, orbital elements, Kepler placement, spawn statistics, presets, stellar
+  evolution, utilities, and a fuzz smoke test.
+- The physical/accelerated switch is process-global. Every test that flips it —
+  and every test that depends on a rate — takes a `SimMode` guard, which
+  serialises them and restores the previous mode on drop (including on panic).
+- `scripts/ci.sh` runs clippy, the unit tests, a release build of `headless`, the
+  headless CLI contract (`--n 0` → exit 2, `--min-ratio` fail/pass, `--json`,
+  `--quiet --json` prints exactly one line, a `--solar` smoke run), builds every
+  example, and checks `scripts/sweep.sh`'s TSV shape.
+- `src/bin/headless.rs` is the throughput/energy harness (`--json`, `--quiet`);
+  `scripts/sweep.sh` wraps it over n × seeds.
+- `examples/` holds ~44 throwaway diagnostics (`check_moon`, `crash_scan`,
+  `stability_sweep`, `check_save_roundtrip`, ...). They are not shipped, but CI
+  compiles them because they are the first thing to rot.
+- `.cargo/config.toml` builds with `-C target-cpu=native`, so a binary is tied to
+  the machine that built it.
 
 ## Not yet modelled
 
-Orbital inclinations (everything is coplanar).
+- **Spin axes.** `spin` is a scalar angular momentum about +z: no obliquity,
+  precession or YORP. Tides assume the spin axis is aligned with the orbit
+  normal, which is exact for prograde, low-inclination orbits and off by cos i
+  otherwise.
+- **Live instabilities.** The spawned architecture is stable by design;
+  encounters are resolved in the sandboxed `early_evolution` pass at spawn time
+  rather than by letting a running system scatter.
+- **Hydrodynamics.** Gas-disk migration is a 1D torque prescription (Type I/II),
+  with no disk self-gravity or gap-opening feedback, and fragmentation is a
+  debris model with a Roche limit, not a hydrocode.
+- **Yarkovsky obliquity.** The spin sense is a hidden ± derived from the body id,
+  so there is no seasonal Yarkovsky and no YORP spin-up.
+- **Tidal heating feedback.** `tidal_heating_w` is displayed; it does not feed
+  back into surface temperature, radius or evolution.
+- **Trojans in tilted systems.** The cloud is placed in the reference plane, so
+  in a strongly inclined system it sits 60° from the giant in projection rather
+  than in the giant's own orbital plane.
