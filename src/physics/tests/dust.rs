@@ -764,3 +764,33 @@ fn collision_dust_ignores_comet_cap() {
         DUST_COMET_FIELD_CAP + DUST_EMIT_GRAINS
     );
 }
+
+/// `Bodies::copy_from` must refill the dust grains in place.
+///
+/// The grain vector is the largest per-snapshot allocation in a dust-heavy
+/// scene (tens of thousands of grains), and the history ring recopies every
+/// recorded frame, so reusing its storage is the whole point of the hand
+/// written `DustField::clone_from`.
+#[test]
+fn copy_from_reuses_dust_grain_allocation() {
+    let mut src = deposit_rig(500.0);
+    deposit(&mut src, 100.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, None, 0.0);
+    assert!(!src.dust_fields[0].grains.is_empty(), "fixture has no grains");
+
+    let mut dst = Bodies::with_capacity(4);
+    dst.copy_from(&src); // first copy: dst has no field to reuse yet
+    let ptr = dst.dust_fields[0].grains.as_ptr();
+    let cap = dst.dust_fields[0].grains.capacity();
+    assert_eq!(dst.dust_fields[0].grains.len(), src.dust_fields[0].grains.len());
+
+    src.dust_fields[0].version += 1;
+    dst.copy_from(&src); // second copy: must refill the same allocation
+    assert_eq!(
+        dst.dust_fields[0].grains.as_ptr(),
+        ptr,
+        "grain storage was reallocated"
+    );
+    assert_eq!(dst.dust_fields[0].grains.capacity(), cap, "grain capacity changed");
+    assert_eq!(dst.dust_fields[0].version, src.dust_fields[0].version);
+    assert_eq!(dst.dust_fields[0].grains.len(), src.dust_fields[0].grains.len());
+}

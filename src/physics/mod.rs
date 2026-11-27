@@ -1150,6 +1150,15 @@ pub struct Bodies {
     /// bit-mask), so the hot path allocates nothing per call.
     pub pn_hosts: Vec<usize>,
     pub pn_mask: Vec<bool>,
+    /// Reused scratch for the force evaluator: the identity active list
+    /// (`compute_accel`), the per-call result buffer (`eval_forces_with`) and
+    /// the direct kernel's running step-limiter maxima. Pure scratch — every
+    /// call clears and refills it from the current state, so a snapshot never
+    /// needs a copy of it and no result depends on what was in it before.
+    pub fx_all: Vec<u32>,
+    pub fx_out: Vec<(f64, f64, f64, f64)>,
+    pub fx_s_max: Vec<f64>,
+    pub fx_w_max: Vec<f64>,
     pub flashes: Vec<Flash>,
     /// Statistical dust fields, one per system. They are not bodies.
     pub dust_fields: Vec<DustField>,
@@ -1210,6 +1219,10 @@ impl Bodies {
             pn_valid: false,
             pn_hosts: Vec::with_capacity(n),
             pn_mask: Vec::new(),
+            fx_all: Vec::new(),
+            fx_out: Vec::new(),
+            fx_s_max: Vec::new(),
+            fx_w_max: Vec::new(),
             flashes: Vec::new(),
             dust_fields: Vec::new(),
             time: 0.0,
@@ -1239,6 +1252,78 @@ impl Bodies {
             rlof: Vec::with_capacity(n),
             comet_grains: Vec::with_capacity(n),
         }
+    }
+
+    /// Refill `self` from `src`, reusing the existing `Vec` allocations.
+    ///
+    /// Copies exactly what `Clone` copies, but the per-body columns, the dust
+    /// fields and the event log are refilled in place, so a steady-state copy
+    /// does not reallocate the outer vectors. Used by the history ring and the
+    /// replay cache, which recopy multi-megabyte snapshots as the run
+    /// progresses and as the user scrubs the timeline.
+    ///
+    /// The derived-data caches (`parent_cache`, `pn_*`, `fx_*`) are cleared
+    /// rather than copied: they are rebuilt on demand and would only bloat
+    /// every snapshot.
+    pub fn copy_from(&mut self, src: &Bodies) {
+        self.x.clone_from(&src.x);
+        self.y.clone_from(&src.y);
+        self.vx.clone_from(&src.vx);
+        self.vy.clone_from(&src.vy);
+        self.z.clone_from(&src.z);
+        self.vz.clone_from(&src.vz);
+        self.ax.clone_from(&src.ax);
+        self.ay.clone_from(&src.ay);
+        self.az.clone_from(&src.az);
+        self._px.clone_from(&src._px);
+        self._py.clone_from(&src._py);
+        self._pz.clone_from(&src._pz);
+        self.m.clone_from(&src.m);
+        self.r.clone_from(&src.r);
+        self.kind.clone_from(&src.kind);
+        self.dead.clone_from(&src.dead);
+        self.id.clone_from(&src.id);
+        self.name.clone_from(&src.name);
+        self.imm.clone_from(&src.imm);
+        self.origin.clone_from(&src.origin);
+        self.bulk_density.clone_from(&src.bulk_density);
+        self.class.clone_from(&src.class);
+        self.rung.clone_from(&src.rung);
+        self.dtl.clone_from(&src.dtl);
+        self.spin.clone_from(&src.spin);
+        self.disrupting.clone_from(&src.disrupting);
+        self.coalesce_counter.clone_from(&src.coalesce_counter);
+        self.flashes.clone_from(&src.flashes);
+        self.dust_fields.clone_from(&src.dust_fields);
+        self.time = src.time;
+        self.next_id = src.next_id;
+        self.stats.clone_from(&src.stats);
+        self.events.clone_from(&src.events);
+        self.rng.clone_from(&src.rng);
+        self.metallicity = src.metallicity;
+        self.e_pre = src.e_pre;
+        self.age_gyr.clone_from(&src.age_gyr);
+        self.m_init.clone_from(&src.m_init);
+        self.sn_kicks = src.sn_kicks;
+        self.mass_transfer = src.mass_transfer;
+        self.evolution_rate = src.evolution_rate;
+        self.rlof.clone_from(&src.rlof);
+        self.comet_grains.clone_from(&src.comet_grains);
+
+        // Derived-data caches: dropped, not copied.
+        self.parent_cache.clear();
+        self.parent_cache_step = 0;
+        self.parent_cache_valid = false;
+        self.pn_order.clear();
+        self.pn_x0.clear();
+        self.pn_len = 0;
+        self.pn_valid = false;
+        self.pn_hosts.clear();
+        self.pn_mask.clear();
+        self.fx_all.clear();
+        self.fx_out.clear();
+        self.fx_s_max.clear();
+        self.fx_w_max.clear();
     }
 
     /// Current body count. Includes bodies marked `dead` but not yet compacted.

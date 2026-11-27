@@ -20,6 +20,11 @@ const MIN_SIM_GAP: f64 = 0.25;
 /// Minimum wall-clock time between recorded frames.
 const MIN_WALL_GAP: Duration = Duration::from_millis(200);
 
+/// Maximum number of recycled `Bodies` allocations kept for reuse. A snapshot
+/// is multi-megabyte, so recycling avoids reallocating every column on each
+/// recorded frame; capping the pool bounds the retained memory.
+const SPARE_MAX: usize = 4;
+
 pub struct Frame {
     pub id: u64,
     pub time: f64,
@@ -34,6 +39,10 @@ pub struct History {
     cap_bytes: usize,
     last_time: f64,
     last_wall: Instant,
+    /// Recycled snapshot allocations from evicted frames. Recording a frame
+    /// refills one of these with `Bodies::copy_from` instead of allocating a
+    /// fresh deep copy, so a long run does not churn multi-megabyte buffers.
+    spare: Vec<Bodies>,
 }
 
 /// Rough heap size of a snapshot, for the memory cap.
@@ -51,6 +60,7 @@ impl History {
             cap_bytes: cap_mb * 1024 * 1024,
             last_time: f64::NEG_INFINITY,
             last_wall: Instant::now(),
+            spare: Vec::new(),
         }
     }
 
@@ -74,19 +84,36 @@ impl History {
             return;
         }
         let bytes = approx_bytes(b);
+        // Refill a recycled allocation when one is available: `copy_from`
+        // reuses the column vectors in place, so a steady-state run does not
+        // reallocate a multi-megabyte snapshot per recorded frame.
+        let mut snap = self
+            .spare
+            .pop()
+            .unwrap_or_else(|| Bodies::with_capacity(b.len()));
+        snap.copy_from(b);
         self.frames.push_back(Frame {
             id: self.next_id,
             time: b.time,
             bytes,
-            state: Arc::new(b.clone()),
+            state: Arc::new(snap),
         });
         self.next_id += 1;
         self.bytes += bytes;
         self.last_time = b.time;
         self.last_wall = Instant::now();
         while self.bytes > self.cap_bytes && self.frames.len() > 2 {
-            if let Some(f) = self.frames.pop_front() {
-                self.bytes -= f.bytes;
+            let Some(f) = self.frames.pop_front() else {
+                break;
+            };
+            self.bytes -= f.bytes;
+            // Recycle the allocation when this frame is the last owner; the
+            // replay cache may still hold a copy, in which case the Arc is
+            // simply dropped and the memory freed as before.
+            if let Ok(bodies) = Arc::try_unwrap(f.state) {
+                if self.spare.len() < SPARE_MAX {
+                    self.spare.push(bodies);
+                }
             }
         }
     }

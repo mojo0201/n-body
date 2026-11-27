@@ -87,13 +87,36 @@ pub struct Grain {
     pub ttl: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DustField {
     pub primary: usize,
     pub extent_gm: f64,
     pub grains: Vec<Grain>,
     /// Bumped on every change, for the renderer.
     pub version: u64,
+}
+
+/// `Clone` is hand-written so `clone_from` can refill the grain vector in
+/// place. `Grain` is `Copy`, so the refill is a plain memcpy into the
+/// existing allocation — which matters because the grain vector is the
+/// largest per-snapshot allocation in a dust-heavy scene (tens of thousands
+/// of grains), and `Bodies::copy_from` recopies every recorded frame.
+impl Clone for DustField {
+    fn clone(&self) -> Self {
+        Self {
+            primary: self.primary,
+            extent_gm: self.extent_gm,
+            grains: self.grains.clone(),
+            version: self.version,
+        }
+    }
+
+    fn clone_from(&mut self, src: &Self) {
+        self.primary = src.primary;
+        self.extent_gm = src.extent_gm;
+        self.grains.clone_from(&src.grains);
+        self.version = src.version;
+    }
 }
 
 /// One point for the renderer: camera-relative position and mass weight.

@@ -41,7 +41,19 @@ impl SimState {
             (f.id, f.state.clone())
         };
         if self.replay_cache.as_ref().map(|c| c.0) != Some(id) {
-            self.replay_cache = Some((id, (*arc).clone()));
+            if self.replay_swapped {
+                // A frame is still swapped into `b`, so the cached copy holds
+                // the live state and must not be overwritten in place.
+                self.replay_cache = Some((id, (*arc).clone()));
+            } else if let Some(c) = self.replay_cache.as_mut() {
+                // Reuse the cached copy's allocations: `copy_from` refills the
+                // column vectors in place, so scrubbing the timeline does not
+                // reallocate a multi-megabyte snapshot per frame.
+                c.0 = id;
+                c.1.copy_from(&arc);
+            } else {
+                self.replay_cache = Some((id, (*arc).clone()));
+            }
         }
         let cache = self.replay_cache.as_mut()?;
         std::mem::swap(b, &mut cache.1);

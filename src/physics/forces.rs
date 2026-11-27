@@ -188,6 +188,8 @@ pub(super) fn compute_accel_direct_sym_impl<const LIMITER: bool>(b: &mut Bodies)
         ay,
         az,
         dtl,
+        fx_s_max,
+        fx_w_max,
         ..
     } = b;
     let n = x.len();
@@ -197,9 +199,18 @@ pub(super) fn compute_accel_direct_sym_impl<const LIMITER: bool>(b: &mut Bodies)
     az[..n].fill(0.0);
 
     // Per-body running maxima; index j is updated by every i < j and
-    // finalised once the outer loop reaches j.
-    let mut s_max = vec![0.0f64; if LIMITER { n } else { 0 }];
-    let mut w_max = vec![0.0f64; if LIMITER { n } else { 0 }];
+    // finalised once the outer loop reaches j. Reused scratch buffers, so the
+    // kernel allocates nothing per call: every element is rewritten before it
+    // is read (`resize` fills with 0.0, and each j-slot is finalised by the
+    // time the outer loop reaches it).
+    fx_s_max.clear();
+    fx_w_max.clear();
+    if LIMITER {
+        fx_s_max.resize(n, 0.0);
+        fx_w_max.resize(n, 0.0);
+    }
+    let s_max: &mut [f64] = &mut fx_s_max[..];
+    let w_max: &mut [f64] = &mut fx_w_max[..];
 
     let xs = &x[..n];
     let ys = &y[..n];
@@ -324,7 +335,14 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
     }
     let use_tree = n >= BH_THRESHOLD && active.len() >= DIRECT_ACTIVE_MAX;
     let threads = rayon::current_num_threads();
-    let out: Vec<(f64, f64, f64, f64)> = if use_tree {
+    // Reused result buffer, taken out of `Bodies` so the closures below can
+    // borrow `b` while we fill it. `clear` + `collect_into_vec` / `extend`
+    // refill the existing allocation, so a steady-state call allocates
+    // nothing. The fill order is unchanged (same active order, same per-body
+    // values), so results are bit-identical to the old `collect()`.
+    let mut out = std::mem::take(&mut b.fx_out);
+    out.clear();
+    if use_tree {
         // Build only if the caller didn't hand us one.
         let owned;
         let tree_ref = if let Some(t) = tree {
@@ -337,28 +355,26 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
         active
             .par_iter()
             .map(|&i| tree_ref.accel_for(bb, i as usize))
-            .collect()
+            .collect_into_vec(&mut out);
     } else if active.len() * n < PAR_WORK_MIN {
         // Tiny: dispatch would cost more than the work.
-        active
-            .iter()
-            .map(|&i| force_direct_on(b, i as usize))
-            .collect()
+        out.extend(active.iter().map(|&i| force_direct_on(b, i as usize)));
     } else if active.len() < threads && n >= 2 * DIRECT_CHUNK {
         // Few active bodies, long j-loops: split each body's loop.
         let bb: &Bodies = b;
-        active
-            .iter()
-            .map(|&i| force_direct_on_parallel(bb, i as usize))
-            .collect()
+        out.extend(
+            active
+                .iter()
+                .map(|&i| force_direct_on_parallel(bb, i as usize)),
+        );
     } else {
         // Plenty of active bodies: split over active.
         let bb: &Bodies = b;
         active
             .par_iter()
             .map(|&i| force_direct_on(bb, i as usize))
-            .collect()
-    };
+            .collect_into_vec(&mut out);
+    }
 
     // Scatter results back to the bodies they belong to.
     for (k, &i) in active.iter().enumerate() {
@@ -368,6 +384,8 @@ pub(super) fn eval_forces_with(b: &mut Bodies, active: &[u32], tree: Option<&Tre
         b.az[i] = out[k].2;
         b.dtl[i] = out[k].3;
     }
+    // Hand the buffer back so the next call reuses its allocation.
+    b.fx_out = out;
 }
 
 /// Recompute forces on every body and remove net COM acceleration.
@@ -397,8 +415,13 @@ pub(super) fn compute_accel_opt(b: &mut Bodies, limiter: bool) {
             compute_accel_direct_sym_impl::<false>(b);
         }
     } else {
-        let all: Vec<u32> = (0..n as u32).collect();
+        // Reused identity active list; taken out so `eval_forces` can borrow
+        // `b` mutably while the list is a local, then handed back.
+        let mut all = std::mem::take(&mut b.fx_all);
+        all.clear();
+        all.extend(0..n as u32);
         eval_forces(b, &all);
+        b.fx_all = all;
     }
 
     // Post-Newtonian corrections. 1PN is the leading GR correction

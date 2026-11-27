@@ -729,3 +729,147 @@ fn am_pn_cache_skips_bodies_that_died() {
         );
     }
 }
+
+// ===========================================================================
+// am — force-evaluator scratch reuse (`fx_*`)
+// ===========================================================================
+//
+// The evaluator's per-call buffers (`fx_all`, `fx_out`, `fx_s_max`, `fx_w_max`)
+// live on `Bodies` and are cleared/refilled on every call. The contract:
+//   * reuse must be **bit-identical** to a cold call — the buffers are only
+//     storage, never inputs;
+//   * a steady-state call must reuse the same allocation (no realloc), which
+//     is the whole point of keeping them on `Bodies`.
+
+/// Reusing the scratch buffers must reproduce a cold run bit-for-bit, on both
+/// sides of the dispatch split at `PAR_DIRECT_MIN`: the symmetric direct kernel
+/// below it (`fx_s_max` / `fx_w_max`) and the `eval_forces` path above it
+/// (`fx_all` / `fx_out`).
+#[test]
+fn am_fx_scratch_reuse_is_bit_identical() {
+    for n in [40usize, 400] {
+        let mut cold = solar_disc(n, 21);
+        compute_accel(&mut cold);
+        let cold_ax: Vec<f64> = cold.ax.clone();
+        let cold_ay: Vec<f64> = cold.ay.clone();
+        let cold_dtl: Vec<f64> = cold.dtl.clone();
+
+        // Identical system, but the scratch buffers are already warm and
+        // non-empty from the first call.
+        let mut warm = solar_disc(n, 21);
+        compute_accel(&mut warm);
+        compute_accel(&mut warm);
+        for i in 0..warm.len() {
+            assert_eq!(
+                warm.ax[i].to_bits(),
+                cold_ax[i].to_bits(),
+                "n {n} body {i}: warm ax differs from cold"
+            );
+            assert_eq!(
+                warm.ay[i].to_bits(),
+                cold_ay[i].to_bits(),
+                "n {n} body {i}: warm ay differs from cold"
+            );
+            assert_eq!(
+                warm.dtl[i].to_bits(),
+                cold_dtl[i].to_bits(),
+                "n {n} body {i}: warm dtl differs from cold"
+            );
+        }
+    }
+}
+
+/// A second call must reuse the same allocations: pointer and capacity of every
+/// scratch vector stay put instead of being reallocated.
+#[test]
+fn am_fx_scratch_buffers_are_reused() {
+    // Above PAR_DIRECT_MIN: exercises `fx_all` + `fx_out`.
+    let mut b = solar_disc(400, 5);
+    compute_accel(&mut b);
+    let (out_ptr, out_cap) = (b.fx_out.as_ptr(), b.fx_out.capacity());
+    let (all_ptr, all_cap) = (b.fx_all.as_ptr(), b.fx_all.capacity());
+    assert_eq!(b.fx_out.len(), b.len(), "result buffer should cover the population");
+    assert_eq!(b.fx_all.len(), b.len(), "identity list should cover the population");
+    compute_accel(&mut b);
+    assert_eq!(b.fx_out.as_ptr(), out_ptr, "result buffer reallocated");
+    assert_eq!(b.fx_out.capacity(), out_cap, "result buffer capacity changed");
+    assert_eq!(b.fx_all.as_ptr(), all_ptr, "identity list reallocated");
+    assert_eq!(b.fx_all.capacity(), all_cap, "identity list capacity changed");
+
+    // Below PAR_DIRECT_MIN: exercises `fx_s_max` / `fx_w_max`.
+    let mut s = solar_disc(40, 5);
+    compute_accel(&mut s);
+    let (sm_ptr, sm_cap) = (s.fx_s_max.as_ptr(), s.fx_s_max.capacity());
+    let (wm_ptr, wm_cap) = (s.fx_w_max.as_ptr(), s.fx_w_max.capacity());
+    assert_eq!(s.fx_s_max.len(), s.len(), "limiter maxima should cover the population");
+    compute_accel(&mut s);
+    assert_eq!(s.fx_s_max.as_ptr(), sm_ptr, "limiter maxima reallocated");
+    assert_eq!(s.fx_s_max.capacity(), sm_cap, "limiter maxima capacity changed");
+    assert_eq!(s.fx_w_max.as_ptr(), wm_ptr, "shear maxima reallocated");
+    assert_eq!(s.fx_w_max.capacity(), wm_cap, "shear maxima capacity changed");
+}
+
+/// `Bodies::copy_from` (used by the history ring and the replay cache) must
+/// reproduce the physics state column-for-column while dropping the derived
+/// caches. Distinct per-column patterns make a swapped assignment (e.g. `y`
+/// into `z`) fail loudly.
+#[test]
+fn am_copy_from_matches_clone() {
+    let mut src = solar_disc(24, 3);
+    for i in 0..src.len() {
+        let f = i as f64;
+        src.x[i] = 1.0 + f;
+        src.y[i] = 2.0 + f;
+        src.z[i] = 3.0 + f;
+        src.vx[i] = 4.0 + f;
+        src.vy[i] = 5.0 + f;
+        src.vz[i] = 6.0 + f;
+        src.ax[i] = 7.0 + f;
+        src.ay[i] = 8.0 + f;
+        src.az[i] = 9.0 + f;
+        src.dtl[i] = 10.0 + f;
+        src.rung[i] = (i % 7) as u8;
+        src.spin[i] = 11.0 + f;
+        src.dead[i] = i % 3 == 0;
+    }
+    src.time = 12.5;
+    src.next_id = 999;
+    src.pn_valid = true;
+    src.parent_cache_valid = true;
+    src.parent_cache.push(Some(0));
+
+    let mut dst = Bodies::with_capacity(4);
+    dst.copy_from(&src);
+
+    assert_eq!(dst.len(), src.len());
+    for i in 0..src.len() {
+        assert_eq!(dst.x[i], src.x[i], "x {i}");
+        assert_eq!(dst.y[i], src.y[i], "y {i}");
+        assert_eq!(dst.z[i], src.z[i], "z {i}");
+        assert_eq!(dst.vx[i], src.vx[i], "vx {i}");
+        assert_eq!(dst.vy[i], src.vy[i], "vy {i}");
+        assert_eq!(dst.vz[i], src.vz[i], "vz {i}");
+        assert_eq!(dst.ax[i], src.ax[i], "ax {i}");
+        assert_eq!(dst.ay[i], src.ay[i], "ay {i}");
+        assert_eq!(dst.az[i], src.az[i], "az {i}");
+        assert_eq!(dst.dtl[i], src.dtl[i], "dtl {i}");
+        assert_eq!(dst.rung[i], src.rung[i], "rung {i}");
+        assert_eq!(dst.spin[i], src.spin[i], "spin {i}");
+        assert_eq!(dst.dead[i], src.dead[i], "dead {i}");
+        assert_eq!(dst.m[i], src.m[i], "m {i}");
+        assert_eq!(dst.r[i], src.r[i], "r {i}");
+        assert_eq!(dst.id[i], src.id[i], "id {i}");
+    }
+    assert_eq!(dst.time, src.time);
+    assert_eq!(dst.next_id, src.next_id);
+    assert_eq!(dst.dust_fields.len(), src.dust_fields.len());
+    assert_eq!(dst.events.len(), src.events.len());
+
+    // Derived caches are dropped: the copy starts cold and rebuilds on demand.
+    assert!(!dst.pn_valid, "PN order cache must not be inherited");
+    assert!(dst.pn_order.is_empty(), "PN order cache must be empty");
+    assert!(!dst.parent_cache_valid, "parent cache must not be inherited");
+    assert!(dst.parent_cache.is_empty(), "parent cache must be empty");
+    assert!(dst.fx_all.is_empty(), "identity scratch must be empty");
+    assert!(dst.fx_out.is_empty(), "result scratch must be empty");
+}
