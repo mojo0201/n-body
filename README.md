@@ -205,7 +205,7 @@ cargo run --release --bin nbody-rust       # the app
 cargo test --lib                           # ~655 headless physics tests
 cargo clippy --all-targets -- -D warnings  # what CI enforces
 scripts/ci.sh                              # the whole gate
-scripts/ci-slow.sh                         # the 7 ignored tests, ~18 min
+scripts/ci-slow.sh                         # the 7 ignored tests, ~15 min
 ```
 
 - The tests live in `src/physics/tests/`, one module per area: forces and the

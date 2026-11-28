@@ -18,11 +18,11 @@
 # integrator: 1 500-4 000 draws at roughly 60-80 ms each. The dev profile is
 # already opt-level 2, so a release build does not make them cheap.
 #
-# Total ~18 min for all seven.
+# Total ~15 min for all seven on an idle 12-core box.
 #
 # Runs one test at a time. Every one of these saturates the cores through
 # rayon's global pool, so running them concurrently oversubscribes the machine
-# and takes far longer than the ~18 min they need back to back.
+# and takes far longer than the ~15 min they need back to back.
 #
 # Deliberately NOT part of scripts/ci.sh: the default gate stays fast enough to
 # run on every change. Exits non-zero if any ignored test fails.
