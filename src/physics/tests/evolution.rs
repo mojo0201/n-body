@@ -658,12 +658,8 @@ fn al_random_systems_keep_ages_on_the_ring() {
 /// must not panic or produce NaN / infinity in positions or velocities.
 /// Also: a solar system with a fast evolution rate must reach the WD
 /// stage within 3000 steps.
-/// Smoke test: 40 random 30-body universes simulated with evolution on
-/// must not panic or produce NaN / infinity in positions or velocities.
-/// Also: a solar system with a fast evolution rate must reach the WD
-/// stage within 3000 steps.
 #[test]
-#[ignore = "40x30-body + solar runs (27 000 advance calls); ~60 s in debug. Run with -- --ignored"]
+#[ignore = "40x30-body + solar runs (27 000 advance calls); ~55 s. Run with -- --ignored"]
 fn smoke_evolution_runs_without_panic() {
     for seed in 0..40u128 {
         let mut b = Bodies::with_capacity(0);

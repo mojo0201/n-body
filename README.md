@@ -202,9 +202,10 @@ request would be clamped to fit.
 
 ```
 cargo run --release --bin nbody-rust       # the app
-cargo test --lib                           # ~630 headless physics tests
+cargo test --lib                           # ~655 headless physics tests
 cargo clippy --all-targets -- -D warnings  # what CI enforces
 scripts/ci.sh                              # the whole gate
+scripts/ci-slow.sh                         # the 7 ignored tests, ~18 min
 ```
 
 - The tests live in `src/physics/tests/`, one module per area: forces and the
@@ -218,6 +219,12 @@ scripts/ci.sh                              # the whole gate
   headless CLI contract (`--n 0` → exit 2, `--min-ratio` fail/pass, `--json`,
   `--quiet --json` prints exactly one line, a `--solar` smoke run), builds every
   example, and checks `scripts/sweep.sh`'s TSV shape.
+- Seven tests are `#[ignore]`d because each takes a minute or more on its own:
+  four spawn-statistics tests that run 1 500–4 000 full `spawn_system` draws
+  (each draw runs the early-evolution integrator), two moon-integration tests,
+  and one stellar-evolution smoke test. `scripts/ci.sh` skips them so the gate
+  stays fast, so `scripts/ci-slow.sh` runs them — use it before a release or
+  when touching the spawner, the early-evolution integrator, or the moon code.
 - `src/bin/headless.rs` is the throughput/energy harness (`--json`, `--quiet`);
   `scripts/sweep.sh` wraps it over n × seeds.
 - `examples/` holds ~44 throwaway diagnostics (`check_moon`, `crash_scan`,

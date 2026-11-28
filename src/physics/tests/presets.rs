@@ -8,7 +8,7 @@
 //! "library silently shrank".
 //!
 //! Two `#[ignore]`d tests (`moon_stays_bound_to_earth`, `moon_parent_stable`)
-//! each run 10 000 integration steps and take ~60 s. Run them with:
+//! each run 10 000 integration steps and take ~2–2.5 min. Run them with:
 //!     cargo test --lib physics::tests::presets -- --ignored
 //!
 //! One test (`every_preset_spawns_and_runs`) requires `parse_body_kind`
@@ -526,13 +526,13 @@ fn solar_moon_periods_match_real() {
 }
 
 #[test]
-#[ignore = "10 000 integration steps; ~60 s. Run with -- --ignored"]
+#[ignore = "10 000 integration steps; ~137 s. Run with -- --ignored"]
 fn moon_stays_bound_to_earth() {
     // Ten thousand steps is long enough for a broken integrator or a
     // wrong-mu `push_orbit` to eject the Moon; a correct one keeps the
     // distance within a factor of two of the initial separation.
     //
-    // Ignored by default because 10 000 steps is ~60 s in debug builds.
+    // Ignored by default because 10 000 steps takes ~2 min.
     // Run explicitly with `cargo test --lib physics::tests::presets -- --ignored`.
     let mut b = Bodies::with_capacity(0);
     spawn_solar_system(&mut b);
@@ -552,12 +552,12 @@ fn moon_stays_bound_to_earth() {
 }
 
 #[test]
-#[ignore = "10 000 integration steps; ~60 s. Run with -- --ignored"]
+#[ignore = "10 000 integration steps; ~155 s. Run with -- --ignored"]
 fn moon_parent_stable() {
     // The parent cache is rebuilt every step; this test catches a
     // regression where a close pass to another body steals the Moon.
     //
-    // Ignored by default because 10 000 steps is ~60 s in debug builds.
+    // Ignored by default because 10 000 steps takes ~2.5 min.
     // Run explicitly with `cargo test --lib physics::tests::presets -- --ignored`.
     let mut b = Bodies::with_capacity(0);
     spawn_solar_system(&mut b);
