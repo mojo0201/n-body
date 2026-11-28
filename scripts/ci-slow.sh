@@ -20,10 +20,14 @@
 #
 # Total ~18 min for all seven.
 #
+# Runs one test at a time. Every one of these saturates the cores through
+# rayon's global pool, so running them concurrently oversubscribes the machine
+# and takes far longer than the ~18 min they need back to back.
+#
 # Deliberately NOT part of scripts/ci.sh: the default gate stays fast enough to
 # run on every change. Exits non-zero if any ignored test fails.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo test --lib --quiet -- --ignored
+cargo test --lib --quiet -- --ignored --test-threads=1
